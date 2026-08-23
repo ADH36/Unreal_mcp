@@ -63,7 +63,11 @@
 #include "GameFramework/InputSettings.h"
 #include "GameFramework/PlayerController.h"
 #include "InputAction.h"
+#include "InputActionValue.h"
 #include "InputMappingContext.h"
+#include "InputModifiers.h"
+#include "InputTriggers.h"
+#include "ScopedTransaction.h"
 
 #endif
 
@@ -73,7 +77,82 @@ namespace
 /** Converts an optional input key name into an FKey for mapping-specific operations. */
 FKey McpInputKeyFromName(const FString& KeyName)
 {
-    return KeyName.IsEmpty() ? FKey() : FKey(FName(*KeyName));
+    if (KeyName.IsEmpty())
+    {
+        return FKey();
+    }
+
+    const FName RequestedName(*KeyName);
+    TArray<FKey> RegisteredKeys;
+    EKeys::GetAllKeys(RegisteredKeys);
+    for (const FKey& RegisteredKey : RegisteredKeys)
+    {
+        if (RegisteredKey.GetFName() == RequestedName ||
+            RegisteredKey.ToString().Equals(KeyName, ESearchCase::IgnoreCase))
+        {
+            return RegisteredKey;
+        }
+    }
+    return FKey();
+}
+
+bool ParseInputValueType(const FString& ValueTypeName, EInputActionValueType& OutType)
+{
+    if (ValueTypeName.IsEmpty() || ValueTypeName.Equals(TEXT("Boolean"), ESearchCase::IgnoreCase) ||
+        ValueTypeName.Equals(TEXT("Bool"), ESearchCase::IgnoreCase))
+    {
+        OutType = EInputActionValueType::Boolean;
+        return true;
+    }
+    if (ValueTypeName.Equals(TEXT("Axis1D"), ESearchCase::IgnoreCase) || ValueTypeName.Equals(TEXT("Float"), ESearchCase::IgnoreCase))
+    {
+        OutType = EInputActionValueType::Axis1D;
+        return true;
+    }
+    if (ValueTypeName.Equals(TEXT("Axis2D"), ESearchCase::IgnoreCase) || ValueTypeName.Equals(TEXT("Vector2D"), ESearchCase::IgnoreCase))
+    {
+        OutType = EInputActionValueType::Axis2D;
+        return true;
+    }
+    if (ValueTypeName.Equals(TEXT("Axis3D"), ESearchCase::IgnoreCase) || ValueTypeName.Equals(TEXT("Vector"), ESearchCase::IgnoreCase))
+    {
+        OutType = EInputActionValueType::Axis3D;
+        return true;
+    }
+    return false;
+}
+
+FString InputValueTypeToString(EInputActionValueType Type)
+{
+    switch (Type)
+    {
+    case EInputActionValueType::Axis1D: return TEXT("Axis1D");
+    case EInputActionValueType::Axis2D: return TEXT("Axis2D");
+    case EInputActionValueType::Axis3D: return TEXT("Axis3D");
+    default: return TEXT("Boolean");
+    }
+}
+
+bool IsInputMappingDuplicate(const UInputMappingContext* Context, const UInputAction* Action, const FKey& Key)
+{
+    for (const FEnhancedActionKeyMapping& Existing : Context->GetMappings())
+    {
+        if (Existing.Action == Action && Existing.Key == Key)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename T>
+void SetNumberIfPresent(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, T& Target)
+{
+    double Number = 0.0;
+    if (Payload->TryGetNumberField(FieldName, Number))
+    {
+        Target = static_cast<T>(Number);
+    }
 }
 
 bool IsLegacyInputMappingAction(const FString& SubAction)
@@ -379,6 +458,17 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
         FString Path;
         Payload->TryGetStringField(TEXT("path"), Path);
 
+        FString ValueTypeName;
+        Payload->TryGetStringField(TEXT("valueType"), ValueTypeName);
+        EInputActionValueType ValueType = EInputActionValueType::Boolean;
+        if (!ParseInputValueType(ValueTypeName, ValueType))
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Unsupported valueType '%s'. Supported: Boolean, Axis1D, Axis2D, Axis3D."), *ValueTypeName),
+                TEXT("INVALID_VALUE_TYPE"));
+            return true;
+        }
+
         if (Name.IsEmpty() || Path.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId,
@@ -419,6 +509,7 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
 
             TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
             Result->SetStringField(TEXT("assetPath"), ExistingAction->GetPathName());
+            Result->SetStringField(TEXT("valueType"), InputValueTypeToString(ExistingAction->ValueType));
             McpHandlerUtils::AddVerification(Result, ExistingAction);
 
             SendAutomationResponse(RequestingSocket, RequestId, true,
@@ -435,10 +526,18 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
 
         if (NewAsset)
         {
+            if (UInputAction* NewAction = Cast<UInputAction>(NewAsset))
+            {
+                const FScopedTransaction Transaction(FText::FromString(TEXT("Create Enhanced Input Action")));
+                NewAction->Modify();
+                NewAction->ValueType = ValueType;
+                NewAction->PostEditChange();
+            }
             SaveLoadedAssetThrottled(NewAsset, -1.0, true);
 
             TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
             Result->SetStringField(TEXT("assetPath"), NewAsset->GetPathName());
+            Result->SetStringField(TEXT("valueType"), InputValueTypeToString(ValueType));
             McpHandlerUtils::AddVerification(Result, NewAsset);
 
             SendAutomationResponse(RequestingSocket, RequestId, true,
@@ -449,6 +548,47 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             SendAutomationError(RequestingSocket, RequestId,
                 TEXT("Failed to create Input Action."), TEXT("CREATION_FAILED"));
         }
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // set_input_action_type: Change the value type of an existing action.
+    // -------------------------------------------------------------------------
+    if (SubAction == TEXT("set_input_action_type"))
+    {
+        FString ActionPath;
+        FString ValueTypeName;
+        Payload->TryGetStringField(TEXT("actionPath"), ActionPath);
+        Payload->TryGetStringField(TEXT("valueType"), ValueTypeName);
+        EInputActionValueType ValueType = EInputActionValueType::Boolean;
+        if (!ParseInputValueType(ValueTypeName, ValueType))
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Unsupported valueType '%s'. Supported: Boolean, Axis1D, Axis2D, Axis3D."), *ValueTypeName),
+                TEXT("INVALID_VALUE_TYPE"));
+            return true;
+        }
+
+        FString SanitizedActionPath;
+        UInputAction* InAction = LoadInputAsset<UInputAction>(ActionPath, SanitizedActionPath);
+        if (!InAction)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Input action not found: %s"), *SanitizedActionPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Set Enhanced Input Action Value Type")));
+        InAction->Modify();
+        InAction->ValueType = ValueType;
+        InAction->PostEditChange();
+        SaveLoadedAssetThrottled(InAction, -1.0, true);
+
+        TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+        Result->SetStringField(TEXT("actionPath"), SanitizedActionPath);
+        Result->SetStringField(TEXT("valueType"), InputValueTypeToString(InAction->ValueType));
+        McpHandlerUtils::AddVerification(Result, InAction);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Input Action value type updated."), Result);
         return true;
     }
 
@@ -539,7 +679,7 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     // -------------------------------------------------------------------------
     // add_mapping / map_input_action: Add key mapping to context
     // -------------------------------------------------------------------------
-    if (SubAction == TEXT("add_mapping") || SubAction == TEXT("map_input_action"))
+    if (SubAction == TEXT("add_mapping") || SubAction == TEXT("map_input_action") || SubAction == TEXT("add_input_mapping"))
     {
         FString ContextPath;
         Payload->TryGetStringField(TEXT("contextPath"), ContextPath);
@@ -564,28 +704,41 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             return true;
         }
 
-        FKey Key = FKey(FName(*KeyName));
+        FKey Key = McpInputKeyFromName(KeyName);
         if (!Key.IsValid())
         {
             SendAutomationError(RequestingSocket, RequestId,
-                TEXT("Invalid key name."), TEXT("INVALID_ARGUMENT"));
+                FString::Printf(TEXT("Invalid key name '%s'. Use a registered UE key such as W, SpaceBar, LeftMouseButton, or Gamepad_FaceButton_Bottom."), *KeyName), TEXT("INVALID_KEY"));
             return true;
         }
 
-        Context->MapKey(InAction, Key);
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Add Enhanced Input Mapping")));
+        Context->Modify();
+        const bool bAlreadyMapped = IsInputMappingDuplicate(Context, InAction, Key);
+        if (!bAlreadyMapped)
+        {
+            Context->MapKey(InAction, Key);
+        }
         SaveLoadedAssetThrottled(Context, -1.0, true);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("contextPath"), SanitizedContextPath);
         Result->SetStringField(TEXT("actionPath"), SanitizedActionPath);
         Result->SetStringField(TEXT("key"), KeyName);
+        Result->SetBoolField(TEXT("alreadyMapped"), bAlreadyMapped);
+        Result->SetNumberField(TEXT("mappingCount"), Context->GetMappings().Num());
         AddAssetVerificationNested(Result, TEXT("contextVerification"), Context);
         AddAssetVerificationNested(Result, TEXT("actionVerification"), InAction);
 
         SendAutomationResponse(RequestingSocket, RequestId, true,
-            SubAction == TEXT("map_input_action") ?
+            (SubAction == TEXT("map_input_action") || SubAction == TEXT("add_input_mapping")) ?
             TEXT("Input action mapped to key.") : TEXT("Mapping added."), Result);
         return true;
+    }
+
+    if (SubAction == TEXT("remove_input_mapping"))
+    {
+        SubAction = TEXT("remove_mapping");
     }
 
     // -------------------------------------------------------------------------
@@ -593,6 +746,7 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     // -------------------------------------------------------------------------
     if (SubAction == TEXT("remove_mapping"))
     {
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Remove Enhanced Input Mapping")));
         FString ContextPath;
         Payload->TryGetStringField(TEXT("contextPath"), ContextPath);
 
@@ -644,6 +798,7 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             return true;
         }
 
+        Context->Modify();
         for (const FKey& KeyToRemove : KeysToRemove)
         {
             Context->UnmapKey(InAction, KeyToRemove);
@@ -681,10 +836,19 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     // -------------------------------------------------------------------------
     // set_input_trigger: Configure trigger on input action
     // -------------------------------------------------------------------------
+    const bool bRequestedMappingTrigger = SubAction == TEXT("add_mapping_trigger");
+    if (bRequestedMappingTrigger)
+    {
+        SubAction = TEXT("set_input_trigger");
+    }
     if (SubAction == TEXT("set_input_trigger"))
     {
         FString ActionPath;
+        FString ContextPath;
+        FString KeyName;
+        Payload->TryGetStringField(TEXT("contextPath"), ContextPath);
         Payload->TryGetStringField(TEXT("actionPath"), ActionPath);
+        Payload->TryGetStringField(TEXT("key"), KeyName);
 
         FString TriggerType;
         Payload->TryGetStringField(TEXT("triggerType"), TriggerType);
@@ -700,48 +864,96 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             return true;
         }
 
+        FString SanitizedContextPath;
+        UInputMappingContext* TargetContext = nullptr;
+        FEnhancedActionKeyMapping* TargetMapping = nullptr;
+        if (bRequestedMappingTrigger)
+        {
+            const FKey RequestedKey = McpInputKeyFromName(KeyName);
+            TargetContext = LoadInputAsset<UInputMappingContext>(ContextPath, SanitizedContextPath);
+            if (!TargetContext || !RequestedKey.IsValid())
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("add_mapping_trigger requires a valid contextPath and registered key; context=%s key=%s"), *SanitizedContextPath, *KeyName),
+                    TEXT("INVALID_ARGUMENT"));
+                return true;
+            }
+            for (int32 MappingIndex = 0; MappingIndex < TargetContext->GetMappings().Num(); ++MappingIndex)
+            {
+                FEnhancedActionKeyMapping& Mapping = TargetContext->GetMapping(MappingIndex);
+                if (Mapping.Action == InAction && Mapping.Key == RequestedKey)
+                {
+                    TargetMapping = &Mapping;
+                    break;
+                }
+            }
+            if (!TargetMapping)
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Mapping not found for action '%s' and key '%s'."), *SanitizedActionPath, *KeyName), TEXT("NOT_FOUND"));
+                return true;
+            }
+        }
+        UObject* TriggerOuter = TargetMapping ? static_cast<UObject*>(TargetContext) : static_cast<UObject*>(InAction);
+
         // Create the appropriate trigger based on type
         UInputTrigger* NewTrigger = nullptr;
 
         // Map common trigger type names to their classes
         if (TriggerType == TEXT("Pressed") || TriggerType == TEXT("InputTriggerPressed"))
         {
-            NewTrigger = NewObject<UInputTriggerPressed>(InAction);
+            NewTrigger = NewObject<UInputTriggerPressed>(TriggerOuter);
         }
         else if (TriggerType == TEXT("Released") || TriggerType == TEXT("InputTriggerReleased"))
         {
-            NewTrigger = NewObject<UInputTriggerReleased>(InAction);
+            NewTrigger = NewObject<UInputTriggerReleased>(TriggerOuter);
         }
         else if (TriggerType == TEXT("Down") || TriggerType == TEXT("InputTriggerDown"))
         {
-            NewTrigger = NewObject<UInputTriggerDown>(InAction);
+            NewTrigger = NewObject<UInputTriggerDown>(TriggerOuter);
         }
         else if (TriggerType == TEXT("Tap") || TriggerType == TEXT("InputTriggerTap"))
         {
-            NewTrigger = NewObject<UInputTriggerTap>(InAction);
+            NewTrigger = NewObject<UInputTriggerTap>(TriggerOuter);
         }
         else if (TriggerType == TEXT("Hold") || TriggerType == TEXT("InputTriggerHold"))
         {
-            NewTrigger = NewObject<UInputTriggerHold>(InAction);
+            NewTrigger = NewObject<UInputTriggerHold>(TriggerOuter);
+        }
+        else if (TriggerType == TEXT("Chorded") || TriggerType == TEXT("ChordedAction") || TriggerType == TEXT("InputTriggerChordAction"))
+        {
+            FString ChordActionPath;
+            Payload->TryGetStringField(TEXT("chordActionPath"), ChordActionPath);
+            FString SanitizedChordActionPath;
+            UInputAction* ChordAction = LoadInputAsset<UInputAction>(ChordActionPath, SanitizedChordActionPath);
+            if (!ChordAction)
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Chorded trigger requires a valid chordActionPath; action not found: %s"), *SanitizedChordActionPath), TEXT("NOT_FOUND"));
+                return true;
+            }
+            UInputTriggerChordAction* ChordTrigger = NewObject<UInputTriggerChordAction>(TriggerOuter);
+            ChordTrigger->ChordAction = ChordAction;
+            NewTrigger = ChordTrigger;
         }
         else if (TriggerType == TEXT("HoldAndRelease") || TriggerType == TEXT("InputTriggerHoldAndRelease"))
         {
-            NewTrigger = NewObject<UInputTriggerHoldAndRelease>(InAction);
+            NewTrigger = NewObject<UInputTriggerHoldAndRelease>(TriggerOuter);
         }
         else if (TriggerType == TEXT("Pulse") || TriggerType == TEXT("InputTriggerPulse"))
         {
-            NewTrigger = NewObject<UInputTriggerPulse>(InAction);
+            NewTrigger = NewObject<UInputTriggerPulse>(TriggerOuter);
         }
         else if (TriggerType == TEXT("RepeatedTap") || TriggerType == TEXT("InputTriggerRepeatedTap") || TriggerType == TEXT("DoubleTap"))
         {
             // UInputTriggerRepeatedTap was added in UE 5.6
             // For earlier versions, use UInputTriggerTap (single tap) or UInputTriggerHold as fallback
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
-            UInputTriggerRepeatedTap* RepeatedTapTrigger = NewObject<UInputTriggerRepeatedTap>(InAction);
+            UInputTriggerRepeatedTap* RepeatedTapTrigger = NewObject<UInputTriggerRepeatedTap>(TriggerOuter);
             NewTrigger = RepeatedTapTrigger;
 #else
             // Fallback for UE 5.0-5.5: Use UInputTriggerTap as closest equivalent
-            NewTrigger = NewObject<UInputTriggerTap>(InAction);
+            NewTrigger = NewObject<UInputTriggerTap>(TriggerOuter);
 #endif
         }
 
@@ -753,15 +965,51 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             return true;
         }
 
-        // Add the trigger to the action
-        InAction->Triggers.Add(NewTrigger);
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Configure Enhanced Input Trigger")));
+        if (TargetMapping)
+        {
+            TargetContext->Modify();
+        }
+        else
+        {
+            InAction->Modify();
+        }
+        bool bAlreadyConfigured = false;
+        TArray<TObjectPtr<UInputTrigger>>& TargetTriggers = TargetMapping ? TargetMapping->Triggers : InAction->Triggers;
+        for (const UInputTrigger* ExistingTrigger : TargetTriggers)
+        {
+            if (ExistingTrigger && ExistingTrigger->GetClass() == NewTrigger->GetClass())
+            {
+                bAlreadyConfigured = true;
+                break;
+            }
+        }
+        if (!bAlreadyConfigured)
+        {
+            TargetTriggers.Add(NewTrigger);
+        }
+        if (UInputTriggerHold* HoldTrigger = Cast<UInputTriggerHold>(NewTrigger))
+        {
+            SetNumberIfPresent(Payload, TEXT("holdTime"), HoldTrigger->HoldTimeThreshold);
+        }
+        if (UInputTriggerTap* TapTrigger = Cast<UInputTriggerTap>(NewTrigger))
+        {
+            SetNumberIfPresent(Payload, TEXT("tapTime"), TapTrigger->TapReleaseTimeThreshold);
+        }
 
-        SaveLoadedAssetThrottled(InAction, -1.0, true);
+        SaveLoadedAssetThrottled(TargetMapping ? static_cast<UObject*>(TargetContext) : static_cast<UObject*>(InAction), -1.0, true);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("actionPath"), SanitizedActionPath);
         Result->SetStringField(TEXT("triggerType"), TriggerType);
         Result->SetBoolField(TEXT("triggerSet"), true);
+        Result->SetBoolField(TEXT("alreadyConfigured"), bAlreadyConfigured);
+        Result->SetNumberField(TEXT("triggerCount"), TargetTriggers.Num());
+        if (TargetMapping)
+        {
+            Result->SetStringField(TEXT("contextPath"), SanitizedContextPath);
+            Result->SetStringField(TEXT("key"), KeyName);
+        }
         McpHandlerUtils::AddVerification(Result, InAction);
 
         SendAutomationResponse(RequestingSocket, RequestId, true,
@@ -772,6 +1020,10 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     // -------------------------------------------------------------------------
     // set_input_modifier: Configure modifier on input action
     // -------------------------------------------------------------------------
+    if (SubAction == TEXT("add_mapping_modifier"))
+    {
+        SubAction = TEXT("set_input_modifier");
+    }
     if (SubAction == TEXT("set_input_modifier"))
     {
         FString ContextPath;
@@ -862,14 +1114,61 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
             return true;
         }
 
+        if (UInputModifierScalar* ScalarModifier = Cast<UInputModifierScalar>(NewModifier))
+        {
+            SetNumberIfPresent(Payload, TEXT("scalarX"), ScalarModifier->Scalar.X);
+            SetNumberIfPresent(Payload, TEXT("scalarY"), ScalarModifier->Scalar.Y);
+            SetNumberIfPresent(Payload, TEXT("scalarZ"), ScalarModifier->Scalar.Z);
+        }
+        if (UInputModifierNegate* NegateModifier = Cast<UInputModifierNegate>(NewModifier))
+        {
+            bool bValue = false;
+            if (Payload->TryGetBoolField(TEXT("negateX"), bValue)) NegateModifier->bX = bValue;
+            if (Payload->TryGetBoolField(TEXT("negateY"), bValue)) NegateModifier->bY = bValue;
+            if (Payload->TryGetBoolField(TEXT("negateZ"), bValue)) NegateModifier->bZ = bValue;
+        }
+        if (UInputModifierDeadZone* DeadZoneModifier = Cast<UInputModifierDeadZone>(NewModifier))
+        {
+            SetNumberIfPresent(Payload, TEXT("lowerThreshold"), DeadZoneModifier->LowerThreshold);
+            SetNumberIfPresent(Payload, TEXT("upperThreshold"), DeadZoneModifier->UpperThreshold);
+            if (DeadZoneModifier->LowerThreshold < 0.0f || DeadZoneModifier->UpperThreshold > 1.0f ||
+                DeadZoneModifier->LowerThreshold >= DeadZoneModifier->UpperThreshold)
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    TEXT("Dead Zone thresholds must satisfy 0 <= lowerThreshold < upperThreshold <= 1."), TEXT("INVALID_MODIFIER_SETTINGS"));
+                return true;
+            }
+        }
+        if (UInputModifierSwizzleAxis* SwizzleModifier = Cast<UInputModifierSwizzleAxis>(NewModifier))
+        {
+            FString Order;
+            Payload->TryGetStringField(TEXT("swizzleOrder"), Order);
+            if (!Order.IsEmpty())
+            {
+                if (Order.Equals(TEXT("YXZ"), ESearchCase::IgnoreCase)) SwizzleModifier->Order = EInputAxisSwizzle::YXZ;
+                else if (Order.Equals(TEXT("ZYX"), ESearchCase::IgnoreCase)) SwizzleModifier->Order = EInputAxisSwizzle::ZYX;
+                else if (Order.Equals(TEXT("XZY"), ESearchCase::IgnoreCase)) SwizzleModifier->Order = EInputAxisSwizzle::XZY;
+                else if (Order.Equals(TEXT("YZX"), ESearchCase::IgnoreCase)) SwizzleModifier->Order = EInputAxisSwizzle::YZX;
+                else if (Order.Equals(TEXT("ZXY"), ESearchCase::IgnoreCase)) SwizzleModifier->Order = EInputAxisSwizzle::ZXY;
+                else
+                {
+                    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Unsupported swizzleOrder. Supported: YXZ, ZYX, XZY, YZX, ZXY."), TEXT("INVALID_MODIFIER_SETTINGS"));
+                    return true;
+                }
+            }
+        }
+
         if (TargetMapping)
         {
+            const FScopedTransaction Transaction(FText::FromString(TEXT("Configure Enhanced Input Mapping Modifier")));
             Context->Modify();
             TargetMapping->Modifiers.Add(NewModifier);
             SaveLoadedAssetThrottled(Context, -1.0, true);
         }
         else
         {
+            const FScopedTransaction Transaction(FText::FromString(TEXT("Configure Enhanced Input Action Modifier")));
             InAction->Modify();
             InAction->Modifiers.Add(NewModifier);
             SaveLoadedAssetThrottled(InAction, -1.0, true);
@@ -1000,6 +1299,10 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     // -------------------------------------------------------------------------
     // get_input_info: Get info about input asset
     // -------------------------------------------------------------------------
+    if (SubAction == TEXT("inspect_input_asset"))
+    {
+        SubAction = TEXT("get_input_info");
+    }
     if (SubAction == TEXT("get_input_info"))
     {
         FString AssetPath;
@@ -1035,13 +1338,70 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
         if (UInputAction* InputAction = Cast<UInputAction>(Asset))
         {
             Result->SetStringField(TEXT("type"), TEXT("InputAction"));
-            Result->SetStringField(TEXT("valueType"), FString::FromInt((int32)InputAction->ValueType));
+            Result->SetStringField(TEXT("valueType"), InputValueTypeToString(InputAction->ValueType));
             Result->SetBoolField(TEXT("consumeInput"), InputAction->bConsumeInput);
+            TArray<TSharedPtr<FJsonValue>> Modifiers;
+            for (const UInputModifier* Modifier : InputAction->Modifiers)
+            {
+                if (Modifier)
+                {
+                    TSharedPtr<FJsonObject> ModifierObject = McpHandlerUtils::CreateResultObject();
+                    ModifierObject->SetStringField(TEXT("class"), Modifier->GetClass()->GetName());
+                    Modifiers.Add(MakeShared<FJsonValueObject>(ModifierObject));
+                }
+            }
+            Result->SetArrayField(TEXT("modifiers"), Modifiers);
+            TArray<TSharedPtr<FJsonValue>> Triggers;
+            for (const UInputTrigger* Trigger : InputAction->Triggers)
+            {
+                if (Trigger)
+                {
+                    TSharedPtr<FJsonObject> TriggerObject = McpHandlerUtils::CreateResultObject();
+                    TriggerObject->SetStringField(TEXT("class"), Trigger->GetClass()->GetName());
+                    if (const UInputTriggerChordAction* Chord = Cast<UInputTriggerChordAction>(Trigger))
+                    {
+                        TriggerObject->SetStringField(TEXT("chordActionPath"), Chord->ChordAction ? Chord->ChordAction->GetPathName() : FString());
+                    }
+                    Triggers.Add(MakeShared<FJsonValueObject>(TriggerObject));
+                }
+            }
+            Result->SetArrayField(TEXT("triggers"), Triggers);
         }
         else if (UInputMappingContext* Context = Cast<UInputMappingContext>(Asset))
         {
             Result->SetStringField(TEXT("type"), TEXT("InputMappingContext"));
             Result->SetNumberField(TEXT("mappingCount"), Context->GetMappings().Num());
+            TArray<TSharedPtr<FJsonValue>> Mappings;
+            for (const FEnhancedActionKeyMapping& Mapping : Context->GetMappings())
+            {
+                TSharedPtr<FJsonObject> MappingObject = McpHandlerUtils::CreateResultObject();
+                MappingObject->SetStringField(TEXT("actionPath"), Mapping.Action ? Mapping.Action->GetPathName() : FString());
+                MappingObject->SetStringField(TEXT("key"), Mapping.Key.ToString());
+                TArray<TSharedPtr<FJsonValue>> Modifiers;
+                for (const UInputModifier* Modifier : Mapping.Modifiers)
+                {
+                    if (Modifier)
+                    {
+                        TSharedPtr<FJsonObject> ModifierObject = McpHandlerUtils::CreateResultObject();
+                        ModifierObject->SetStringField(TEXT("class"), Modifier->GetClass()->GetName());
+                        Modifiers.Add(MakeShared<FJsonValueObject>(ModifierObject));
+                    }
+                }
+                MappingObject->SetArrayField(TEXT("modifiers"), Modifiers);
+                TArray<TSharedPtr<FJsonValue>> Triggers;
+                for (const UInputTrigger* Trigger : Mapping.Triggers)
+                {
+                    if (Trigger)
+                    {
+                        TSharedPtr<FJsonObject> TriggerObject = McpHandlerUtils::CreateResultObject();
+                        TriggerObject->SetStringField(TEXT("class"), Trigger->GetClass()->GetName());
+                        Triggers.Add(MakeShared<FJsonValueObject>(TriggerObject));
+                    }
+                }
+                MappingObject->SetArrayField(TEXT("triggers"), Triggers);
+                Mappings.Add(MakeShared<FJsonValueObject>(MappingObject));
+            }
+            Result->SetArrayField(TEXT("mappings"), Mappings);
         }
 
         McpHandlerUtils::AddVerification(Result, Asset);

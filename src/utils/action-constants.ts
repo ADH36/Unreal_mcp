@@ -167,6 +167,18 @@ export const INPUT_ACTIONS = {
   REMOVE_LEGACY_ACTION_MAPPING: 'remove_legacy_action_mapping',
   ADD_LEGACY_AXIS_MAPPING: 'add_legacy_axis_mapping',
   REMOVE_LEGACY_AXIS_MAPPING: 'remove_legacy_axis_mapping',
+  MAP_INPUT_ACTION: 'map_input_action',
+  SET_INPUT_TRIGGER: 'set_input_trigger',
+  SET_INPUT_MODIFIER: 'set_input_modifier',
+  ENABLE_INPUT_MAPPING: 'enable_input_mapping',
+  DISABLE_INPUT_ACTION: 'disable_input_action',
+  GET_INPUT_INFO: 'get_input_info',
+  SET_INPUT_ACTION_TYPE: 'set_input_action_type',
+  ADD_INPUT_MAPPING: 'add_input_mapping',
+  REMOVE_INPUT_MAPPING: 'remove_input_mapping',
+  ADD_MAPPING_MODIFIER: 'add_mapping_modifier',
+  ADD_MAPPING_TRIGGER: 'add_mapping_trigger',
+  INSPECT_INPUT_ASSET: 'inspect_input_asset',
 } as const;
 
 // ============================================================================

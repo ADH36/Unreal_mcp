@@ -124,7 +124,9 @@ const blueprintGraphActionSet = new Set<string>([
   'add_begin_play', 'add_tick', 'add_input_event', 'add_custom_event',
   'add_variable_get', 'add_variable_set', 'add_function_call', 'add_branch',
   'add_sequence', 'add_cast', 'add_arithmetic', 'add_component_reference',
-  'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_connections'
+  'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_connections',
+  'register_mapping_context_begin_play', 'add_enhanced_input_event',
+  'bind_input_action_event', 'inspect_input_bindings'
 ]);
 const animationAuthoringActionSet = new Set<string>([
   'create_animation_sequence', 'set_sequence_length', 'add_bone_track', 'set_bone_key', 'set_curve_key',

@@ -85,7 +85,8 @@ describe('handleGraphTools behavior tree payload mapping', () => {
 
     expect(actionSchema.enum).toEqual(expect.arrayContaining([
       'create_event_graph', 'create_function_graph', 'add_begin_play',
-      'add_variable_get', 'add_function_call', 'disconnect_pins', 'inspect_graph'
+      'add_variable_get', 'add_function_call', 'disconnect_pins', 'inspect_graph',
+      'register_mapping_context_begin_play', 'add_enhanced_input_event', 'inspect_input_bindings'
     ]));
   });
 
@@ -107,6 +108,28 @@ describe('handleGraphTools behavior tree payload mapping', () => {
         functionName: 'PrintString'
       }),
       'Automation bridge not available'
+    );
+  });
+
+  it('routes automatic Enhanced Input registration and event binding actions', async () => {
+    await handleGraphTools('manage_blueprint', 'register_mapping_context_begin_play', {
+      action: 'register_mapping_context_begin_play', blueprintPath: '/Game/BP_Input',
+      mappingContextPath: '/Game/Input/IMC_Test', priority: 0
+    }, {} as never);
+    await handleGraphTools('manage_blueprint', 'add_enhanced_input_event', {
+      action: 'add_enhanced_input_event', blueprintPath: '/Game/BP_Input',
+      inputActionPath: '/Game/Input/IA_Move', inputTriggerEvent: 'Triggered'
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenNthCalledWith(
+      1, {}, 'manage_blueprint', expect.objectContaining({
+        subAction: 'register_mapping_context_begin_play', mappingContextPath: '/Game/Input/IMC_Test'
+      }), 'Automation bridge not available'
+    );
+    expect(executeAutomationRequestMock).toHaveBeenNthCalledWith(
+      2, {}, 'manage_blueprint', expect.objectContaining({
+        subAction: 'add_enhanced_input_event', inputActionPath: '/Game/Input/IA_Move', inputTriggerEvent: 'Triggered'
+      }), 'Automation bridge not available'
     );
   });
 });

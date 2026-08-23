@@ -150,7 +150,9 @@ export const INPUT_ACTIONS = [
   'add_legacy_action_mapping', 'remove_legacy_action_mapping',
   'add_legacy_axis_mapping', 'remove_legacy_axis_mapping',
   'map_input_action', 'set_input_trigger', 'set_input_modifier', 'enable_input_mapping',
-  'disable_input_action', 'get_input_info'
+  'disable_input_action', 'get_input_info', 'set_input_action_type',
+  'add_input_mapping', 'remove_input_mapping', 'add_mapping_modifier',
+  'add_mapping_trigger', 'inspect_input_asset'
 ] as const;
 
 export const VOLUME_ACTIONS = [
@@ -392,7 +394,9 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'add_begin_play', 'add_tick', 'add_input_event', 'add_custom_event',
             'add_variable_get', 'add_variable_set', 'add_function_call', 'add_branch',
             'add_sequence', 'add_cast', 'add_arithmetic', 'add_component_reference',
-            'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_nodes', 'get_connections'
+            'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_nodes', 'get_connections',
+            'register_mapping_context_begin_play', 'add_enhanced_input_event',
+            'bind_input_action_event', 'inspect_input_bindings'
           ,
             ...WIDGET_AUTHORING_ACTIONS],
           description: 'Blueprint action'
@@ -459,6 +463,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         actionPath: commonSchemas.assetPath,
         inputActionPath: commonSchemas.assetPath,
         inputActionAssetPath: commonSchemas.assetPath,
+        mappingContextPath: commonSchemas.assetPath,
+        inputTriggerEvent: { type: 'string', enum: ['Started', 'Triggered', 'Ongoing', 'Completed', 'Canceled'], description: 'Enhanced Input event pin to use.' },
         // Compilation options
         saveAfterCompile: commonSchemas.booleanProp,
         // Timing/async options
@@ -3351,6 +3357,19 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         cmd: { type: 'boolean', description: 'Require Cmd for a legacy action mapping.' },
         triggerType: commonSchemas.stringProp,
         modifierType: commonSchemas.stringProp,
+        valueType: { type: 'string', enum: ['Boolean', 'Axis1D', 'Axis2D', 'Axis3D'], description: 'Enhanced Input action value type.' },
+        chordActionPath: commonSchemas.assetPath,
+        lowerThreshold: commonSchemas.numberProp,
+        upperThreshold: commonSchemas.numberProp,
+        scalarX: commonSchemas.numberProp,
+        scalarY: commonSchemas.numberProp,
+        scalarZ: commonSchemas.numberProp,
+        swizzleOrder: commonSchemas.stringProp,
+        negateX: commonSchemas.booleanProp,
+        negateY: commonSchemas.booleanProp,
+        negateZ: commonSchemas.booleanProp,
+        holdTime: commonSchemas.numberProp,
+        tapTime: commonSchemas.numberProp,
         assetPath: commonSchemas.assetPath,
         priority: { type: 'number', description: 'Priority for input mapping context (default: 0).' },
         timeoutMs: commonSchemas.numberProp,

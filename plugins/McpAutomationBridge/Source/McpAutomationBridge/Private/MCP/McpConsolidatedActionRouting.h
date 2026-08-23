@@ -160,7 +160,9 @@ inline const TArray<FString>& ManageBlueprintCore()
 		TEXT("add_branch"), TEXT("add_sequence"), TEXT("add_cast"),
 		TEXT("add_arithmetic"), TEXT("add_component_reference"),
 		TEXT("add_self_reference"), TEXT("disconnect_pins"),
-		TEXT("inspect_graph"), TEXT("get_nodes"), TEXT("get_connections")
+		TEXT("inspect_graph"), TEXT("get_nodes"), TEXT("get_connections"),
+		TEXT("register_mapping_context_begin_play"), TEXT("add_enhanced_input_event"),
+		TEXT("bind_input_action_event"), TEXT("inspect_input_bindings")
 	};
 	return Actions;
 }
@@ -495,7 +497,10 @@ inline const TArray<FString>& Input()
 		TEXT("add_legacy_axis_mapping"), TEXT("remove_legacy_axis_mapping"),
 		TEXT("set_input_trigger"), TEXT("set_input_modifier"),
 		TEXT("enable_input_mapping"), TEXT("disable_input_action"),
-		TEXT("get_input_info")
+		TEXT("get_input_info"), TEXT("set_input_action_type"),
+		TEXT("add_input_mapping"), TEXT("remove_input_mapping"),
+		TEXT("add_mapping_modifier"), TEXT("add_mapping_trigger"),
+		TEXT("inspect_input_asset")
 	};
 	return Actions;
 }

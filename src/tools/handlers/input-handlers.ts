@@ -7,20 +7,26 @@ import { sanitizePath } from '../../utils/path-security.js';
 
 /** Valid parameters for each input action */
 const VALID_PARAMS_BY_ACTION: Record<string, Set<string>> = {
-    create_input_action: new Set(['action', 'name', 'path', 'priority', 'timeoutMs']),
+    create_input_action: new Set(['action', 'name', 'path', 'valueType', 'priority', 'timeoutMs']),
     create_input_mapping_context: new Set(['action', 'name', 'path', 'priority', 'timeoutMs']),
     add_mapping: new Set(['action', 'contextPath', 'actionPath', 'key', 'triggerType', 'modifierType', 'timeoutMs']),
+    add_input_mapping: new Set(['action', 'contextPath', 'actionPath', 'key', 'timeoutMs']),
     remove_mapping: new Set(['action', 'contextPath', 'actionPath', 'key', 'timeoutMs']),
+    remove_input_mapping: new Set(['action', 'contextPath', 'actionPath', 'key', 'timeoutMs']),
     add_legacy_action_mapping: new Set(['action', 'name', 'actionName', 'key', 'shift', 'ctrl', 'alt', 'cmd', 'timeoutMs']),
     remove_legacy_action_mapping: new Set(['action', 'name', 'actionName', 'key', 'shift', 'ctrl', 'alt', 'cmd', 'timeoutMs']),
     add_legacy_axis_mapping: new Set(['action', 'name', 'axisName', 'key', 'scale', 'timeoutMs']),
     remove_legacy_axis_mapping: new Set(['action', 'name', 'axisName', 'key', 'scale', 'timeoutMs']),
     map_input_action: new Set(['action', 'contextPath', 'actionPath', 'key', 'timeoutMs']),
-    set_input_trigger: new Set(['action', 'actionPath', 'triggerType', 'timeoutMs']),
-    set_input_modifier: new Set(['action', 'contextPath', 'actionPath', 'key', 'modifierType', 'timeoutMs']),
+    set_input_trigger: new Set(['action', 'actionPath', 'triggerType', 'chordActionPath', 'holdTime', 'tapTime', 'timeoutMs']),
+    add_mapping_trigger: new Set(['action', 'contextPath', 'actionPath', 'key', 'triggerType', 'chordActionPath', 'holdTime', 'tapTime', 'timeoutMs']),
+    set_input_modifier: new Set(['action', 'contextPath', 'actionPath', 'key', 'modifierType', 'scalarX', 'scalarY', 'scalarZ', 'swizzleOrder', 'lowerThreshold', 'upperThreshold', 'negateX', 'negateY', 'negateZ', 'timeoutMs']),
+    add_mapping_modifier: new Set(['action', 'contextPath', 'actionPath', 'key', 'modifierType', 'scalarX', 'scalarY', 'scalarZ', 'swizzleOrder', 'lowerThreshold', 'upperThreshold', 'negateX', 'negateY', 'negateZ', 'timeoutMs']),
     enable_input_mapping: new Set(['action', 'contextPath', 'priority', 'timeoutMs']),
     disable_input_action: new Set(['action', 'actionPath', 'timeoutMs']),
     get_input_info: new Set(['action', 'assetPath', 'timeoutMs']),
+    inspect_input_asset: new Set(['action', 'assetPath', 'timeoutMs']),
+    set_input_action_type: new Set(['action', 'actionPath', 'valueType', 'timeoutMs']),
 };
 
 /** Validate that no extraneous parameters are present */
@@ -92,10 +98,14 @@ const REQUIRED_PATHS_BY_ACTION: Record<string, string[]> = {
     remove_mapping: ['contextPath', 'actionPath'],
     map_input_action: ['contextPath', 'actionPath'],
     set_input_trigger: ['actionPath'],
+    add_mapping_trigger: ['contextPath', 'actionPath'],
     set_input_modifier: ['actionPath'],
+    add_mapping_modifier: ['contextPath', 'actionPath'],
     enable_input_mapping: ['contextPath'],
     disable_input_action: ['actionPath'],
     get_input_info: ['assetPath'],
+    inspect_input_asset: ['assetPath'],
+    set_input_action_type: ['actionPath'],
 };
 
 export async function handleInputTools(
@@ -164,8 +174,14 @@ export async function handleInputTools(
         case 'add_mapping':
             return sendRequest('add_mapping');
 
+        case 'add_input_mapping':
+            return sendRequest('add_input_mapping');
+
         case 'remove_mapping':
             return sendRequest('remove_mapping');
+
+        case 'remove_input_mapping':
+            return sendRequest('remove_input_mapping');
 
         case 'add_legacy_action_mapping':
             return sendRequest('add_legacy_action_mapping');
@@ -186,8 +202,14 @@ export async function handleInputTools(
         case 'set_input_trigger':
             return sendRequest('set_input_trigger');
 
+        case 'add_mapping_trigger':
+            return sendRequest('add_mapping_trigger');
+
         case 'set_input_modifier':
             return sendRequest('set_input_modifier');
+
+        case 'add_mapping_modifier':
+            return sendRequest('add_mapping_modifier');
 
         case 'enable_input_mapping':
             return sendRequest('enable_input_mapping');
@@ -197,6 +219,12 @@ export async function handleInputTools(
 
         case 'get_input_info':
             return sendRequest('get_input_info');
+
+        case 'inspect_input_asset':
+            return sendRequest('inspect_input_asset');
+
+        case 'set_input_action_type':
+            return sendRequest('set_input_action_type');
 
         default:
             return ResponseFactory.error(`Unknown input action: ${action}`);

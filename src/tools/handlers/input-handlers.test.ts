@@ -84,4 +84,41 @@ describe('handleInputTools path normalization', () => {
       expect.objectContaining({ timeoutMs: expect.any(Number) })
     );
   });
+
+  it('forwards Enhanced Input value types and mapping modifiers', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+
+    await handleInputTools('create_input_action', {
+      action: 'create_input_action', name: 'IA_Move', path: 'Game/MCPTest/Input', valueType: 'Axis2D'
+    }, tools);
+    await handleInputTools('add_mapping_modifier', {
+      action: 'add_mapping_modifier', contextPath: 'Game/MCPTest/Input/IMC_Test',
+      actionPath: 'Game/MCPTest/Input/IA_Move', key: 'W', modifierType: 'Negate', negateY: false
+    }, tools);
+
+    expect(sendAutomationRequest).toHaveBeenNthCalledWith(
+      1, 'manage_input', expect.objectContaining({ subAction: 'create_input_action', valueType: 'Axis2D' }),
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    );
+    expect(sendAutomationRequest).toHaveBeenNthCalledWith(
+      2, 'manage_input', expect.objectContaining({ subAction: 'add_mapping_modifier', modifierType: 'Negate', negateY: false }),
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    );
+  });
+
+  it('routes mapping trigger aliases with sanitized asset paths', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+
+    await handleInputTools('add_mapping_trigger', {
+      action: 'add_mapping_trigger', contextPath: 'Game/MCPTest/Input/IMC_Test',
+      actionPath: 'Game/MCPTest/Input/IA_Jump', key: 'SpaceBar', triggerType: 'Pressed'
+    }, tools);
+
+    expect(sendAutomationRequest).toHaveBeenCalledWith(
+      'manage_input', expect.objectContaining({
+        subAction: 'add_mapping_trigger', contextPath: '/Game/MCPTest/Input/IMC_Test',
+        actionPath: '/Game/MCPTest/Input/IA_Jump', triggerType: 'Pressed'
+      }), expect.objectContaining({ timeoutMs: expect.any(Number) })
+    );
+  });
 });

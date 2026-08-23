@@ -101,6 +101,8 @@ public:
 			.String(TEXT("actionPath"), TEXT("Input action asset path."))
 			.String(TEXT("inputActionPath"), TEXT("Input action asset path."))
 			.String(TEXT("inputActionAssetPath"), TEXT("Input action asset path."))
+			.String(TEXT("mappingContextPath"), TEXT("Input mapping context asset path."))
+			.String(TEXT("inputTriggerEvent"), TEXT("Enhanced Input event pin: Started, Triggered, Ongoing, Completed, or Canceled."))
 			.Bool(TEXT("saveAfterCompile"), TEXT(""))
 			.Number(TEXT("timeoutMs"), TEXT(""))
 			.String(TEXT("parentClass"), TEXT("Path or name of the parent class."))

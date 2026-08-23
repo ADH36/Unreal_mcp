@@ -92,6 +92,9 @@
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "InputAction.h"
+#include "InputMappingContext.h"
+#include "EnhancedInputSubsystems.h"
+#include "Subsystems/SubsystemBlueprintLibrary.h"
 
 // Blueprint Editor
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -422,7 +425,10 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
   } else if (SubAction == TEXT("add_input_event")) {
     SubAction = TEXT("create_node");
     ForcedNodeType = TEXT("InputAxisEvent");
-  } else if (SubAction == TEXT("inspect_graph") || SubAction == TEXT("get_connections")) {
+  } else if (SubAction == TEXT("add_enhanced_input_event") || SubAction == TEXT("bind_input_action_event")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("K2Node_EnhancedInputAction");
+  } else if (SubAction == TEXT("inspect_graph") || SubAction == TEXT("get_connections") || SubAction == TEXT("inspect_input_bindings")) {
     SubAction = TEXT("get_nodes");
   }
 
@@ -490,6 +496,174 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     return nullptr;
   };
 
+  if (SubAction == TEXT("register_mapping_context_begin_play")) {
+    FString MappingContextPath;
+    Payload->TryGetStringField(TEXT("mappingContextPath"), MappingContextPath);
+    if (MappingContextPath.IsEmpty()) {
+      Payload->TryGetStringField(TEXT("contextPath"), MappingContextPath);
+    }
+    int32 Priority = 0;
+    Payload->TryGetNumberField(TEXT("priority"), Priority);
+
+    FString CleanContextPath = MappingContextPath;
+    int32 DotIndex = INDEX_NONE;
+    FString PackagePath = CleanContextPath;
+    if (CleanContextPath.FindChar(TEXT('.'), DotIndex)) {
+      PackagePath = CleanContextPath.Left(DotIndex);
+    }
+    const FString SanitizedContextPath = SanitizeProjectRelativePath(PackagePath);
+    if (SanitizedContextPath.IsEmpty()) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("mappingContextPath is required and must be a valid project asset path."),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    CleanContextPath = DotIndex == INDEX_NONE
+        ? FString::Printf(TEXT("%s.%s"), *SanitizedContextPath, *FPackageName::GetShortName(SanitizedContextPath))
+        : SanitizedContextPath + CleanContextPath.Mid(DotIndex);
+    UInputMappingContext* MappingContext = LoadObject<UInputMappingContext>(nullptr, *CleanContextPath);
+    if (!MappingContext) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Input Mapping Context not found: %s"), *MappingContextPath),
+                          TEXT("ASSET_NOT_FOUND"));
+      return true;
+    }
+
+    UFunction* BeginPlayFunction = AActor::StaticClass()->FindFunctionByName(TEXT("ReceiveBeginPlay"));
+    UFunction* GetPlayerControllerFunction = UGameplayStatics::StaticClass()->FindFunctionByName(TEXT("GetPlayerController"));
+    UFunction* GetSubsystemFunction = USubsystemBlueprintLibrary::StaticClass()->FindFunctionByName(TEXT("GetLocalPlayerSubSystemFromPlayerController"));
+    UFunction* AddMappingFunction = UEnhancedInputLocalPlayerSubsystem::StaticClass()->FindFunctionByName(TEXT("AddMappingContext"));
+    if (!BeginPlayFunction || !GetPlayerControllerFunction || !GetSubsystemFunction || !AddMappingFunction) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("Enhanced Input registration functions could not be resolved through UE reflection."),
+                          TEXT("REFLECTION_NOT_AVAILABLE"));
+      return true;
+    }
+
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Register Enhanced Input Mapping Context")));
+    Blueprint->Modify();
+    TargetGraph->Modify();
+    UK2Node_Event* BeginPlayNode = nullptr;
+    for (UEdGraphNode* ExistingNode : TargetGraph->Nodes) {
+      if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(ExistingNode)) {
+        if (EventNode->EventReference.GetMemberName() == BeginPlayFunction->GetFName()) {
+          BeginPlayNode = EventNode;
+          break;
+        }
+      }
+    }
+    if (!BeginPlayNode) {
+      FGraphNodeCreator<UK2Node_Event> Creator(*TargetGraph);
+      BeginPlayNode = Creator.CreateNode(false);
+      BeginPlayNode->EventReference.SetFromField<UFunction>(BeginPlayFunction, false);
+      BeginPlayNode->bOverrideFunction = true;
+      BeginPlayNode->NodePosX = -700;
+      BeginPlayNode->NodePosY = -150;
+      Creator.Finalize();
+    }
+
+    auto CreateReflectedCall = [&](UFunction* Function, int32 X, int32 Y) -> UK2Node_CallFunction* {
+      FGraphNodeCreator<UK2Node_CallFunction> Creator(*TargetGraph);
+      UK2Node_CallFunction* Node = Creator.CreateNode(false);
+      Node->SetFromFunction(Function);
+      Node->NodePosX = X;
+      Node->NodePosY = Y;
+      Creator.Finalize();
+      return Node;
+    };
+    UK2Node_CallFunction* GetPlayerControllerNode = nullptr;
+    UK2Node_CallFunction* GetSubsystemNode = nullptr;
+    UK2Node_DynamicCast* EnhancedInputCastNode = nullptr;
+    UK2Node_CallFunction* AddMappingNode = nullptr;
+    for (UEdGraphNode* ExistingNode : TargetGraph->Nodes) {
+      UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(ExistingNode);
+      if (!CallNode) {
+        continue;
+      }
+      const FName FunctionName = CallNode->FunctionReference.GetMemberName();
+      if (!AddMappingNode && FunctionName == AddMappingFunction->GetFName()) {
+        UEdGraphPin* ExistingContextPin = FindPinByName(CallNode, TEXT("MappingContext"));
+        if (ExistingContextPin && ExistingContextPin->DefaultObject.Get() == static_cast<UObject*>(MappingContext)) {
+          AddMappingNode = CallNode;
+        }
+      }
+      if (FunctionName == GetPlayerControllerFunction->GetFName() && !GetPlayerControllerNode) {
+        GetPlayerControllerNode = CallNode;
+      }
+      if (FunctionName == GetSubsystemFunction->GetFName() && !GetSubsystemNode) {
+        GetSubsystemNode = CallNode;
+      }
+    }
+    bool bCreatedRegistration = false;
+    if (!AddMappingNode) {
+      GetPlayerControllerNode = CreateReflectedCall(GetPlayerControllerFunction, -400, 0);
+      GetSubsystemNode = CreateReflectedCall(GetSubsystemFunction, -100, 0);
+      AddMappingNode = CreateReflectedCall(AddMappingFunction, 220, 0);
+      bCreatedRegistration = true;
+      if (UEdGraphPin* ContextPin = FindPinByName(AddMappingNode, TEXT("MappingContext"))) {
+        ContextPin->DefaultObject = static_cast<UObject*>(MappingContext);
+      }
+      if (UEdGraphPin* PriorityPin = FindPinByName(AddMappingNode, TEXT("Priority"))) {
+        PriorityPin->DefaultValue = FString::FromInt(Priority);
+      }
+      if (UEdGraphPin* ClassPin = FindPinByName(GetSubsystemNode, TEXT("Class"))) {
+        ClassPin->DefaultObject = UEnhancedInputLocalPlayerSubsystem::StaticClass();
+      }
+      if (UEdGraphPin* PlayerIndexPin = FindPinByName(GetPlayerControllerNode, TEXT("PlayerIndex"))) {
+        PlayerIndexPin->DefaultValue = TEXT("0");
+      }
+      {
+        FGraphNodeCreator<UK2Node_DynamicCast> CastCreator(*TargetGraph);
+        EnhancedInputCastNode = CastCreator.CreateNode(false);
+        EnhancedInputCastNode->TargetType = UEnhancedInputLocalPlayerSubsystem::StaticClass();
+        EnhancedInputCastNode->ReconstructNode();
+        EnhancedInputCastNode->NodePosX = 40;
+        EnhancedInputCastNode->NodePosY = 0;
+        CastCreator.Finalize();
+      }
+      auto ConnectIfPossible = [&](UEdGraphNode* FromNode, const TCHAR* FromName, UEdGraphNode* ToNode, const TCHAR* ToName) -> bool {
+        UEdGraphPin* FromPin = FindPinByName(FromNode, FromName);
+        UEdGraphPin* ToPin = FindPinByName(ToNode, ToName);
+        return FromPin && ToPin && TargetGraph->GetSchema()->TryCreateConnection(FromPin, ToPin);
+      };
+      UEdGraphPin* CastObjectPin = EnhancedInputCastNode ? FindPinByName(EnhancedInputCastNode, TEXT("Object")) : nullptr;
+      UEdGraphPin* CastOutputPin = nullptr;
+      if (EnhancedInputCastNode) {
+        for (UEdGraphPin* Pin : EnhancedInputCastNode->Pins) {
+          if (Pin && Pin->Direction == EGPD_Output && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object &&
+              Pin->PinName.ToString().StartsWith(TEXT("As"))) {
+            CastOutputPin = Pin;
+            break;
+          }
+        }
+      }
+      UEdGraphPin* AddSelfPin = FindPinByName(AddMappingNode, TEXT("self"));
+      if (!ConnectIfPossible(BeginPlayNode, TEXT("then"), AddMappingNode, TEXT("execute")) ||
+          !ConnectIfPossible(GetPlayerControllerNode, TEXT("ReturnValue"), GetSubsystemNode, TEXT("PlayerController")) ||
+          !CastObjectPin || !CastOutputPin ||
+          !TargetGraph->GetSchema()->TryCreateConnection(FindPinByName(GetSubsystemNode, TEXT("ReturnValue")), CastObjectPin) ||
+          !AddSelfPin || !TargetGraph->GetSchema()->TryCreateConnection(CastOutputPin, AddSelfPin)) {
+        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("Enhanced Input registration graph could not connect reflected pins. Inspect available pins and UE class compatibility."),
+                            TEXT("PIN_CONNECTION_FAILED"));
+        return true;
+      }
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    SaveLoadedAssetThrottled(Blueprint);
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("mappingContextPath"), CleanContextPath);
+    Result->SetStringField(TEXT("beginPlayNodeId"), BeginPlayNode->NodeGuid.ToString());
+    Result->SetStringField(TEXT("getPlayerControllerNodeId"), GetPlayerControllerNode->NodeGuid.ToString());
+    Result->SetStringField(TEXT("getSubsystemNodeId"), GetSubsystemNode->NodeGuid.ToString());
+    Result->SetStringField(TEXT("addMappingContextNodeId"), AddMappingNode->NodeGuid.ToString());
+    Result->SetBoolField(TEXT("created"), bCreatedRegistration);
+    McpHandlerUtils::AddVerification(Result, Blueprint);
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           bCreatedRegistration ? TEXT("Enhanced Input Mapping Context registered during BeginPlay.") : TEXT("BeginPlay Mapping Context registration already exists."), Result);
+    return true;
+  }
+
   if (SubAction == TEXT("create_node")) {
     const FScopedTransaction Transaction(
         FText::FromString(TEXT("Create Blueprint Node")));
@@ -512,6 +686,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         NodeType.Equals(TEXT("K2Node_Event"), ESearchCase::IgnoreCase) ||
         NodeType.Equals(TEXT("CustomEvent"), ESearchCase::IgnoreCase) ||
         NodeType.Equals(TEXT("K2Node_CustomEvent"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("K2Node_EnhancedInputAction"), ESearchCase::IgnoreCase) ||
         NodeType.Equals(TEXT("InputAxisEvent"), ESearchCase::IgnoreCase) ||
         NodeType.Equals(TEXT("K2Node_InputAxisEvent"), ESearchCase::IgnoreCase);
     if (bIsEventNode && !Blueprint->UbergraphPages.Contains(TargetGraph)) {
@@ -1433,6 +1608,29 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
                               FString::Printf(TEXT("Input action not found: %s"), *InputActionPath),
                               TEXT("ASSET_NOT_FOUND"));
           return true;
+        }
+
+        // Enhanced Input event nodes are keyed by their action asset. Reuse an
+        // existing node so repeated MCP calls remain idempotent and do not
+        // create duplicate event sources in the graph.
+        for (UEdGraphNode* ExistingNode : TargetGraph->Nodes) {
+          if (!ExistingNode || ExistingNode->GetClass() != NodeClass) {
+            continue;
+          }
+          if (FObjectProperty* ExistingActionProperty = CastField<FObjectProperty>(ExistingNode->GetClass()->FindPropertyByName(FName(TEXT("InputAction"))))) {
+            if (ExistingActionProperty->GetObjectPropertyValue_InContainer(ExistingNode) == InputAction) {
+              TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+              Result->SetStringField(TEXT("nodeId"), ExistingNode->NodeGuid.ToString());
+              Result->SetStringField(TEXT("nodeName"), ExistingNode->GetName());
+              Result->SetStringField(TEXT("nodeClass"), NodeClass->GetName());
+              Result->SetStringField(TEXT("inputActionPath"), CleanActionPath);
+              Result->SetBoolField(TEXT("alreadyExists"), true);
+              McpHandlerUtils::AddVerification(Result, Blueprint);
+              SendAutomationResponse(RequestingSocket, RequestId, true,
+                                     TEXT("Enhanced Input node already exists."), Result);
+              return true;
+            }
+          }
         }
 
         UEdGraphNode *NewNode = NewObject<UEdGraphNode>(TargetGraph, NodeClass);
