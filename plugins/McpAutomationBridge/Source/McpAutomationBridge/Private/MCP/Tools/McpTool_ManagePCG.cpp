@@ -12,7 +12,7 @@ public:
 	FString GetDescription() const override
 	{
 		return TEXT("Create, edit, execute, and configure PCG graphs: graph assets, input/sampler/filter/spawner nodes, "
-			"pin connections, node settings, and partition grid size.");
+			"pin connections, UE 5.8 Static Mesh Spawner selectors and entries, generated output, and partition grid size.");
 	}
 
 	FString GetCategory() const override { return TEXT("world"); }
@@ -45,7 +45,17 @@ public:
 			.String(TEXT("classPath"), TEXT("Class path/name for actor-spawner settings or class-based PCG settings."))
 			.String(TEXT("actorClass"), TEXT("Actor class path/name for spawn actor PCG nodes."))
 			.String(TEXT("meshPath"), TEXT("Static mesh asset path for mesh/spawner PCG settings."))
+			.String(TEXT("staticMesh"), TEXT("Static mesh asset path alias for Static Mesh Spawner entries."))
 			.String(TEXT("texturePath"), TEXT("Texture asset path for texture sampler PCG settings."))
+			.String(TEXT("meshSelectorType"), TEXT("Mesh selector class/name or alias, such as weighted or weighted_by_category."))
+			.Number(TEXT("entryIndex"), TEXT("Static Mesh Spawner mesh entry index."))
+			.Number(TEXT("weight"), TEXT("Static Mesh Spawner mesh entry weight."))
+			.FreeformObject(TEXT("entry"), TEXT("Static Mesh Spawner entry payload."))
+			.Array(TEXT("meshEntries"), TEXT("Static Mesh Spawner entries."))
+			.FreeformObject(TEXT("descriptorSettings"), TEXT("Reflected FPCGSoftISMComponentDescriptor properties."))
+			.FreeformObject(TEXT("collision"), TEXT("Collision profile or reflected collision descriptor settings."))
+			.Number(TEXT("seed"), TEXT("Deterministic PCG seed."))
+			.Bool(TEXT("deterministic"), TEXT("Request deterministic variation when supported by the node."))
 			.StringEnum(TEXT("scope"), {TEXT("world"), TEXT("component")}, TEXT("Partition grid target scope."))
 			.Bool(TEXT("createComponent"), TEXT("Create a PCG component on actor when executing and none exists."))
 			.Bool(TEXT("force"), TEXT("Force PCG generation."))

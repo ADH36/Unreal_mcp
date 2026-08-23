@@ -297,6 +297,9 @@ inline const TArray<FString>& PCG()
 		TEXT("create_pcg_graph"), TEXT("create_pcg_subgraph"),
 		TEXT("add_pcg_node"), TEXT("connect_pcg_pins"),
 		TEXT("set_pcg_node_settings"),
+		TEXT("find_static_mesh_spawner"), TEXT("configure_static_mesh_spawner"),
+		TEXT("add_static_mesh_entry"), TEXT("update_static_mesh_entry"),
+		TEXT("remove_static_mesh_entry"), TEXT("inspect_static_mesh_spawner"),
 		TEXT("add_landscape_data_node"), TEXT("add_spline_data_node"),
 		TEXT("add_volume_data_node"), TEXT("add_actor_data_node"),
 		TEXT("add_texture_data_node"), TEXT("add_surface_sampler"),
@@ -309,6 +312,8 @@ inline const TArray<FString>& PCG()
 		TEXT("add_copy_points"), TEXT("add_merge_points"),
 		TEXT("add_static_mesh_spawner"), TEXT("add_actor_spawner"),
 		TEXT("add_spline_spawner"), TEXT("execute_pcg_graph"),
+		TEXT("regenerate_pcg_component"), TEXT("read_pcg_generated_instances"),
+		TEXT("clear_pcg_generated_output"),
 		TEXT("set_pcg_partition_grid_size")
 	};
 	return Actions;

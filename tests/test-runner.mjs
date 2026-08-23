@@ -894,7 +894,7 @@ function matchesObjectSubset(candidate, expectedSubset) {
   });
 }
 
-function evaluateAssertions(testCase, response) {
+function evaluateAssertions(testCase, response, capturedValues = {}) {
   if (!Array.isArray(testCase.assertions) || testCase.assertions.length === 0) return { passed: true };
 
   for (const assertion of testCase.assertions) {
@@ -907,6 +907,17 @@ function evaluateAssertions(testCase, response) {
 
     if (Object.prototype.hasOwnProperty.call(assertion, 'length') && (!Array.isArray(actual) || actual.length !== assertion.length)) {
       return { passed: false, reason: `${label}: expected array length ${assertion.length}, got ${Array.isArray(actual) ? actual.length : typeof actual}` };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(assertion, 'greaterThan') && (!(typeof actual === 'number') || actual <= assertion.greaterThan)) {
+      return { passed: false, reason: `${label}: expected ${JSON.stringify(actual)} to be greater than ${assertion.greaterThan}` };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(assertion, 'equalsCaptured')) {
+      const expected = capturedValues[assertion.equalsCaptured];
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        return { passed: false, reason: `${label}: expected captured ${assertion.equalsCaptured} to equal ${JSON.stringify(actual)}` };
+      }
     }
 
     if (assertion.includesObject) {
@@ -1502,7 +1513,7 @@ export async function runToolTests(toolName, testCases) {
         }
         let { passed, reason } = evaluateExpectation(testCase, normalizedResponse);
         if (passed && testCase.assertions) {
-          const assertionResult = evaluateAssertions(testCase, normalizedResponse);
+          const assertionResult = evaluateAssertions(testCase, normalizedResponse, capturedValues);
           if (!assertionResult.passed) {
             passed = false;
             reason = assertionResult.reason;

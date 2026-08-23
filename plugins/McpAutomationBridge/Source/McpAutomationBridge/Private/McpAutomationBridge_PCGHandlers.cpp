@@ -28,6 +28,7 @@
 #include "PCGComponent.h"
 #include "PCGEdge.h"
 #include "PCGGraph.h"
+#include "PCGManagedResource.h"
 #include "PCGNode.h"
 #include "PCGPin.h"
 #include "PCGSettings.h"
@@ -36,8 +37,18 @@
 #include "Elements/PCGStaticMeshSpawner.h"
 #include "Elements/PCGSpawnActor.h"
 #include "Engine/StaticMesh.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Helpers/PCGHelpers.h"
 #include "MeshSelectors/PCGMeshSelectorWeighted.h"
+#include "Misc/Crc.h"
+#if __has_include("ScopedTransaction.h")
+#include "ScopedTransaction.h"
+#elif __has_include("Editor/ScopedTransaction.h")
+#include "Editor/ScopedTransaction.h"
+#elif __has_include("Misc/ScopedTransaction.h")
+#include "Misc/ScopedTransaction.h"
+#endif
 #endif
 
 #if WITH_EDITOR && MCP_HAS_PCG
@@ -713,23 +724,568 @@ bool ApplyStaticMeshSpawnerMeshPath(UPCGSettings* Settings, const FString& MeshP
     }
 
     SpawnerSettings->Modify();
-    if (!SpawnerSettings->MeshSelectorParameters || !SpawnerSettings->MeshSelectorParameters->IsA<UPCGMeshSelectorWeighted>())
+    if (!SpawnerSettings->MeshSelectorParameters)
     {
         SpawnerSettings->SetMeshSelectorType(UPCGMeshSelectorWeighted::StaticClass());
     }
 
-    UPCGMeshSelectorWeighted* WeightedSelector = Cast<UPCGMeshSelectorWeighted>(SpawnerSettings->MeshSelectorParameters);
-    if (!WeightedSelector)
+    UObject* Selector = SpawnerSettings->MeshSelectorParameters;
+    if (!Selector)
     {
-        OutError = TEXT("Could not create weighted mesh selector for PCG static mesh spawner.");
+        OutError = TEXT("PCG static mesh spawner did not create MeshSelectorParameters after selecting weighted.");
         return false;
     }
 
-    WeightedSelector->Modify();
-    WeightedSelector->MeshEntries.Reset();
-    FPCGMeshSelectorWeightedEntry& Entry = WeightedSelector->MeshEntries.AddDefaulted_GetRef();
-    Entry.Descriptor.StaticMesh = StaticMesh;
-    Entry.Weight = 1;
+    FArrayProperty* EntriesProperty = FindFProperty<FArrayProperty>(Selector->GetClass(), TEXT("MeshEntries"));
+    if (!EntriesProperty)
+    {
+        OutError = FString::Printf(TEXT("PCG mesh selector '%s' has no reflected property 'MeshEntries'; selector-specific entries are not supported."), *Selector->GetClass()->GetName());
+        return false;
+    }
+
+    FScriptArrayHelper EntriesHelper(EntriesProperty, EntriesProperty->ContainerPtrToValuePtr<void>(Selector));
+    EntriesHelper.EmptyValues();
+    EntriesHelper.AddValue();
+    void* EntryPtr = EntriesHelper.GetRawPtr(0);
+    FStructProperty* EntryStructProperty = CastField<FStructProperty>(EntriesProperty->Inner);
+    if (!EntryStructProperty || !EntryStructProperty->Struct)
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s.%s' is not an entry struct array."), *Selector->GetClass()->GetName(), *EntriesProperty->GetName());
+        return false;
+    }
+
+    FStructProperty* DescriptorProperty = FindFProperty<FStructProperty>(EntryStructProperty->Struct, TEXT("Descriptor"));
+    FSoftObjectProperty* MeshProperty = DescriptorProperty && DescriptorProperty->Struct
+        ? FindFProperty<FSoftObjectProperty>(DescriptorProperty->Struct, TEXT("StaticMesh"))
+        : nullptr;
+    if (!DescriptorProperty || !MeshProperty)
+    {
+        OutError = FString::Printf(TEXT("Reflected mesh entry '%s' is missing Descriptor.StaticMesh soft-object property."), *EntryStructProperty->Struct->GetName());
+        return false;
+    }
+
+    void* DescriptorPtr = DescriptorProperty->ContainerPtrToValuePtr<void>(EntryPtr);
+    void* MeshPtr = MeshProperty->ContainerPtrToValuePtr<void>(DescriptorPtr);
+    *static_cast<FSoftObjectPtr*>(MeshPtr) = FSoftObjectPath(StaticMesh->GetPathName());
+    if (FProperty* WeightProperty = FindFProperty<FProperty>(EntryStructProperty->Struct, TEXT("Weight")))
+    {
+        ApplyJsonValueToProperty(EntryPtr, WeightProperty, MakeShared<FJsonValueNumber>(1.0), OutError);
+    }
+    return true;
+}
+
+FProperty* FindPCGProperty(UStruct* Struct, const TArray<FName>& Names)
+{
+    if (!Struct)
+    {
+        return nullptr;
+    }
+    for (const FName& Name : Names)
+    {
+        if (FProperty* Property = FindFProperty<FProperty>(Struct, Name))
+        {
+            return Property;
+        }
+    }
+    return nullptr;
+}
+
+bool ResolvePCGMeshSelectorClass(const FString& RawType, UClass*& OutClass, FString& OutError)
+{
+    OutClass = nullptr;
+    FString Type = RawType.TrimStartAndEnd();
+    if (Type.IsEmpty())
+    {
+        OutError = TEXT("meshSelectorType must be a non-empty selector class or alias.");
+        return false;
+    }
+
+    if (Type.Equals(TEXT("weighted"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("weighted_mesh"), ESearchCase::IgnoreCase))
+    {
+        OutClass = UPCGMeshSelectorWeighted::StaticClass();
+    }
+    else if (Type.Equals(TEXT("by_attribute"), ESearchCase::IgnoreCase))
+    {
+        OutClass = ResolveClassByName(TEXT("PCGMeshSelectorByAttribute"));
+    }
+    else if (Type.Equals(TEXT("weighted_by_category"), ESearchCase::IgnoreCase))
+    {
+        OutClass = ResolveClassByName(TEXT("PCGMeshSelectorWeightedByCategory"));
+    }
+    else
+    {
+        TArray<FString> Candidates;
+        Candidates.Add(Type);
+        if (Type.StartsWith(TEXT("U")) && Type.StartsWith(TEXT("UPCG")))
+        {
+            Candidates.Add(Type.RightChop(1));
+        }
+        if (!Type.StartsWith(TEXT("PCG")))
+        {
+            Candidates.Add(TEXT("PCG") + Type);
+        }
+        if (!Type.EndsWith(TEXT("Settings")) && !Type.EndsWith(TEXT("Selector")))
+        {
+            Candidates.Add(Type + TEXT("Selector"));
+        }
+        for (const FString& Candidate : Candidates)
+        {
+            if ((OutClass = ResolveClassByName(Candidate)) != nullptr)
+            {
+                break;
+            }
+            const FString ScriptPath = FString::Printf(TEXT("/Script/PCG.%s"), *Candidate);
+            OutClass = FindObject<UClass>(nullptr, *ScriptPath);
+            if (!OutClass)
+            {
+                OutClass = LoadObject<UClass>(nullptr, *ScriptPath);
+            }
+            if (OutClass)
+            {
+                break;
+            }
+        }
+    }
+
+    if (!OutClass || !OutClass->IsChildOf(UPCGMeshSelectorBase::StaticClass()) || OutClass->HasAnyClassFlags(CLASS_Abstract))
+    {
+        OutError = FString::Printf(TEXT("Could not resolve mesh selector '%s' as a concrete UPCGMeshSelectorBase."), *RawType);
+        OutClass = nullptr;
+        return false;
+    }
+    return true;
+}
+
+UObject* GetPCGMeshSelector(UPCGStaticMeshSpawnerSettings* Settings, FString& OutError)
+{
+    if (!Settings)
+    {
+        OutError = TEXT("PCG static mesh spawner settings are invalid.");
+        return nullptr;
+    }
+    FObjectProperty* SelectorProperty = FindFProperty<FObjectProperty>(Settings->GetClass(), TEXT("MeshSelectorParameters"));
+    if (!SelectorProperty)
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s.MeshSelectorParameters' was not found."), *Settings->GetClass()->GetName());
+        return nullptr;
+    }
+    UObject* Selector = SelectorProperty->GetObjectPropertyValue_InContainer(Settings);
+    if (!Selector)
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s.MeshSelectorParameters' is null."), *Settings->GetClass()->GetName());
+        return nullptr;
+    }
+    return Selector;
+}
+
+FArrayProperty* GetPCGMeshEntriesProperty(UObject* Selector, FString& OutError)
+{
+    if (!Selector)
+    {
+        OutError = TEXT("PCG mesh selector is null.");
+        return nullptr;
+    }
+    FArrayProperty* EntriesProperty = FindFProperty<FArrayProperty>(Selector->GetClass(), TEXT("MeshEntries"));
+    if (!EntriesProperty)
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s.MeshEntries' was not found. Selector '%s' does not expose weighted mesh entries."), *Selector->GetClass()->GetName(), *Selector->GetClass()->GetName());
+        return nullptr;
+    }
+    if (!CastField<FStructProperty>(EntriesProperty->Inner))
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s.MeshEntries' is not an array of structs."), *Selector->GetClass()->GetName());
+        return nullptr;
+    }
+    return EntriesProperty;
+}
+
+bool ApplyPCGClassProperty(void* Container, FProperty* Property, const FString& RawClass, FString& OutError)
+{
+    FClassProperty* ClassProperty = CastField<FClassProperty>(Property);
+    if (!ClassProperty)
+    {
+        OutError = FString::Printf(TEXT("Reflected property '%s' is not a class property."), Property ? *Property->GetName() : TEXT("<null>"));
+        return false;
+    }
+    UClass* Class = ResolveClassByName(RawClass);
+    if (!Class)
+    {
+        Class = LoadObject<UClass>(nullptr, *RawClass);
+    }
+    if (!Class || (ClassProperty->MetaClass && !Class->IsChildOf(ClassProperty->MetaClass)) || !Class->IsChildOf(UInstancedStaticMeshComponent::StaticClass()))
+    {
+        OutError = FString::Printf(TEXT("Class '%s' is not assignable to reflected property '%s' or is not an instanced static mesh component class."), *RawClass, *Property->GetName());
+        return false;
+    }
+    ClassProperty->SetObjectPropertyValue_InContainer(Container, Class);
+    return true;
+}
+
+bool ApplyPCGDescriptorSettings(void* DescriptorContainer, UStruct* DescriptorStruct, const TSharedPtr<FJsonObject>& Object, FString& OutError)
+{
+    if (!DescriptorContainer || !DescriptorStruct || !Object.IsValid())
+    {
+        return true;
+    }
+
+    for (const auto& Pair : Object->Values)
+    {
+        const FString PairKey(*Pair.Key);
+        FString PropertyName = PairKey;
+        if (PropertyName.Equals(TEXT("meshPath"), ESearchCase::IgnoreCase) || PropertyName.Equals(TEXT("staticMesh"), ESearchCase::IgnoreCase))
+        {
+            PropertyName = TEXT("StaticMesh");
+        }
+        if (PropertyName.Equals(TEXT("collision"), ESearchCase::IgnoreCase))
+        {
+            FStructProperty* BodyInstanceProperty = FindFProperty<FStructProperty>(DescriptorStruct, TEXT("BodyInstance"));
+            if (!BodyInstanceProperty)
+            {
+                OutError = FString::Printf(TEXT("Reflected property '%s.BodyInstance' was not found while applying collision settings."), *DescriptorStruct->GetName());
+                return false;
+            }
+            void* BodyInstance = BodyInstanceProperty->ContainerPtrToValuePtr<void>(DescriptorContainer);
+            if (Pair.Value->Type == EJson::String)
+            {
+                FProperty* ProfileProperty = FindFProperty<FProperty>(BodyInstanceProperty->Struct, TEXT("CollisionProfileName"));
+                if (!ProfileProperty || !ApplyJsonValueToProperty(BodyInstance, ProfileProperty, Pair.Value, OutError))
+                {
+                    OutError = FString::Printf(TEXT("Failed reflected collision property '%s.BodyInstance.CollisionProfileName': %s"), *DescriptorStruct->GetName(), *OutError);
+                    return false;
+                }
+            }
+            else if (!ApplyJsonValueToProperty(DescriptorContainer, BodyInstanceProperty, Pair.Value, OutError))
+            {
+                OutError = FString::Printf(TEXT("Failed reflected collision property '%s.BodyInstance': %s"), *DescriptorStruct->GetName(), *OutError);
+                return false;
+            }
+            continue;
+        }
+
+        FProperty* Property = FindFProperty<FProperty>(DescriptorStruct, FName(*PropertyName));
+        if (!Property)
+        {
+            OutError = FString::Printf(TEXT("PCG descriptor property '%s' was not found on '%s' (requested '%s')."), *PropertyName, *DescriptorStruct->GetName(), *Pair.Key);
+            return false;
+        }
+        if (FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
+        {
+            if (Pair.Value->Type != EJson::String || !ApplyPCGClassProperty(DescriptorContainer, ClassProperty, Pair.Value->AsString(), OutError))
+            {
+                return false;
+            }
+        }
+        else if (Property->GetFName() == TEXT("StaticMesh"))
+        {
+            if (Pair.Value->Type != EJson::String)
+            {
+                OutError = FString::Printf(TEXT("PCG descriptor property '%s.StaticMesh' requires a valid soft-object asset path string."), *DescriptorStruct->GetName());
+                return false;
+            }
+            FString ResolvedMeshPath;
+            if (!LoadPCGStaticMesh(Pair.Value->AsString(), ResolvedMeshPath, OutError))
+            {
+                return false;
+            }
+            FSoftObjectProperty* StaticMeshProperty = CastField<FSoftObjectProperty>(Property);
+            if (!StaticMeshProperty)
+            {
+                OutError = FString::Printf(TEXT("Reflected descriptor property '%s.StaticMesh' is not a soft-object property."), *DescriptorStruct->GetName());
+                return false;
+            }
+            void* StaticMesh = StaticMeshProperty->ContainerPtrToValuePtr<void>(DescriptorContainer);
+            *static_cast<FSoftObjectPtr*>(StaticMesh) = FSoftObjectPath(ResolvedMeshPath.Contains(TEXT(".")) ? ResolvedMeshPath : ToObjectPath(ResolvedMeshPath));
+        }
+        else if (!ApplyJsonValueToProperty(DescriptorContainer, Property, Pair.Value, OutError))
+        {
+            OutError = FString::Printf(TEXT("Failed to apply PCG descriptor property '%s.%s': %s"), *DescriptorStruct->GetName(), *PropertyName, *OutError);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ApplyPCGMeshEntry(void* EntryContainer, FStructProperty* EntryStructProperty, const TSharedPtr<FJsonObject>& EntryObject, bool bRequireMesh, FString& OutError)
+{
+    if (!EntryContainer || !EntryStructProperty || !EntryStructProperty->Struct || !EntryObject.IsValid())
+    {
+        OutError = TEXT("Invalid PCG mesh entry payload or reflected entry struct.");
+        return false;
+    }
+
+    FStructProperty* DescriptorProperty = FindFProperty<FStructProperty>(EntryStructProperty->Struct, TEXT("Descriptor"));
+    if (!DescriptorProperty || !DescriptorProperty->Struct)
+    {
+        OutError = FString::Printf(TEXT("Reflected mesh entry '%s.Descriptor' was not found."), *EntryStructProperty->Struct->GetName());
+        return false;
+    }
+    void* Descriptor = DescriptorProperty->ContainerPtrToValuePtr<void>(EntryContainer);
+
+    const FString MeshPath = GetFirstStringField(EntryObject, {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
+    if (bRequireMesh && MeshPath.IsEmpty())
+    {
+        OutError = TEXT("Static Mesh Spawner mesh entry requires meshPath (a valid UStaticMesh asset path); no cube fallback is used.");
+        return false;
+    }
+    if (!MeshPath.IsEmpty())
+    {
+        FString ResolvedMeshPath;
+        if (!LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError))
+        {
+            return false;
+        }
+        FSoftObjectProperty* StaticMeshProperty = FindFProperty<FSoftObjectProperty>(DescriptorProperty->Struct, TEXT("StaticMesh"));
+        if (!StaticMeshProperty)
+        {
+            OutError = FString::Printf(TEXT("Reflected descriptor property '%s.StaticMesh' is not a soft-object property."), *DescriptorProperty->Struct->GetName());
+            return false;
+        }
+        void* StaticMesh = StaticMeshProperty->ContainerPtrToValuePtr<void>(Descriptor);
+        *static_cast<FSoftObjectPtr*>(StaticMesh) = FSoftObjectPath(ResolvedMeshPath.Contains(TEXT(".")) ? ResolvedMeshPath : ToObjectPath(ResolvedMeshPath));
+    }
+
+    double Weight = 0.0;
+    if (EntryObject->TryGetNumberField(TEXT("weight"), Weight) || EntryObject->TryGetNumberField(TEXT("Weight"), Weight))
+    {
+        FProperty* WeightProperty = FindFProperty<FProperty>(EntryStructProperty->Struct, TEXT("Weight"));
+        if (!WeightProperty || !ApplyJsonValueToProperty(EntryContainer, WeightProperty, MakeShared<FJsonValueNumber>(Weight), OutError))
+        {
+            OutError = FString::Printf(TEXT("Failed to apply reflected mesh entry property '%s.Weight': %s"), *EntryStructProperty->Struct->GetName(), *OutError);
+            return false;
+        }
+    }
+
+    const TSharedPtr<FJsonObject>* DescriptorSettings = nullptr;
+    if (EntryObject->TryGetObjectField(TEXT("descriptorSettings"), DescriptorSettings) && DescriptorSettings && DescriptorSettings->IsValid() &&
+        !ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, *DescriptorSettings, OutError))
+    {
+        return false;
+    }
+    const TSharedPtr<FJsonValue>* CollisionValue = EntryObject->Values.Find(TEXT("collision"));
+    if (CollisionValue && *CollisionValue)
+    {
+        TSharedPtr<FJsonObject> CollisionObject = MakeShared<FJsonObject>();
+        CollisionObject->SetField(TEXT("collision"), *CollisionValue);
+        if (!ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, CollisionObject, OutError))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+UPCGNode* FindStaticMeshSpawnerNode(UPCGGraph* Graph, const FString& RequestedNodeId, FString& OutError)
+{
+    if (!Graph)
+    {
+        OutError = TEXT("PCG graph is invalid.");
+        return nullptr;
+    }
+    if (!RequestedNodeId.IsEmpty())
+    {
+        UPCGNode* Node = FindPCGNode(Graph, RequestedNodeId);
+        if (!Node)
+        {
+            OutError = FString::Printf(TEXT("Could not resolve PCG node '%s' while looking for a Static Mesh Spawner."), *RequestedNodeId);
+            return nullptr;
+        }
+        if (!Node->GetSettings() || !Node->GetSettings()->IsA<UPCGStaticMeshSpawnerSettings>())
+        {
+            OutError = FString::Printf(TEXT("PCG node '%s' is '%s', not UPCGStaticMeshSpawnerSettings."), *RequestedNodeId, Node->GetSettings() ? *Node->GetSettings()->GetClass()->GetName() : TEXT("<null>"));
+            return nullptr;
+        }
+        return Node;
+    }
+    for (UPCGNode* Node : Graph->GetNodes())
+    {
+        if (Node && Node->GetSettings() && Node->GetSettings()->IsA<UPCGStaticMeshSpawnerSettings>())
+        {
+            return Node;
+        }
+    }
+    OutError = TEXT("No UPCGStaticMeshSpawnerSettings node was found in the graph. Provide nodeId/nodeName or create one with add_static_mesh_spawner.");
+    return nullptr;
+}
+
+TSharedPtr<FJsonObject> BuildStaticMeshSpawnerResult(UPCGGraph* Graph, UPCGNode* Node, const FString& GraphPath, FString& OutError)
+{
+    TSharedPtr<FJsonObject> Result = BuildNodeResult(Graph, Node, GraphPath);
+    UPCGStaticMeshSpawnerSettings* Settings = Node ? Cast<UPCGStaticMeshSpawnerSettings>(Node->GetSettings()) : nullptr;
+    UObject* Selector = GetPCGMeshSelector(Settings, OutError);
+    if (!Selector)
+    {
+        return nullptr;
+    }
+    Result->SetStringField(TEXT("meshSelectorType"), Selector->GetClass()->GetName());
+    Result->SetStringField(TEXT("meshSelectorClass"), Selector->GetClass()->GetPathName());
+    Result->SetBoolField(TEXT("deterministic"), Settings->UseSeed());
+
+    FArrayProperty* EntriesProperty = GetPCGMeshEntriesProperty(Selector, OutError);
+    if (!EntriesProperty)
+    {
+        return nullptr;
+    }
+    FStructProperty* EntryStructProperty = CastField<FStructProperty>(EntriesProperty->Inner);
+    FScriptArrayHelper Entries(EntriesProperty, EntriesProperty->ContainerPtrToValuePtr<void>(Selector));
+    TArray<TSharedPtr<FJsonValue>> EntryValues;
+    for (int32 Index = 0; Index < Entries.Num(); ++Index)
+    {
+        void* Entry = Entries.GetRawPtr(Index);
+        TSharedPtr<FJsonObject> EntryObject = MakeShared<FJsonObject>();
+        EntryObject->SetNumberField(TEXT("index"), Index);
+        if (FProperty* WeightProperty = FindFProperty<FProperty>(EntryStructProperty->Struct, TEXT("Weight")))
+        {
+            if (FIntProperty* IntWeight = CastField<FIntProperty>(WeightProperty))
+            {
+                EntryObject->SetNumberField(TEXT("weight"), IntWeight->GetPropertyValue_InContainer(Entry));
+            }
+            else
+            {
+                EntryObject->SetField(TEXT("weight"), ExportPropertyToJsonValue(Entry, WeightProperty));
+            }
+        }
+        if (FStructProperty* DescriptorProperty = FindFProperty<FStructProperty>(EntryStructProperty->Struct, TEXT("Descriptor")))
+        {
+            void* Descriptor = DescriptorProperty->ContainerPtrToValuePtr<void>(Entry);
+            TSharedPtr<FJsonObject> DescriptorObject = MakeShared<FJsonObject>();
+            if (FSoftObjectProperty* MeshProperty = FindFProperty<FSoftObjectProperty>(DescriptorProperty->Struct, TEXT("StaticMesh")))
+            {
+                const FSoftObjectPtr* Mesh = static_cast<const FSoftObjectPtr*>(MeshProperty->ContainerPtrToValuePtr<void>(Descriptor));
+                const FString MeshPath = Mesh && !Mesh->IsNull() ? Mesh->ToSoftObjectPath().ToString() : FString();
+                EntryObject->SetStringField(TEXT("meshPath"), MeshPath);
+            }
+            if (FClassProperty* ComponentClassProperty = FindFProperty<FClassProperty>(DescriptorProperty->Struct, TEXT("ComponentClass")))
+            {
+                if (UClass* ComponentClass = Cast<UClass>(ComponentClassProperty->GetObjectPropertyValue_InContainer(Descriptor)))
+                {
+                    DescriptorObject->SetStringField(TEXT("ComponentClass"), ComponentClass->GetPathName());
+                }
+            }
+            for (TFieldIterator<FProperty> It(DescriptorProperty->Struct); It; ++It)
+            {
+                FProperty* Property = *It;
+                if (!Property || Property->GetFName() == TEXT("StaticMesh") || Property->GetFName() == TEXT("ComponentClass") || Property->GetFName() == TEXT("Hash"))
+                {
+                    continue;
+                }
+                if (TSharedPtr<FJsonValue> Value = ExportPropertyToJsonValue(Descriptor, Property))
+                {
+                    DescriptorObject->SetField(Property->GetName(), Value);
+                }
+            }
+            EntryObject->SetObjectField(TEXT("descriptorSettings"), DescriptorObject);
+        }
+        EntryValues.Add(MakeShared<FJsonValueObject>(EntryObject));
+    }
+    Result->SetArrayField(TEXT("meshEntries"), EntryValues);
+    Result->SetNumberField(TEXT("entryCount"), EntryValues.Num());
+    return Result;
+}
+
+bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Settings, const TSharedPtr<FJsonObject>& SettingsObject, FString& OutError, int32& OutAppliedCount)
+{
+    OutAppliedCount = 0;
+    if (!Settings || !SettingsObject.IsValid())
+    {
+        return true;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* MeshEntries = nullptr;
+    if (SettingsObject->TryGetArrayField(TEXT("meshEntries"), MeshEntries) && MeshEntries)
+    {
+        // Validate every asset before changing the reflected array. This keeps
+        // an invalid path from leaving a partially authored selector behind.
+        for (const TSharedPtr<FJsonValue>& EntryValue : *MeshEntries)
+        {
+            if (!EntryValue || EntryValue->Type != EJson::Object)
+            {
+                OutError = TEXT("meshEntries must contain JSON objects.");
+                return false;
+            }
+            const FString MeshPath = GetFirstStringField(EntryValue->AsObject(), {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
+            FString ResolvedMeshPath;
+            if (MeshPath.IsEmpty() || !LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError))
+            {
+                if (OutError.IsEmpty())
+                {
+                    OutError = TEXT("Static Mesh Spawner mesh entry requires a valid UStaticMesh asset path; no cube fallback is used.");
+                }
+                return false;
+            }
+        }
+    }
+
+    FString SelectorType = GetFirstStringField(SettingsObject, {TEXT("meshSelectorType"), TEXT("selectorType"), TEXT("MeshSelectorType")});
+    if (!SelectorType.IsEmpty())
+    {
+        UClass* SelectorClass = nullptr;
+        if (!ResolvePCGMeshSelectorClass(SelectorType, SelectorClass, OutError))
+        {
+            return false;
+        }
+        Settings->Modify();
+        Settings->SetMeshSelectorType(SelectorClass);
+        ++OutAppliedCount;
+    }
+
+    if (SettingsObject->TryGetArrayField(TEXT("meshEntries"), MeshEntries) && MeshEntries)
+    {
+        UObject* Selector = GetPCGMeshSelector(Settings, OutError);
+        FArrayProperty* EntriesProperty = GetPCGMeshEntriesProperty(Selector, OutError);
+        if (!EntriesProperty)
+        {
+            return false;
+        }
+        FStructProperty* EntryStructProperty = CastField<FStructProperty>(EntriesProperty->Inner);
+        FScriptArrayHelper Entries(EntriesProperty, EntriesProperty->ContainerPtrToValuePtr<void>(Selector));
+        Entries.EmptyValues();
+        for (const TSharedPtr<FJsonValue>& EntryValue : *MeshEntries)
+        {
+            if (!EntryValue || EntryValue->Type != EJson::Object)
+            {
+                OutError = TEXT("meshEntries must contain JSON objects.");
+                return false;
+            }
+            Entries.AddValue();
+            if (!ApplyPCGMeshEntry(Entries.GetRawPtr(Entries.Num() - 1), EntryStructProperty, EntryValue->AsObject(), true, OutError))
+            {
+                return false;
+            }
+            ++OutAppliedCount;
+        }
+    }
+
+    const FString MeshPath = GetFirstStringField(SettingsObject, {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
+    if (!MeshPath.IsEmpty())
+    {
+        if (!ApplyStaticMeshSpawnerMeshPath(Settings, MeshPath, OutError))
+        {
+            return false;
+        }
+        ++OutAppliedCount;
+    }
+
+    TSharedPtr<FJsonObject> DirectSettings = MakeShared<FJsonObject>();
+    for (const auto& Pair : SettingsObject->Values)
+    {
+        const FString PairKey(*Pair.Key);
+        const bool bSpecial = PairKey.Equals(TEXT("meshSelectorType"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("selectorType"), ESearchCase::IgnoreCase) ||
+            PairKey.Equals(TEXT("MeshSelectorType"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("meshEntries"), ESearchCase::IgnoreCase) ||
+            PairKey.Equals(TEXT("meshPath"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("staticMesh"), ESearchCase::IgnoreCase);
+        if (!bSpecial)
+        {
+            DirectSettings->SetField(Pair.Key, Pair.Value);
+        }
+    }
+    if (!DirectSettings->Values.IsEmpty())
+    {
+        int32 DirectApplied = 0;
+        if (!ApplySettingsObject(Settings, DirectSettings, OutError, DirectApplied))
+        {
+            return false;
+        }
+        OutAppliedCount += DirectApplied;
+    }
     return true;
 }
 
@@ -788,6 +1344,45 @@ bool ApplyPCGConvenienceSettings(const FString& SubAction, UPCGSettings* Setting
             }
             ++OutAppliedCount;
         }
+    }
+
+    const TArray<TPair<const TCHAR*, const TCHAR*>> ReflectedAliases = {
+        {TEXT("seed"), TEXT("Seed")},
+        {TEXT("scaleMin"), TEXT("ScaleMin")}, {TEXT("scaleMax"), TEXT("ScaleMax")},
+        {TEXT("rotationMin"), TEXT("RotationMin")}, {TEXT("rotationMax"), TEXT("RotationMax")},
+        {TEXT("offsetMin"), TEXT("OffsetMin")}, {TEXT("offsetMax"), TEXT("OffsetMax")}
+    };
+    for (const TPair<const TCHAR*, const TCHAR*>& Alias : ReflectedAliases)
+    {
+        const TSharedPtr<FJsonValue>* Value = Payload->Values.Find(Alias.Key);
+        if (!Value || !(*Value))
+        {
+            continue;
+        }
+        FProperty* Property = FindFProperty<FProperty>(Settings->GetClass(), FName(Alias.Value));
+        if (!Property)
+        {
+            OutError = FString::Printf(TEXT("PCG settings property '%s' was not found on '%s' while applying '%s'."), Alias.Value, *Settings->GetClass()->GetName(), Alias.Key);
+            return false;
+        }
+        if (!ApplyJsonValueToProperty(Settings, Property, *Value, OutError))
+        {
+            OutError = FString::Printf(TEXT("Failed to apply PCG settings property '%s' for '%s': %s"), Alias.Value, Alias.Key, *OutError);
+            return false;
+        }
+        ++OutAppliedCount;
+    }
+    if (Payload->HasField(TEXT("deterministic")) && GetJsonBoolField(Payload, TEXT("deterministic"), false))
+    {
+        if (!Settings->UseSeed())
+        {
+            OutError = FString::Printf(TEXT("Deterministic variation was requested, but '%s' does not support a seed."), *Settings->GetClass()->GetName());
+            return false;
+        }
+        // PCG's deterministic variation is seed-driven. There is no private
+        // bDeterministic field to write; retaining the explicit seed is the
+        // UE-supported behavior across 5.0-5.8.
+        ++OutAppliedCount;
     }
 
     return true;
@@ -1002,6 +1597,89 @@ bool SaveGraphIfRequested(UPCGGraph* Graph, bool bSave, bool& bOutSaved, FString
 
     return true;
 }
+
+UPCGComponent* ResolveRequestedPCGComponent(const TSharedPtr<FJsonObject>& Payload, UWorld* World, AActor*& OutActor, FString& OutError)
+{
+    OutActor = nullptr;
+    if (!World)
+    {
+        OutError = TEXT("Could not resolve the editor world for PCG component access.");
+        return nullptr;
+    }
+    const FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
+    const FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"));
+    const FString ComponentPath = GetJsonStringField(Payload, TEXT("componentPath"));
+    const FString Selector = !ComponentPath.IsEmpty() ? ComponentPath : ComponentName;
+    UPCGComponent* Component = FindPCGComponent(World, ActorName, Selector, OutActor);
+    if (!Component)
+    {
+        OutError = TEXT("Could not resolve a PCG component. Provide actorName plus componentName/componentPath.");
+    }
+    return Component;
+}
+
+TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
+{
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    int32 TotalInstances = 0;
+    int32 ISMInstances = 0;
+    int32 HISMInstances = 0;
+    TArray<TSharedPtr<FJsonValue>> InstanceValues;
+    if (Component)
+    {
+        Component->ForEachConstManagedResource([&](const UPCGManagedResource* Resource)
+        {
+            const UPCGManagedISMComponent* ManagedISM = Cast<UPCGManagedISMComponent>(Resource);
+            if (!ManagedISM)
+            {
+                return;
+            }
+            UInstancedStaticMeshComponent* ISM = ManagedISM->GetComponent();
+            if (!ISM)
+            {
+                return;
+            }
+            const int32 Count = ISM->GetInstanceCount();
+            const bool bIsHISM = ISM->IsA<UHierarchicalInstancedStaticMeshComponent>();
+            TotalInstances += Count;
+            if (bIsHISM)
+            {
+                HISMInstances += Count;
+            }
+            else
+            {
+                ISMInstances += Count;
+            }
+            TSharedPtr<FJsonObject> InstanceObject = MakeShared<FJsonObject>();
+            InstanceObject->SetStringField(TEXT("componentPath"), ISM->GetPathName());
+            InstanceObject->SetStringField(TEXT("componentType"), bIsHISM ? TEXT("HISM") : TEXT("ISM"));
+            InstanceObject->SetStringField(TEXT("meshPath"), ISM->GetStaticMesh() ? ISM->GetStaticMesh()->GetPathName() : FString());
+            InstanceObject->SetNumberField(TEXT("instanceCount"), Count);
+            uint32 InstanceSignature = 0;
+            for (int32 InstanceIndex = 0; InstanceIndex < Count; ++InstanceIndex)
+            {
+                FTransform InstanceTransform;
+                if (ISM->GetInstanceTransform(InstanceIndex, InstanceTransform, false))
+                {
+                    InstanceSignature = FCrc::StrCrc32(*InstanceTransform.ToString(), InstanceSignature);
+                }
+            }
+            InstanceObject->SetStringField(TEXT("instanceSignature"), FString::Printf(TEXT("%u"), InstanceSignature));
+            InstanceValues.Add(MakeShared<FJsonValueObject>(InstanceObject));
+        });
+    }
+    Result->SetNumberField(TEXT("instanceCount"), TotalInstances);
+    Result->SetNumberField(TEXT("ismInstanceCount"), ISMInstances);
+    Result->SetNumberField(TEXT("hismInstanceCount"), HISMInstances);
+    Result->SetArrayField(TEXT("instances"), InstanceValues);
+    Result->SetBoolField(TEXT("generated"), Component ? Component->bGenerated : false);
+    Result->SetBoolField(TEXT("generationInProgress"), Component ? Component->IsGenerating() : false);
+    if (Component)
+    {
+        McpHandlerUtils::AddVerification(Result, Component);
+    }
+    return Result;
+}
 }
 #endif
 
@@ -1133,6 +1811,81 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         }
 
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG subgraph created."), Result);
+        return true;
+    }
+
+    if (SubAction == TEXT("regenerate_pcg_component") || SubAction == TEXT("read_pcg_generated_instances") || SubAction == TEXT("clear_pcg_generated_output"))
+    {
+        UWorld* World = GetPCGEditorWorld();
+        AActor* Actor = nullptr;
+        FString ComponentError;
+        UPCGComponent* Component = ResolveRequestedPCGComponent(Payload, World, Actor, ComponentError);
+        if (!Component)
+        {
+            SendAutomationError(Socket, RequestId, ComponentError, TEXT("COMPONENT_NOT_FOUND"));
+            return true;
+        }
+
+        if (SubAction == TEXT("read_pcg_generated_instances"))
+        {
+            TSharedPtr<FJsonObject> Result = BuildGeneratedInstancesResult(Component);
+            Result->SetStringField(TEXT("actorName"), Actor ? Actor->GetName() : FString());
+            Result->SetStringField(TEXT("componentName"), Component->GetName());
+            Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
+            SendAutomationResponse(Socket, RequestId, true, TEXT("PCG generated instances read."), Result);
+            return true;
+        }
+
+        if (SubAction == TEXT("clear_pcg_generated_output"))
+        {
+            const FScopedTransaction Transaction(FText::FromString(TEXT("Clear PCG Generated Output")));
+            Component->Modify();
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
+            Component->CleanupLocalImmediate(true, true);
+            Component->ClearPerPinGeneratedOutput();
+#else
+            Component->CleanupLocal(true);
+#endif
+            bool bLevelSaved = false;
+            FString SaveError;
+            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+            {
+                SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+                return true;
+            }
+            TSharedPtr<FJsonObject> Result = BuildGeneratedInstancesResult(Component);
+            Result->SetStringField(TEXT("actorName"), Actor ? Actor->GetName() : FString());
+            Result->SetStringField(TEXT("componentName"), Component->GetName());
+            Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
+            Result->SetBoolField(TEXT("saved"), bLevelSaved);
+            SendAutomationResponse(Socket, RequestId, true, TEXT("PCG generated output cleared safely."), Result);
+            return true;
+        }
+
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Regenerate PCG Component")));
+        Component->Modify();
+        const bool bForceGenerate = GetJsonBoolField(Payload, TEXT("force"), true);
+        const FPCGTaskId TaskId = Component->GenerateLocalGetTaskId(bForceGenerate);
+        if (TaskId == InvalidPCGTaskId)
+        {
+            SendAutomationError(Socket, RequestId, TEXT("PCG regeneration was not scheduled. The component may already be generating, be up to date with force=false, or have no graph."), TEXT("GENERATION_NOT_SCHEDULED"));
+            return true;
+        }
+        bool bLevelSaved = false;
+        FString SaveError;
+        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+        {
+            SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+            return true;
+        }
+        TSharedPtr<FJsonObject> Result = BuildGeneratedInstancesResult(Component);
+        Result->SetStringField(TEXT("actorName"), Actor ? Actor->GetName() : FString());
+        Result->SetStringField(TEXT("componentName"), Component->GetName());
+        Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
+        Result->SetNumberField(TEXT("taskId"), static_cast<double>(TaskId));
+        Result->SetBoolField(TEXT("force"), bForceGenerate);
+        Result->SetBoolField(TEXT("saved"), bLevelSaved);
+        SendAutomationResponse(Socket, RequestId, true, TEXT("PCG component regeneration started."), Result);
         return true;
     }
 
@@ -1353,8 +2106,144 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         return true;
     }
 
+    if (SubAction == TEXT("find_static_mesh_spawner") || SubAction == TEXT("inspect_static_mesh_spawner") ||
+        SubAction == TEXT("configure_static_mesh_spawner") || SubAction == TEXT("add_static_mesh_entry") ||
+        SubAction == TEXT("update_static_mesh_entry") || SubAction == TEXT("remove_static_mesh_entry"))
+    {
+        const FString RequestedNodeId = GetFirstStringField(Payload, {TEXT("nodeId"), TEXT("nodeName")});
+        UPCGNode* Node = FindStaticMeshSpawnerNode(Graph, RequestedNodeId, Error);
+        if (!Node)
+        {
+            SendAutomationError(Socket, RequestId, Error, TEXT("NODE_NOT_FOUND"));
+            return true;
+        }
+        if (SubAction == TEXT("find_static_mesh_spawner") || SubAction == TEXT("inspect_static_mesh_spawner"))
+        {
+            TSharedPtr<FJsonObject> Result = BuildStaticMeshSpawnerResult(Graph, Node, GraphPath, Error);
+            if (!Result.IsValid())
+            {
+                SendAutomationError(Socket, RequestId, Error, TEXT("REFLECTION_ERROR"));
+                return true;
+            }
+            SendAutomationResponse(Socket, RequestId, true, TEXT("Static Mesh Spawner inspected."), Result);
+            return true;
+        }
+
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Author PCG Static Mesh Spawner")));
+        UPCGStaticMeshSpawnerSettings* SpawnerSettings = Cast<UPCGStaticMeshSpawnerSettings>(Node->GetSettings());
+        UObject* Selector = GetPCGMeshSelector(SpawnerSettings, Error);
+        FArrayProperty* EntriesProperty = nullptr;
+        if (Selector)
+        {
+            EntriesProperty = GetPCGMeshEntriesProperty(Selector, Error);
+        }
+        if (SubAction != TEXT("configure_static_mesh_spawner") && !EntriesProperty)
+        {
+            SendAutomationError(Socket, RequestId, Error, TEXT("REFLECTION_ERROR"));
+            return true;
+        }
+        FStructProperty* EntryStructProperty = EntriesProperty ? CastField<FStructProperty>(EntriesProperty->Inner) : nullptr;
+        TUniquePtr<FScriptArrayHelper> Entries;
+        if (EntriesProperty)
+        {
+            Entries = MakeUnique<FScriptArrayHelper>(EntriesProperty, EntriesProperty->ContainerPtrToValuePtr<void>(Selector));
+        }
+
+        int32 Applied = 0;
+        if (SubAction == TEXT("configure_static_mesh_spawner"))
+        {
+            TSharedPtr<FJsonObject> Configuration = MakeShared<FJsonObject>();
+            for (const TCHAR* Field : {TEXT("meshSelectorType"), TEXT("selectorType"), TEXT("meshEntries"), TEXT("meshPath"), TEXT("staticMesh")})
+            {
+                if (const TSharedPtr<FJsonValue>* Value = Payload->Values.Find(Field))
+                {
+                    Configuration->SetField(Field, *Value);
+                }
+            }
+            if (const TSharedPtr<FJsonObject>* SettingsObject = nullptr; Payload->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
+            {
+                if (!ApplyStaticMeshSpawnerSettingsObject(SpawnerSettings, *SettingsObject, Error, Applied))
+                {
+                    SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
+                    return true;
+                }
+            }
+            if (!Configuration->Values.IsEmpty())
+            {
+                int32 ConfigurationApplied = 0;
+                if (!ApplyStaticMeshSpawnerSettingsObject(SpawnerSettings, Configuration, Error, ConfigurationApplied))
+                {
+                    SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
+                    return true;
+                }
+                Applied += ConfigurationApplied;
+            }
+        }
+        else
+        {
+            int32 EntryIndex = GetJsonIntField(Payload, TEXT("entryIndex"), INDEX_NONE);
+            if (SubAction == TEXT("add_static_mesh_entry"))
+            {
+                const TSharedPtr<FJsonObject>* EntryObject = nullptr;
+                const TSharedPtr<FJsonObject> EntryPayload = (Payload->TryGetObjectField(TEXT("entry"), EntryObject) && EntryObject && EntryObject->IsValid()) ? *EntryObject : Payload;
+                Entries->AddValue();
+                if (!ApplyPCGMeshEntry(Entries->GetRawPtr(Entries->Num() - 1), EntryStructProperty, EntryPayload, true, Error))
+                {
+                    Entries->RemoveValues(Entries->Num() - 1, 1);
+                    SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
+                    return true;
+                }
+                EntryIndex = Entries->Num() - 1;
+                Applied = 1;
+            }
+            else if (EntryIndex < 0 || EntryIndex >= Entries->Num())
+            {
+                SendAutomationError(Socket, RequestId, FString::Printf(TEXT("entryIndex %d is outside reflected MeshEntries range [0, %d)."), EntryIndex, Entries->Num()), TEXT("INVALID_ARGUMENT"));
+                return true;
+            }
+            else if (SubAction == TEXT("remove_static_mesh_entry"))
+            {
+                Entries->RemoveValues(EntryIndex, 1);
+                Applied = 1;
+            }
+            else
+            {
+                const TSharedPtr<FJsonObject>* EntryObject = nullptr;
+                const TSharedPtr<FJsonObject> EntryPayload = (Payload->TryGetObjectField(TEXT("entry"), EntryObject) && EntryObject && EntryObject->IsValid()) ? *EntryObject : Payload;
+                if (!ApplyPCGMeshEntry(Entries->GetRawPtr(EntryIndex), EntryStructProperty, EntryPayload, false, Error))
+                {
+                    SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
+                    return true;
+                }
+                Applied = 1;
+            }
+        }
+
+        SpawnerSettings->Modify();
+        Node->UpdateAfterSettingsChangeDuringCreation();
+        SpawnerSettings->PostEditChange();
+        bool bSaved = false;
+        if (!SaveGraphIfRequested(Graph, bSave, bSaved, Error))
+        {
+            SendAutomationError(Socket, RequestId, Error, TEXT("SAVE_FAILED"));
+            return true;
+        }
+        TSharedPtr<FJsonObject> Result = BuildStaticMeshSpawnerResult(Graph, Node, GraphPath, Error);
+        if (!Result.IsValid())
+        {
+            SendAutomationError(Socket, RequestId, Error, TEXT("REFLECTION_ERROR"));
+            return true;
+        }
+        Result->SetNumberField(TEXT("settingsApplied"), Applied);
+        Result->SetNumberField(TEXT("entryIndex"), GetJsonIntField(Payload, TEXT("entryIndex"), SubAction == TEXT("add_static_mesh_entry") ? Entries->Num() - 1 : INDEX_NONE));
+        Result->SetBoolField(TEXT("saved"), bSaved);
+        SendAutomationResponse(Socket, RequestId, true, TEXT("Static Mesh Spawner updated."), Result);
+        return true;
+    }
+
     if (SubAction == TEXT("add_pcg_node") || IsPCGNodeCreationAction(SubAction))
     {
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Add PCG Node")));
         FString NodeType = GetFirstStringField(Payload, {TEXT("settingsClass"), TEXT("nodeType")});
         if (NodeType.IsEmpty())
         {
@@ -1381,7 +2270,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         int32 AppliedSettings = 0;
         if (Payload->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
         {
-            if (!ApplySettingsObject(DefaultSettings, *SettingsObject, Error, AppliedSettings))
+            const bool bStaticMeshSpawnerSettings = DefaultSettings->IsA<UPCGStaticMeshSpawnerSettings>();
+            if ((bStaticMeshSpawnerSettings && !ApplyStaticMeshSpawnerSettingsObject(Cast<UPCGStaticMeshSpawnerSettings>(DefaultSettings), *SettingsObject, Error, AppliedSettings)) ||
+                (!bStaticMeshSpawnerSettings && !ApplySettingsObject(DefaultSettings, *SettingsObject, Error, AppliedSettings)))
             {
                 SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
                 return true;
@@ -1415,6 +2306,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
 
     if (SubAction == TEXT("connect_pcg_pins"))
     {
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Connect PCG Pins")));
         const FString SourceNodeId = GetJsonStringField(Payload, TEXT("sourceNodeId"));
         const FString TargetNodeId = GetJsonStringField(Payload, TEXT("targetNodeId"));
         if (SourceNodeId.IsEmpty() || TargetNodeId.IsEmpty())
@@ -1476,6 +2368,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
 
     if (SubAction == TEXT("set_pcg_node_settings"))
     {
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Set PCG Node Settings")));
         const FString NodeId = GetFirstStringField(Payload, {TEXT("nodeId"), TEXT("nodeName")});
         UPCGNode* Node = FindPCGNode(Graph, NodeId);
         if (!Node)
@@ -1495,7 +2388,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         const TSharedPtr<FJsonObject>* SettingsObject = nullptr;
         if (Payload->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
         {
-            if (!ApplySettingsObject(Settings, *SettingsObject, Error, AppliedSettings))
+            const bool bStaticMeshSpawnerSettings = Settings->IsA<UPCGStaticMeshSpawnerSettings>();
+            if ((bStaticMeshSpawnerSettings && !ApplyStaticMeshSpawnerSettingsObject(Cast<UPCGStaticMeshSpawnerSettings>(Settings), *SettingsObject, Error, AppliedSettings)) ||
+                (!bStaticMeshSpawnerSettings && !ApplySettingsObject(Settings, *SettingsObject, Error, AppliedSettings)))
             {
                 SendAutomationError(Socket, RequestId, Error, TEXT("INVALID_SETTINGS"));
                 return true;

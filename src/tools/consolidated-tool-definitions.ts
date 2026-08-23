@@ -168,12 +168,15 @@ export const VOLUME_ACTIONS = [
 
 export const PCG_ACTIONS = [
   'create_pcg_graph', 'create_pcg_subgraph', 'add_pcg_node', 'connect_pcg_pins', 'set_pcg_node_settings',
+  'find_static_mesh_spawner', 'configure_static_mesh_spawner', 'add_static_mesh_entry',
+  'update_static_mesh_entry', 'remove_static_mesh_entry', 'inspect_static_mesh_spawner',
   'add_landscape_data_node', 'add_spline_data_node', 'add_volume_data_node', 'add_actor_data_node', 'add_texture_data_node',
   'add_surface_sampler', 'add_mesh_sampler', 'add_spline_sampler', 'add_volume_sampler',
   'add_bounds_modifier', 'add_density_filter', 'add_height_filter', 'add_slope_filter', 'add_distance_filter', 'add_bounds_filter',
   'add_self_pruning', 'add_transform_points', 'add_project_to_surface', 'add_copy_points', 'add_merge_points',
   'add_static_mesh_spawner', 'add_actor_spawner', 'add_spline_spawner',
-  'execute_pcg_graph', 'set_pcg_partition_grid_size'
+  'execute_pcg_graph', 'regenerate_pcg_component', 'read_pcg_generated_instances',
+  'clear_pcg_generated_output', 'set_pcg_partition_grid_size'
 ] as const;
 
 
@@ -1738,7 +1741,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_pcg',
     category: 'world',
-    description: 'Create, edit, execute, and configure PCG graphs: graph assets, input/sampler/filter/spawner nodes, pin connections, node settings, and partition grid size.',
+    description: 'Create, edit, execute, and configure PCG graphs, including UE 5.8 Static Mesh Spawner mesh selectors, entries, descriptors, pins, and generated output.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1770,7 +1773,23 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         classPath: commonSchemas.stringProp,
         actorClass: commonSchemas.stringProp,
         meshPath: commonSchemas.meshPath,
+        staticMesh: commonSchemas.meshPath,
         texturePath: commonSchemas.texturePath,
+        meshSelectorType: { type: 'string', description: 'Selector class/name or alias such as weighted, by_attribute, or weighted_by_category.' },
+        entryIndex: commonSchemas.integerProp,
+        weight: commonSchemas.numberProp,
+        entry: { type: 'object', description: 'Static Mesh Spawner entry: meshPath/staticMesh, weight, descriptorSettings, and collision.' },
+        meshEntries: { type: 'array', items: { type: 'object' }, description: 'Static Mesh Spawner entries to replace or configure.' },
+        descriptorSettings: { type: 'object', description: 'Reflected FPCGSoftISMComponentDescriptor properties; ComponentClass selects ISM/HISM.' },
+        collision: { oneOf: [{ type: 'string' }, { type: 'object' }], description: 'Collision profile name or reflected collision descriptor settings.' },
+        seed: commonSchemas.integerProp,
+        deterministic: commonSchemas.booleanProp,
+        scaleMin: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
+        scaleMax: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
+        rotationMin: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
+        rotationMax: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
+        offsetMin: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
+        offsetMax: { type: 'array', items: commonSchemas.numberProp, minItems: 3, maxItems: 3 },
         createComponent: commonSchemas.booleanProp,
         force: commonSchemas.booleanProp,
         wait: commonSchemas.booleanProp,
@@ -1800,6 +1819,19 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         nodeName: commonSchemas.nodeName,
         title: commonSchemas.stringProp,
         nodeType: commonSchemas.stringProp,
+        meshSelectorType: commonSchemas.stringProp,
+        meshEntries: { type: 'array', items: { type: 'object' } },
+        entryIndex: commonSchemas.integerProp,
+        entryCount: commonSchemas.integerProp,
+        meshPath: commonSchemas.meshPath,
+        instanceCount: commonSchemas.integerProp,
+        ismInstanceCount: commonSchemas.integerProp,
+        hismInstanceCount: commonSchemas.integerProp,
+        instances: { type: 'array', items: { type: 'object' } },
+        instanceSignature: commonSchemas.stringProp,
+        generated: commonSchemas.booleanProp,
+        generationInProgress: commonSchemas.booleanProp,
+        deterministic: commonSchemas.booleanProp,
         sourceNodeId: commonSchemas.sourceNodeId,
         targetNodeId: commonSchemas.targetNodeId,
         sourcePin: commonSchemas.sourcePin,

@@ -29,6 +29,14 @@ export async function handlePCGTools(
     case 'set_pcg_node_settings':
       return sendRequest('set_pcg_node_settings');
 
+    case 'find_static_mesh_spawner':
+    case 'configure_static_mesh_spawner':
+    case 'add_static_mesh_entry':
+    case 'update_static_mesh_entry':
+    case 'remove_static_mesh_entry':
+    case 'inspect_static_mesh_spawner':
+      return sendRequest(action);
+
     case 'add_landscape_data_node':
       return sendRequest('add_landscape_data_node');
 
@@ -100,6 +108,11 @@ export async function handlePCGTools(
 
     case 'execute_pcg_graph':
       return sendRequest('execute_pcg_graph');
+
+    case 'regenerate_pcg_component':
+    case 'read_pcg_generated_instances':
+    case 'clear_pcg_generated_output':
+      return sendRequest(action);
 
     case 'set_pcg_partition_grid_size':
       return sendRequest('set_pcg_partition_grid_size');
