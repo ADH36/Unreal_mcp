@@ -1454,6 +1454,17 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                         TEXT("get_node_details"),  TEXT("get_graph_details"),
                         TEXT("get_pin_details"),   TEXT("list_node_types"),
                         TEXT("set_pin_default_value"),
+						TEXT("add_node"), TEXT("get_nodes"),
+						TEXT("create_event_graph"), TEXT("find_event_graph"),
+						TEXT("create_function_graph"), TEXT("find_function_graph"),
+						TEXT("add_begin_play"), TEXT("add_tick"),
+						TEXT("add_input_event"), TEXT("add_custom_event"),
+						TEXT("add_variable_get"), TEXT("add_variable_set"),
+						TEXT("add_function_call"), TEXT("add_branch"),
+						TEXT("add_sequence"), TEXT("add_cast"),
+						TEXT("add_arithmetic"), TEXT("add_component_reference"),
+						TEXT("add_self_reference"), TEXT("disconnect_pins"),
+						TEXT("inspect_graph"), TEXT("get_connections"),
                         // Wave 6B Path-a AnimBP graph discovery actions —
                         // implemented in HandleBlueprintGraphAction (early
                         // dispatch L691/831) but were missing from this routing

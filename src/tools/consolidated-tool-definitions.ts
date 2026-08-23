@@ -387,7 +387,12 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'add_component', 'set_default', 'modify_scs', 'get_scs', 'add_scs_component', 'remove_scs_component', 'reparent_scs_component', 'set_scs_transform', 'set_scs_property',
             'ensure_exists', 'probe_handle', 'add_variable', 'remove_variable', 'rename_variable', 'add_function', 'add_event', 'remove_event', 'add_construction_script', 'set_variable_metadata', 'set_metadata',
             'create_node', 'add_node', 'delete_node', 'connect_pins', 'break_pin_links', 'set_node_property', 'create_reroute_node', 'get_node_details', 'get_graph_details', 'get_pin_details',
-            'list_node_types', 'set_pin_default_value'
+            'list_node_types', 'set_pin_default_value',
+            'create_event_graph', 'find_event_graph', 'create_function_graph', 'find_function_graph',
+            'add_begin_play', 'add_tick', 'add_input_event', 'add_custom_event',
+            'add_variable_get', 'add_variable_set', 'add_function_call', 'add_branch',
+            'add_sequence', 'add_cast', 'add_arithmetic', 'add_component_reference',
+            'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_nodes', 'get_connections'
           ,
             ...WIDGET_AUTHORING_ACTIONS],
           description: 'Blueprint action'
@@ -446,6 +451,10 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         // Graph operations
         memberClass: commonSchemas.stringProp,
         targetClass: commonSchemas.stringProp,
+        classPath: commonSchemas.stringProp,
+        operation: commonSchemas.stringProp,
+        inputEventType: commonSchemas.stringProp,
+        graphType: { type: 'string', enum: ['event', 'function'], description: 'Blueprint graph type.' },
         inputAxisName: commonSchemas.stringProp,
         actionPath: commonSchemas.assetPath,
         inputActionPath: commonSchemas.assetPath,

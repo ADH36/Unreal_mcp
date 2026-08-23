@@ -119,7 +119,12 @@ const volumeActionSet = new Set<string>(VOLUME_ACTIONS);
 const blueprintGraphActionSet = new Set<string>([
   'create_node', 'delete_node', 'connect_pins', 'break_pin_links', 'set_node_property',
   'create_reroute_node', 'get_node_details', 'get_graph_details', 'get_pin_details',
-  'list_node_types', 'set_pin_default_value'
+  'list_node_types', 'set_pin_default_value', 'add_node', 'get_nodes',
+  'create_event_graph', 'find_event_graph', 'create_function_graph', 'find_function_graph',
+  'add_begin_play', 'add_tick', 'add_input_event', 'add_custom_event',
+  'add_variable_get', 'add_variable_set', 'add_function_call', 'add_branch',
+  'add_sequence', 'add_cast', 'add_arithmetic', 'add_component_reference',
+  'add_self_reference', 'disconnect_pins', 'inspect_graph', 'get_connections'
 ]);
 const animationAuthoringActionSet = new Set<string>([
   'create_animation_sequence', 'set_sequence_length', 'add_bone_track', 'set_bone_key', 'set_curve_key',

@@ -39,6 +39,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Factories/BlueprintFactory.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/CompilerResultsLog.h"
 #include "UObject/UObjectIterator.h"
 
 // -----------------------------------------------------------------------------
@@ -4191,17 +4192,27 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintAction(
                              Err, TEXT("NOT_FOUND"));
       return true;
     }
-    McpSafeCompileBlueprint(BP);
+    FCompilerResultsLog CompilerResults;
+    FKismetEditorUtilities::CompileBlueprint(
+        BP, EBlueprintCompileOptions::SkipGarbageCollection, &CompilerResults);
     bool bSaved = false;
-    if (bSaveAfterCompile) {
+    if (bSaveAfterCompile && CompilerResults.NumErrors == 0) {
       bSaved = SaveLoadedAssetThrottled(BP);
     }
     TSharedPtr<FJsonObject> Out = McpHandlerUtils::CreateResultObject();
-    Out->SetBoolField(TEXT("compiled"), true);
+    Out->SetBoolField(TEXT("compiled"), CompilerResults.NumErrors == 0);
     Out->SetBoolField(TEXT("saved"), bSaved);
     Out->SetStringField(TEXT("blueprintPath"), Path);
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Blueprint compiled"), Out, FString());
+    Out->SetNumberField(TEXT("compilerErrorCount"), CompilerResults.NumErrors);
+    Out->SetNumberField(TEXT("compilerWarningCount"), CompilerResults.NumWarnings);
+    TArray<TSharedPtr<FJsonValue>> CompilerMessages;
+    for (const TSharedRef<FTokenizedMessage>& Message : CompilerResults.Messages) {
+      CompilerMessages.Add(MakeShared<FJsonValueString>(Message->ToText().ToString()));
+    }
+    Out->SetArrayField(TEXT("compilerMessages"), CompilerMessages);
+    SendAutomationResponse(RequestingSocket, RequestId, CompilerResults.NumErrors == 0,
+                           CompilerResults.NumErrors == 0 ? TEXT("Blueprint compiled") : TEXT("Blueprint compiler reported errors"),
+                           Out, CompilerResults.NumErrors == 0 ? FString() : TEXT("BLUEPRINT_COMPILE_FAILED"));
     return true;
 #else
     SendAutomationResponse(RequestingSocket, RequestId, false,

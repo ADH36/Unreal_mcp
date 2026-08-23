@@ -13,6 +13,7 @@ vi.mock('./common-handlers.js', async () => {
 });
 
 import { handleGraphTools } from './graph-handlers.js';
+import { consolidatedToolDefinitions } from '../consolidated-tool-definitions.js';
 
 describe('handleGraphTools behavior tree payload mapping', () => {
   beforeEach(() => {
@@ -73,6 +74,37 @@ describe('handleGraphTools behavior tree payload mapping', () => {
         blueprintPath: '/Game/BP_Player',
         nodeType: 'K2Node_EnhancedInputAction',
         actionPath: '/Game/Input/IA_Throttle'
+      }),
+      'Automation bridge not available'
+    );
+  });
+
+  it('publishes the UE 5.8 Blueprint graph actions in the canonical schema', () => {
+    const blueprintTool = consolidatedToolDefinitions.find((tool) => tool.name === 'manage_blueprint');
+    const actionSchema = (blueprintTool?.inputSchema.properties as Record<string, { enum?: string[] }>).action;
+
+    expect(actionSchema.enum).toEqual(expect.arrayContaining([
+      'create_event_graph', 'create_function_graph', 'add_begin_play',
+      'add_variable_get', 'add_function_call', 'disconnect_pins', 'inspect_graph'
+    ]));
+  });
+
+  it('routes Blueprint graph-authoring aliases through the graph dispatcher', async () => {
+    await handleGraphTools('manage_blueprint', 'add_function_call', {
+      action: 'add_function_call',
+      blueprintPath: '/Game/BP_GraphTest',
+      classPath: '/Script/Engine.KismetSystemLibrary',
+      functionName: 'PrintString'
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenCalledWith(
+      {},
+      'manage_blueprint',
+      expect.objectContaining({
+        subAction: 'add_function_call',
+        blueprintPath: '/Game/BP_GraphTest',
+        classPath: '/Script/Engine.KismetSystemLibrary',
+        functionName: 'PrintString'
       }),
       'Automation bridge not available'
     );

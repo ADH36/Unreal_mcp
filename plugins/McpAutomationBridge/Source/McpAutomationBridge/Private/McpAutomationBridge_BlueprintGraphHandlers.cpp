@@ -241,8 +241,76 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     return true;
   }
 
+  const FString RequestedSubAction = GetJsonStringField(Payload, TEXT("subAction"));
   FString GraphName;
   Payload->TryGetStringField(TEXT("graphName"), GraphName);
+  if (RequestedSubAction == TEXT("find_function_graph") && GraphName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("find_function_graph requires graphName."),
+                        TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  // Graph creation is deliberately handled before normal graph lookup: a
+  // missing graph is the expected state for a create request.  The existing
+  // add_function/add_event actions remain supported; these graph actions give
+  // native MCP callers a direct, schema-backed graph API.
+  if (RequestedSubAction == TEXT("create_event_graph") ||
+      RequestedSubAction == TEXT("create_function_graph")) {
+    const bool bEventGraph = RequestedSubAction == TEXT("create_event_graph");
+    if (GraphName.IsEmpty()) {
+      GraphName = bEventGraph ? TEXT("EventGraph") : TEXT("NewFunction");
+    }
+    if (GraphName.Contains(TEXT("/")) || GraphName.Contains(TEXT("\\"))) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("graphName must be a Blueprint graph name, not a path."),
+                          TEXT("INVALID_GRAPH_NAME"));
+      return true;
+    }
+
+    TArray<UEdGraph*> AllGraphs;
+    Blueprint->GetAllGraphs(AllGraphs);
+    for (UEdGraph* ExistingGraph : AllGraphs) {
+      if (ExistingGraph && ExistingGraph->GetName().Equals(GraphName, ESearchCase::IgnoreCase)) {
+        TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+        Result->SetStringField(TEXT("graphName"), ExistingGraph->GetName());
+        Result->SetStringField(TEXT("graphType"),
+            Blueprint->FunctionGraphs.Contains(ExistingGraph) ? TEXT("function") : TEXT("event"));
+        Result->SetBoolField(TEXT("created"), false);
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+                               TEXT("Blueprint graph already exists."), Result);
+        return true;
+      }
+    }
+
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Create Blueprint Graph")));
+    Blueprint->Modify();
+    UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+        Blueprint, FName(*GraphName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+    if (!NewGraph) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Failed to create graph '%s'."), *GraphName),
+                          TEXT("CREATE_FAILED"));
+      return true;
+    }
+    if (bEventGraph) {
+      FBlueprintEditorUtils::AddUbergraphPage(Blueprint, NewGraph);
+    } else {
+      FBlueprintEditorUtils::AddFunctionGraph<UClass>(Blueprint, NewGraph, true, nullptr);
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("graphName"), NewGraph->GetName());
+    Result->SetStringField(TEXT("graphType"), bEventGraph ? TEXT("event") : TEXT("function"));
+    Result->SetBoolField(TEXT("created"), true);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    SendAutomationResponse(RequestingSocket, RequestId, bSaved,
+                           bSaved ? TEXT("Blueprint graph created.") : TEXT("Blueprint graph created but could not be saved."),
+                           Result, bSaved ? FString() : TEXT("SAVE_FAILED"));
+    return true;
+  }
+
   UEdGraph *TargetGraph = nullptr;
 
   // Find the target graph
@@ -291,7 +359,72 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     return true;
   }
 
-  const FString SubAction = GetJsonStringField(Payload, TEXT("subAction"));
+  if (RequestedSubAction == TEXT("find_event_graph") ||
+      RequestedSubAction == TEXT("find_function_graph")) {
+    const bool bIsFunction = Blueprint->FunctionGraphs.Contains(TargetGraph);
+    if ((RequestedSubAction == TEXT("find_event_graph") && bIsFunction) ||
+        (RequestedSubAction == TEXT("find_function_graph") && !bIsFunction)) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Graph '%s' is a %s graph."), *TargetGraph->GetName(),
+                                          bIsFunction ? TEXT("function") : TEXT("event")),
+                          TEXT("INCOMPATIBLE_GRAPH"));
+      return true;
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("graphName"), TargetGraph->GetName());
+    Result->SetStringField(TEXT("graphType"), bIsFunction ? TEXT("function") : TEXT("event"));
+    Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Blueprint graph found."), Result);
+    return true;
+  }
+
+  FString SubAction = RequestedSubAction;
+  FString ForcedNodeType;
+  FString ForcedEventName;
+  if (SubAction == TEXT("add_node")) {
+    SubAction = TEXT("create_node");
+  } else if (SubAction == TEXT("add_begin_play")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Event");
+    ForcedEventName = TEXT("BeginPlay");
+  } else if (SubAction == TEXT("add_tick")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Event");
+    ForcedEventName = TEXT("Tick");
+  } else if (SubAction == TEXT("add_custom_event")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("CustomEvent");
+  } else if (SubAction == TEXT("add_variable_get")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("VariableGet");
+  } else if (SubAction == TEXT("add_variable_set")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("VariableSet");
+  } else if (SubAction == TEXT("add_function_call") || SubAction == TEXT("add_arithmetic")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("CallFunction");
+  } else if (SubAction == TEXT("add_branch")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Branch");
+  } else if (SubAction == TEXT("add_sequence")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Sequence");
+  } else if (SubAction == TEXT("add_cast")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Cast");
+  } else if (SubAction == TEXT("add_self_reference")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("Self");
+  } else if (SubAction == TEXT("add_component_reference")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("VariableGet");
+  } else if (SubAction == TEXT("add_input_event")) {
+    SubAction = TEXT("create_node");
+    ForcedNodeType = TEXT("InputAxisEvent");
+  } else if (SubAction == TEXT("inspect_graph") || SubAction == TEXT("get_connections")) {
+    SubAction = TEXT("get_nodes");
+  }
 
   // Node identifier interoperability:
   // - Prefer NodeGuid strings for stable references.
@@ -365,6 +498,29 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
 
     FString NodeType;
     Payload->TryGetStringField(TEXT("nodeType"), NodeType);
+    if (!ForcedNodeType.IsEmpty()) {
+      NodeType = ForcedNodeType;
+    }
+    if (NodeType.IsEmpty()) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("nodeType is required. Use a reflected function/class name or a supported K2 node type."),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    const bool bIsEventNode = NodeType.Equals(TEXT("Event"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("K2Node_Event"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("CustomEvent"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("K2Node_CustomEvent"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("InputAxisEvent"), ESearchCase::IgnoreCase) ||
+        NodeType.Equals(TEXT("K2Node_InputAxisEvent"), ESearchCase::IgnoreCase);
+    if (bIsEventNode && !Blueprint->UbergraphPages.Contains(TargetGraph)) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Node type '%s' is only valid in an Event Graph; '%s' is a Function Graph."),
+                                          *NodeType, *TargetGraph->GetName()),
+                          TEXT("INCOMPATIBLE_GRAPH"));
+      return true;
+    }
     float X = 0.0f;
     float Y = 0.0f;
     Payload->TryGetNumberField(TEXT("x"), X);
@@ -618,6 +774,15 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
                            NodeType == TEXT("K2Node_VariableSet"));
       FString VarName;
       Payload->TryGetStringField(TEXT("variableName"), VarName);
+      if (VarName.IsEmpty() && RequestedSubAction == TEXT("add_component_reference")) {
+        Payload->TryGetStringField(TEXT("componentName"), VarName);
+      }
+      if (VarName.IsEmpty()) {
+        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("variableName is required (or componentName for add_component_reference)."),
+                            TEXT("INVALID_ARGUMENT"));
+        return true;
+      }
       FName VarFName(*VarName);
 
       // Support inherited UPROPERTY on parent / SCS component class
@@ -722,12 +887,25 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       FString MemberName, MemberClass;
       Payload->TryGetStringField(TEXT("memberName"), MemberName);
       Payload->TryGetStringField(TEXT("memberClass"), MemberClass);
+      if (MemberName.IsEmpty()) {
+        Payload->TryGetStringField(TEXT("functionName"), MemberName);
+      }
+      if (MemberName.IsEmpty()) {
+        Payload->TryGetStringField(TEXT("operation"), MemberName);
+      }
+      if (MemberClass.IsEmpty()) {
+        Payload->TryGetStringField(TEXT("classPath"), MemberClass);
+      }
       UFunction *Func = nullptr;
+      UClass *FunctionOwnerClass = nullptr;
       if (!MemberClass.IsEmpty()) {
-        if (UClass *Class = ResolveUClass(MemberClass))
-          Func = Class->FindFunctionByName(*MemberName);
+        FunctionOwnerClass = ResolveUClass(MemberClass);
+        if (FunctionOwnerClass) {
+          Func = FunctionOwnerClass->FindFunctionByName(*MemberName);
+        }
       } else {
-        Func = Blueprint->GeneratedClass->FindFunctionByName(*MemberName);
+        FunctionOwnerClass = Blueprint->GeneratedClass;
+        Func = FunctionOwnerClass ? FunctionOwnerClass->FindFunctionByName(*MemberName) : nullptr;
         if (!Func) {
           if (UClass *KSL = UKismetSystemLibrary::StaticClass())
             Func = KSL->FindFunctionByName(*MemberName);
@@ -745,9 +923,23 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         CallFuncNode->SetFromFunction(Func);
         FinalizeAndReport(NodeCreator, CallFuncNode);
       } else {
+        TArray<FString> AvailableFunctions;
+        if (FunctionOwnerClass) {
+          for (TFieldIterator<UFunction> It(FunctionOwnerClass, EFieldIteratorFlags::IncludeSuper); It; ++It) {
+            const FString Candidate = It->GetName();
+            if ((MemberName.IsEmpty() || Candidate.Contains(MemberName, ESearchCase::IgnoreCase)) &&
+                !AvailableFunctions.Contains(Candidate)) {
+              AvailableFunctions.Add(Candidate);
+              if (AvailableFunctions.Num() == 12) {
+                break;
+              }
+            }
+          }
+        }
         SendAutomationError(
             RequestingSocket, RequestId,
-            FString::Printf(TEXT("Function '%s' not found"), *MemberName),
+            FString::Printf(TEXT("Function '%s' was not found by reflection. Provide memberClass/classPath and the exact UFunction name. Matching functions: [%s]"),
+                            *MemberName, *FString::Join(AvailableFunctions, TEXT(", "))),
             TEXT("FUNCTION_NOT_FOUND"));
       }
       return true;
@@ -757,6 +949,9 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       FString EventName, MemberClass;
       Payload->TryGetStringField(TEXT("eventName"), EventName);
       Payload->TryGetStringField(TEXT("memberClass"), MemberClass);
+      if (EventName.IsEmpty()) {
+        EventName = ForcedEventName;
+      }
       if (EventName.IsEmpty()) {
         SendAutomationError(RequestingSocket, RequestId,
                             TEXT("eventName required"),
@@ -786,6 +981,18 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         }
       }
       if (EventFunc && TargetClass) {
+        for (UEdGraphNode* ExistingNode : TargetGraph->Nodes) {
+          UK2Node_Event* ExistingEvent = Cast<UK2Node_Event>(ExistingNode);
+          if (ExistingEvent && ExistingEvent->EventReference.GetMemberName() == EventFunc->GetFName()) {
+            TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+            Result->SetStringField(TEXT("nodeId"), ExistingEvent->NodeGuid.ToString());
+            Result->SetStringField(TEXT("nodeName"), ExistingEvent->GetName());
+            Result->SetBoolField(TEXT("created"), false);
+            SendAutomationResponse(RequestingSocket, RequestId, true,
+                                   TEXT("Event node already exists."), Result);
+            return true;
+          }
+        }
         FGraphNodeCreator<UK2Node_Event> NodeCreator(*TargetGraph);
         UK2Node_Event *EventNode = NodeCreator.CreateNode(false);
         EventNode->EventReference.SetFromField<UFunction>(EventFunc, false);
@@ -804,6 +1011,15 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         NodeType == TEXT("K2Node_CustomEvent")) {
       FString EventName;
       Payload->TryGetStringField(TEXT("eventName"), EventName);
+      if (EventName.IsEmpty()) {
+        Payload->TryGetStringField(TEXT("customEventName"), EventName);
+      }
+      if (EventName.IsEmpty()) {
+        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("eventName or customEventName is required for a custom event."),
+                            TEXT("INVALID_ARGUMENT"));
+        return true;
+      }
 
       // Helper lambda to convert a type string into an FEdGraphPinType
       auto ResolvePinType = [&](const FString& TypeStr) -> FEdGraphPinType {
@@ -955,6 +1171,18 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
 
       // No parameters → simple custom event
       if (!bHasParams) {
+        for (UEdGraphNode* ExistingNode : TargetGraph->Nodes) {
+          UK2Node_CustomEvent* ExistingEvent = Cast<UK2Node_CustomEvent>(ExistingNode);
+          if (ExistingEvent && ExistingEvent->CustomFunctionName == FName(*EventName)) {
+            TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+            Result->SetStringField(TEXT("nodeId"), ExistingEvent->NodeGuid.ToString());
+            Result->SetStringField(TEXT("nodeName"), ExistingEvent->GetName());
+            Result->SetBoolField(TEXT("created"), false);
+            SendAutomationResponse(RequestingSocket, RequestId, true,
+                                   TEXT("Custom event node already exists."), Result);
+            return true;
+          }
+        }
         FGraphNodeCreator<UK2Node_CustomEvent> NodeCreator(*TargetGraph);
         UK2Node_CustomEvent* EventNode = NodeCreator.CreateNode(false);
         EventNode->CustomFunctionName = FName(*EventName);
@@ -1288,6 +1516,43 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
           TEXT("NODE_TYPE_NOT_FOUND"));
     }
     return true;
+  } else if (SubAction == TEXT("disconnect_pins")) {
+    FString FromNodeId, FromPinName, ToNodeId, ToPinName;
+    Payload->TryGetStringField(TEXT("fromNodeId"), FromNodeId);
+    Payload->TryGetStringField(TEXT("fromPinName"), FromPinName);
+    Payload->TryGetStringField(TEXT("toNodeId"), ToNodeId);
+    Payload->TryGetStringField(TEXT("toPinName"), ToPinName);
+    UEdGraphNode* FromNode = FindNodeByIdOrName(FromNodeId);
+    UEdGraphNode* ToNode = FindNodeByIdOrName(ToNodeId);
+    UEdGraphPin* FromPin = FindPinByName(FromNode, FromPinName);
+    UEdGraphPin* ToPin = FindPinByName(ToNode, ToPinName);
+    if (!FromNode || !ToNode || !FromPin || !ToPin) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("disconnect_pins requires existing node GUIDs and pin names."),
+                          TEXT("PIN_NOT_FOUND"));
+      return true;
+    }
+    if (!FromPin->LinkedTo.Contains(ToPin)) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("The specified pins are not connected."),
+                          TEXT("CONNECTION_NOT_FOUND"));
+      return true;
+    }
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Disconnect Blueprint Pins")));
+    Blueprint->Modify();
+    TargetGraph->Modify();
+    FromNode->Modify();
+    ToNode->Modify();
+    TargetGraph->GetSchema()->BreakSinglePinLink(FromPin, ToPin);
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("disconnected"), true);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    SendAutomationResponse(RequestingSocket, RequestId, bSaved,
+                           bSaved ? TEXT("Pins disconnected.") : TEXT("Pins disconnected but could not be saved."),
+                           Result, bSaved ? FString() : TEXT("SAVE_FAILED"));
+    return true;
   } else if (SubAction == TEXT("connect_pins")) {
     const FScopedTransaction Transaction(
         FText::FromString(TEXT("Connect Blueprint Pins")));
@@ -1349,8 +1614,30 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       UE_LOG(LogTemp, Warning, TEXT("connect_pins: FromNode '%s' pins: %s"), *FromNode->GetName(), *FromPinsList);
       UE_LOG(LogTemp, Warning, TEXT("connect_pins: ToNode '%s' pins: %s"), *ToNode->GetName(), *ToPinsList);
       SendAutomationError(RequestingSocket, RequestId,
-                          TEXT("Could not find source or target pin."),
+                          FString::Printf(TEXT("Could not find source or target pin. Source pins: [%s] Target pins: [%s]"),
+                                          *FromPinsList, *ToPinsList),
                           TEXT("PIN_NOT_FOUND"));
+      return true;
+    }
+
+    if (FromPin->Direction != EGPD_Output || ToPin->Direction != EGPD_Input) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Connections must be output-to-input; got %s '%s' to %s '%s'."),
+                              FromPin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"), *FromPin->PinName.ToString(),
+                              ToPin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"), *ToPin->PinName.ToString()),
+                          TEXT("INVALID_PIN_DIRECTION"));
+      return true;
+    }
+
+    const FPinConnectionResponse ConnectionResponse =
+        TargetGraph->GetSchema()->CanCreateConnection(FromPin, ToPin);
+    if (ConnectionResponse.Response == CONNECT_RESPONSE_DISALLOW) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Cannot connect '%s' (%s) to '%s' (%s): %s"),
+                              *FromPin->PinName.ToString(), *FromPin->PinType.PinCategory.ToString(),
+                              *ToPin->PinName.ToString(), *ToPin->PinType.PinCategory.ToString(),
+                              *ConnectionResponse.Message.ToString()),
+                          TEXT("INCOMPATIBLE_PIN_TYPES"));
       return true;
     }
 
@@ -1361,6 +1648,10 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       SaveLoadedAssetThrottled(Blueprint);
 
       TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+      Result->SetStringField(TEXT("fromNodeId"), FromNode->NodeGuid.ToString());
+      Result->SetStringField(TEXT("fromPinName"), FromPin->PinName.ToString());
+      Result->SetStringField(TEXT("toNodeId"), ToNode->NodeGuid.ToString());
+      Result->SetStringField(TEXT("toPinName"), ToPin->PinName.ToString());
       McpHandlerUtils::AddVerification(Result, Blueprint);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Pins connected."), Result);
@@ -1623,6 +1914,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
 
     if (TargetNode) {
       TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+      Result->SetStringField(TEXT("nodeId"), TargetNode->NodeGuid.ToString());
       Result->SetStringField(TEXT("nodeName"), TargetNode->GetName());
       Result->SetStringField(
           TEXT("nodeTitle"),
@@ -1843,7 +2135,17 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
 
     UEdGraphPin *Pin = FindPinByName(TargetNode, PinName);
     if (!Pin) {
-      SendAutomationError(RequestingSocket, RequestId, TEXT("Pin not found."),
+      FString AvailablePins;
+      for (const UEdGraphPin* Candidate : TargetNode->Pins) {
+        if (Candidate) {
+          if (!AvailablePins.IsEmpty()) {
+            AvailablePins += TEXT(", ");
+          }
+          AvailablePins += Candidate->PinName.ToString();
+        }
+      }
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Pin '%s' not found. Available pins: [%s]"), *PinName, *AvailablePins),
                           TEXT("PIN_NOT_FOUND"));
       return true;
     }
@@ -1852,6 +2154,12 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       SendAutomationError(RequestingSocket, RequestId,
                           TEXT("Can only set default values on input pins."),
                           TEXT("INVALID_PIN_DIRECTION"));
+      return true;
+    }
+    if (Pin->LinkedTo.Num() > 0) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("Disconnect the pin before setting a default value."),
+                          TEXT("PIN_CONNECTED"));
       return true;
     }
 
@@ -1863,6 +2171,16 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
 
     // Use the schema to properly set the default value
     const UEdGraphSchema *Schema = TargetGraph->GetSchema();
+    const FString ValidationError = Schema
+        ? Schema->IsPinDefaultValid(Pin, Value, nullptr, FText::GetEmpty())
+        : TEXT("Graph has no schema.");
+    if (!ValidationError.IsEmpty()) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("'%s' is not a valid default value for pin '%s' (%s): %s"),
+                              *Value, *Pin->PinName.ToString(), *Pin->PinType.PinCategory.ToString(), *ValidationError),
+                          TEXT("INVALID_PIN_DEFAULT"));
+      return true;
+    }
     Schema->TrySetDefaultValue(*Pin, Value);
 
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
