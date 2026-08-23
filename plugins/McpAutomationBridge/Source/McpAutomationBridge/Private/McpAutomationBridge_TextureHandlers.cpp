@@ -450,11 +450,42 @@ static float FBMNoise(float X, float Y, int32 Octaves, float Persistence, float 
     return Total / MaxValue;
 }
 
-TSharedPtr<FJsonObject> UMcpAutomationBridgeSubsystem::HandleManageTextureAction(const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonObject> UMcpAutomationBridgeSubsystem::HandleManageTextureAction(TSharedPtr<FJsonObject> Params)
 {
     TSharedPtr<FJsonObject> Response = McpHandlerUtils::CreateResultObject();
 
+    if (!Params.IsValid())
+    {
+        TEXTURE_ERROR_RESPONSE(TEXT("Missing texture parameters"));
+    }
+
+    // Native MCP calls to consolidated tools use `action`, while the texture
+    // handlers use `subAction`. Keep both request shapes working, then remove
+    // the routing-only field before each action's strict parameter validation.
+    TSharedPtr<FJsonObject> NormalizedParams = MakeShared<FJsonObject>();
+    NormalizedParams->Values = Params->Values;
+    Params = NormalizedParams;
+
     FString SubAction = GetStringFieldTextAuth(Params, TEXT("subAction"), TEXT(""));
+    const FString RoutedAction = GetStringFieldTextAuth(Params, TEXT("action"), TEXT(""));
+    if (SubAction.IsEmpty())
+    {
+        SubAction = RoutedAction;
+    }
+    else if (!RoutedAction.IsEmpty() && RoutedAction != SubAction)
+    {
+        TEXTURE_ERROR_RESPONSE(FString::Printf(
+            TEXT("Conflicting texture action '%s' and subAction '%s'"),
+            *RoutedAction, *SubAction));
+    }
+
+    if (SubAction.IsEmpty())
+    {
+        TEXTURE_ERROR_RESPONSE(TEXT("Missing texture action"));
+    }
+
+    Params->SetStringField(TEXT("subAction"), SubAction);
+    Params->RemoveField(TEXT("action"));
 
     // ===== PROCEDURAL GENERATION =====
 
@@ -765,7 +796,7 @@ Response->SetBoolField(TEXT("success"), true);
             TEXT("subAction"), TEXT("name"), TEXT("path"), TEXT("patternType"),
             TEXT("width"), TEXT("height"), TEXT("tilesX"), TEXT("tilesY"),
             TEXT("lineWidth"), TEXT("brickRatio"), TEXT("offset"), TEXT("save"),
-            TEXT("primaryColor"), TEXT("secondaryColor")
+            TEXT("primaryColor"), TEXT("secondaryColor"), TEXT("pattern")
         };
         for (const auto& Field : Params->Values)
         {
@@ -794,7 +825,25 @@ Response->SetBoolField(TEXT("success"), true);
         }
         Name = SanitizedName;
 
-        FString PatternType = GetStringFieldTextAuth(Params, TEXT("patternType"), TEXT("Checker"));
+        FString PatternType = GetStringFieldTextAuth(Params, TEXT("patternType"), TEXT(""));
+        if (PatternType.IsEmpty())
+        {
+            // `pattern` was advertised by the consolidated asset tool before
+            // patternType was added to its action-specific schema.
+            PatternType = GetStringFieldTextAuth(Params, TEXT("pattern"), TEXT("Checker"));
+        }
+        if (PatternType.Equals(TEXT("checker"), ESearchCase::IgnoreCase)) PatternType = TEXT("Checker");
+        else if (PatternType.Equals(TEXT("grid"), ESearchCase::IgnoreCase)) PatternType = TEXT("Grid");
+        else if (PatternType.Equals(TEXT("brick"), ESearchCase::IgnoreCase)) PatternType = TEXT("Brick");
+        else if (PatternType.Equals(TEXT("tile"), ESearchCase::IgnoreCase)) PatternType = TEXT("Tile");
+        else if (PatternType.Equals(TEXT("dots"), ESearchCase::IgnoreCase)) PatternType = TEXT("Dots");
+        else if (PatternType.Equals(TEXT("stripes"), ESearchCase::IgnoreCase)) PatternType = TEXT("Stripes");
+        else
+        {
+            TEXTURE_ERROR_RESPONSE(FString::Printf(
+                TEXT("Unsupported pattern '%s'. Supported patterns: Checker, Grid, Brick, Tile, Dots, Stripes"),
+                *PatternType));
+        }
         int32 Width = 0;
         int32 Height = 0;
         int32 TilesX = 0;
@@ -820,6 +869,18 @@ Response->SetBoolField(TEXT("success"), true);
         float BrickRatio = static_cast<float>(GetNumberFieldTextAuth(Params, TEXT("brickRatio"), 2.0));
         float Offset = static_cast<float>(GetNumberFieldTextAuth(Params, TEXT("offset"), 0.5));
         bool bSave = GetBoolFieldTextAuth(Params, TEXT("save"), true);
+        if (!FMath::IsFinite(LineWidth) || LineWidth < 0.0f || LineWidth >= 0.5f)
+        {
+            TEXTURE_ERROR_RESPONSE(TEXT("lineWidth must be finite and in the range [0, 0.5)"));
+        }
+        if (!FMath::IsFinite(BrickRatio) || BrickRatio <= 0.0f)
+        {
+            TEXTURE_ERROR_RESPONSE(TEXT("brickRatio must be finite and greater than zero"));
+        }
+        if (!FMath::IsFinite(Offset) || Offset < 0.0f || Offset > 1.0f)
+        {
+            TEXTURE_ERROR_RESPONSE(TEXT("offset must be finite and in the range [0, 1]"));
+        }
 
         // Get colors
         FLinearColor PrimaryColor(1, 1, 1, 1);
@@ -901,6 +962,15 @@ Response->SetBoolField(TEXT("success"), true);
                     bUsePrimary = (LocalX > LineWidth && LocalX < (1.0f - LineWidth) &&
                                    LocalY > LineWidth && LocalY < (1.0f - LineWidth));
                 }
+                else if (PatternType == TEXT("Tile"))
+                {
+                    float CellWidth = 1.0f / TilesX;
+                    float CellHeight = 1.0f / TilesY;
+                    float LocalX = FMath::Fmod(NX, CellWidth) / CellWidth;
+                    float LocalY = FMath::Fmod(NY, CellHeight) / CellHeight;
+                    bUsePrimary = (LocalX > LineWidth && LocalX < (1.0f - LineWidth) &&
+                                   LocalY > LineWidth && LocalY < (1.0f - LineWidth));
+                }
                 else if (PatternType == TEXT("Stripes"))
                 {
                     int32 StripeIndex = static_cast<int32>(NX * TilesX);
@@ -939,9 +1009,24 @@ Response->SetBoolField(TEXT("success"), true);
             }
         }
 
-Response->SetBoolField(TEXT("success"), true);
+        const FString ObjectPath = NewTexture->GetPathName();
+        UTexture2D* VerifiedTexture = NewTexture;
+        if (bSave)
+        {
+            VerifiedTexture = LoadObject<UTexture2D>(nullptr, *ObjectPath);
+            if (!VerifiedTexture)
+            {
+                TEXTURE_ERROR_RESPONSE(FString::Printf(TEXT("Saved pattern texture could not be read back: %s"), *ObjectPath));
+            }
+        }
+
+        Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Pattern texture '%s' created"), *Name));
-        McpHandlerUtils::AddVerification(Response, NewTexture);
+        Response->SetStringField(TEXT("assetPath"), VerifiedTexture->GetOutermost()->GetName());
+        Response->SetStringField(TEXT("objectPath"), VerifiedTexture->GetPathName());
+        Response->SetNumberField(TEXT("width"), VerifiedTexture->GetSizeX());
+        Response->SetNumberField(TEXT("height"), VerifiedTexture->GetSizeY());
+        McpHandlerUtils::AddVerification(Response, VerifiedTexture);
         return Response;
     }
 

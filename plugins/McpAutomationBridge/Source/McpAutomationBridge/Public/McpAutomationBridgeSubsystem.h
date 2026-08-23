@@ -831,7 +831,7 @@ private:
       const TSharedPtr<FJsonObject> &Payload,
       TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
   // Internal texture processing helper
-  TSharedPtr<FJsonObject> HandleManageTextureAction(const TSharedPtr<FJsonObject>& Params);
+  TSharedPtr<FJsonObject> HandleManageTextureAction(TSharedPtr<FJsonObject> Params);
   // Phase 10: Animation Authoring handlers
   bool HandleManageAnimationAuthoringAction(
       const FString &RequestId, const FString &Action,

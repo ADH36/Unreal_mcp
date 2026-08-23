@@ -139,6 +139,17 @@ public:
 			.Number(TEXT("strength"), TEXT("Strength value."))
 			.Number(TEXT("scale"), TEXT("Scale value."))
 			.Number(TEXT("octaves"), TEXT("Octave count."))
+			.StringEnum(TEXT("patternType"), {
+				TEXT("Checker"), TEXT("Grid"), TEXT("Brick"),
+				TEXT("Tile"), TEXT("Dots"), TEXT("Stripes")
+			}, TEXT("Pattern texture type."))
+			.FreeformObject(TEXT("primaryColor"), TEXT("Primary pattern color {r, g, b, a}."))
+			.FreeformObject(TEXT("secondaryColor"), TEXT("Secondary pattern color {r, g, b, a}."))
+			.Number(TEXT("tilesX"), TEXT("Pattern tile count horizontally."))
+			.Number(TEXT("tilesY"), TEXT("Pattern tile count vertically."))
+			.Number(TEXT("lineWidth"), TEXT("Grid, tile, and brick line width (0-0.5)."))
+			.Number(TEXT("brickRatio"), TEXT("Brick width/height ratio."))
+			.Number(TEXT("offset"), TEXT("Brick row offset (0-1)."))
 			.Number(TEXT("samples"), TEXT("Sample count."))
 			.Number(TEXT("newWidth"), TEXT("New width."))
 			.Number(TEXT("newHeight"), TEXT("New height."))

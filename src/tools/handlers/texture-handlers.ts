@@ -181,7 +181,7 @@ export async function handleTextureTools(
         const params = normalizeArgs(args, [
           { key: 'name', required: true },
           { key: 'path', aliases: ['directory'], default: '/Game/Textures' },
-          { key: 'patternType', default: 'Checker' }, // Checker, Grid, Brick, Tile, Dots, Stripes
+          { key: 'patternType', aliases: ['pattern'], default: 'Checker' }, // Checker, Grid, Brick, Tile, Dots, Stripes
           { key: 'width', default: 1024 },
           { key: 'height', default: 1024 },
           { key: 'primaryColor', default: { r: 1, g: 1, b: 1, a: 1 } },

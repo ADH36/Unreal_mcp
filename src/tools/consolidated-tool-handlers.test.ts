@@ -31,6 +31,41 @@ function createConnectedTools() {
 }
 
 describe('consolidated action params compatibility', () => {
+  it('advertises pattern texture parameters on the consolidated asset schema', () => {
+    const tool = consolidatedToolDefinitions.find((definition) => definition.name === 'manage_asset');
+    const inputSchema = tool?.inputSchema as Record<string, unknown> | undefined;
+    const properties = inputSchema?.properties as Record<string, unknown> | undefined;
+    const action = properties?.action as { enum?: string[] } | undefined;
+
+    expect(action?.enum).toContain('create_pattern_texture');
+    for (const property of ['path', 'width', 'height', 'pattern', 'patternType', 'primaryColor', 'secondaryColor', 'tilesX', 'tilesY', 'lineWidth', 'brickRatio', 'offset']) {
+      expect(properties).toHaveProperty(property);
+    }
+  });
+
+  it('routes pattern texture aliases without leaking the consolidated action to strict texture validation', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+
+    await handleConsolidatedToolCall('manage_asset', {
+      action: 'create_pattern_texture',
+      name: 'MCP_Pattern',
+      path: '/Game/Textures',
+      pattern: 'Dots',
+      width: 64,
+      height: 32
+    }, tools);
+
+    expect(sendAutomationRequest).toHaveBeenCalledWith('manage_texture', expect.objectContaining({
+      subAction: 'create_pattern_texture',
+      name: 'MCP_Pattern',
+      path: '/Game/Textures',
+      patternType: 'Dots',
+      width: 64,
+      height: 32
+    }), expect.any(Object));
+    expect(sendAutomationRequest.mock.calls[0]?.[1]).not.toHaveProperty('action');
+  });
+
   it('advertises params for action tools in public schemas', () => {
     const tools = [
       consolidatedToolDefinitions.find((tool) => tool.name === 'manage_level_structure'),

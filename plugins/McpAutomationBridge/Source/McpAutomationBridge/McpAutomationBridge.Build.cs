@@ -231,7 +231,8 @@ public class McpAutomationBridge : ModuleRules
             AddOptionalDynamicModule(Target, EngineDir, "GeometryScriptingCore", "GeometryScriptingCore");
             AddOptionalDynamicModule(Target, EngineDir, "GeometryScriptingEditor", "GeometryScriptingEditor");
 
-            bool bHasPCG = AddOptionalDynamicModule(Target, EngineDir, "PCG", "PCG");
+            // UE 5.8 PCG exports UserParameterTagData, so it cannot be delay-loaded.
+            bool bHasPCG = AddOptionalConditionalModule(Target, EngineDir, "PCG", "PCG");
             PublicDefinitions.Add(bHasPCG ? "MCP_HAS_PCG=1" : "MCP_HAS_PCG=0");
 
             // LevelSequenceEditor (optional plugin) - for Sequencer/Cinematics
