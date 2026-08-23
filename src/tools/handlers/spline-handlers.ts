@@ -40,6 +40,12 @@ export async function handleSplineTools(
     case 'add_spline_point':
       return sendRequest('add_spline_point');
 
+    case 'insert_spline_point':
+      return sendRequest('insert_spline_point');
+
+    case 'update_spline_point':
+      return sendRequest('update_spline_point');
+
     case 'remove_spline_point':
       return sendRequest('remove_spline_point');
 
@@ -54,6 +60,9 @@ export async function handleSplineTools(
 
     case 'set_spline_point_scale':
       return sendRequest('set_spline_point_scale');
+
+    case 'set_spline_point_roll':
+      return sendRequest('set_spline_point_roll');
 
     case 'set_spline_type':
       return sendRequest('set_spline_type');
@@ -75,6 +84,15 @@ export async function handleSplineTools(
 
     case 'set_spline_mesh_material':
       return sendRequest('set_spline_mesh_material');
+
+    case 'generate_spline_mesh_segments':
+      return sendRequest('generate_spline_mesh_segments');
+
+    case 'rebuild_spline_mesh_segments':
+      return sendRequest('rebuild_spline_mesh_segments');
+
+    case 'clear_generated_spline_segments':
+      return sendRequest('clear_generated_spline_segments');
 
     // ========================================================================
     // Spline Mesh Array (3 actions)
@@ -109,11 +127,23 @@ export async function handleSplineTools(
     case 'create_pipe_spline':
       return sendRequest('create_pipe_spline');
 
+    case 'create_path_spline':
+      return sendRequest('create_path_spline');
+
     // ========================================================================
     // Utility (1 action)
     // ========================================================================
     case 'get_splines_info':
       return sendRequest('get_splines_info');
+
+    case 'find_spline_actors':
+      return sendRequest('find_spline_actors');
+
+    case 'find_spline_components':
+      return sendRequest('find_spline_components');
+
+    case 'inspect_spline_points':
+      return sendRequest('inspect_spline_points');
 
     default:
       return {

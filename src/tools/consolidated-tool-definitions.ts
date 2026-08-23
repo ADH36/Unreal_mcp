@@ -67,11 +67,11 @@ export const LIGHTING_ACTIONS = [
 
 export const SPLINE_ACTIONS = [
   'create_spline_actor', 'add_spline_point', 'remove_spline_point', 'set_spline_point_position',
-  'set_spline_point_tangents', 'set_spline_point_rotation', 'set_spline_point_scale', 'set_spline_type',
+  'insert_spline_point', 'update_spline_point', 'set_spline_point_tangents', 'set_spline_point_rotation', 'set_spline_point_scale', 'set_spline_point_roll', 'set_spline_type',
   'create_spline_mesh_component', 'set_spline_mesh_asset', 'configure_spline_mesh_axis',
-  'set_spline_mesh_material', 'scatter_meshes_along_spline', 'configure_mesh_spacing',
+  'set_spline_mesh_material', 'generate_spline_mesh_segments', 'rebuild_spline_mesh_segments', 'clear_generated_spline_segments', 'scatter_meshes_along_spline', 'configure_mesh_spacing',
   'configure_mesh_randomization', 'create_road_spline', 'create_river_spline', 'create_fence_spline',
-  'create_wall_spline', 'create_cable_spline', 'create_pipe_spline', 'get_splines_info'
+  'create_wall_spline', 'create_cable_spline', 'create_pipe_spline', 'create_path_spline', 'find_spline_actors', 'find_spline_components', 'inspect_spline_points', 'get_splines_info'
 ] as const;
 
 export const PHASE_28_ENVIRONMENT_ACTIONS = [
@@ -1015,6 +1015,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         seed: commonSchemas.numberProp,
         foliageTypes: commonSchemas.arrayOfObjects,
         points: commonSchemas.arrayOfObjects,
+        routePoints: commonSchemas.arrayOfObjects,
         // Additional handler-used params
         quadsPerSection: commonSchemas.numberProp,
         count: commonSchemas.numberProp,
@@ -1064,6 +1065,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         alignToSpline: commonSchemas.booleanProp,
         arriveTangent: commonSchemas.location,
         bClosedLoop: commonSchemas.booleanProp,
+        coordinateSpace: { type: 'string', enum: ['Local', 'World'], description: 'Coordinate space for spline route and point values.' },
         blueprintPath: commonSchemas.blueprintPath,
         compensationValue: commonSchemas.numberProp,
         componentName: commonSchemas.componentName,
@@ -1078,8 +1080,10 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         minBrightness: commonSchemas.numberProp,
         operation: commonSchemas.stringProp,
         pointIndex: commonSchemas.numberProp,
+        index: commonSchemas.numberProp,
         pointRotation: commonSchemas.rotation,
         pointScale: commonSchemas.scale,
+        roll: commonSchemas.numberProp,
         pointType: commonSchemas.stringProp,
         propertyName: commonSchemas.propertyName,
         propertyValue: commonSchemas.value,

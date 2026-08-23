@@ -265,20 +265,24 @@ inline const TArray<FString>& Lighting()
 
 inline const TArray<FString>& Splines()
 {
-	static const TArray<FString> Actions = {
-		TEXT("create_spline_actor"), TEXT("add_spline_point"),
-		TEXT("remove_spline_point"), TEXT("set_spline_point_position"),
-		TEXT("set_spline_point_tangents"), TEXT("set_spline_point_rotation"),
-		TEXT("set_spline_point_scale"), TEXT("set_spline_type"),
-		TEXT("create_spline_mesh_component"), TEXT("set_spline_mesh_asset"),
-		TEXT("configure_spline_mesh_axis"),
-		TEXT("set_spline_mesh_material"),
-		TEXT("scatter_meshes_along_spline"),
+    static const TArray<FString> Actions = {
+        TEXT("create_spline_actor"), TEXT("add_spline_point"),
+        TEXT("insert_spline_point"), TEXT("update_spline_point"),
+        TEXT("remove_spline_point"), TEXT("set_spline_point_position"),
+        TEXT("set_spline_point_tangents"), TEXT("set_spline_point_rotation"),
+        TEXT("set_spline_point_scale"), TEXT("set_spline_point_roll"), TEXT("set_spline_type"),
+        TEXT("create_spline_mesh_component"), TEXT("set_spline_mesh_asset"),
+        TEXT("configure_spline_mesh_axis"),
+        TEXT("set_spline_mesh_material"),
+        TEXT("generate_spline_mesh_segments"), TEXT("rebuild_spline_mesh_segments"),
+        TEXT("clear_generated_spline_segments"),
+        TEXT("scatter_meshes_along_spline"),
 		TEXT("configure_mesh_spacing"),
 		TEXT("configure_mesh_randomization"), TEXT("create_road_spline"),
 		TEXT("create_river_spline"), TEXT("create_fence_spline"),
 		TEXT("create_wall_spline"), TEXT("create_cable_spline"),
-		TEXT("create_pipe_spline"), TEXT("get_splines_info")
+        TEXT("create_pipe_spline"), TEXT("create_path_spline"), TEXT("find_spline_actors"),
+        TEXT("find_spline_components"), TEXT("inspect_spline_points"), TEXT("get_splines_info")
 	};
 	return Actions;
 }

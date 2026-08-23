@@ -24,16 +24,22 @@ public:
 			.StringEnum(TEXT("action"), {
 				TEXT("create_spline_actor"),
 				TEXT("add_spline_point"),
+				TEXT("insert_spline_point"),
+				TEXT("update_spline_point"),
 				TEXT("remove_spline_point"),
 				TEXT("set_spline_point_position"),
 				TEXT("set_spline_point_tangents"),
 				TEXT("set_spline_point_rotation"),
 				TEXT("set_spline_point_scale"),
+				TEXT("set_spline_point_roll"),
 				TEXT("set_spline_type"),
 				TEXT("create_spline_mesh_component"),
 				TEXT("set_spline_mesh_asset"),
 				TEXT("configure_spline_mesh_axis"),
 				TEXT("set_spline_mesh_material"),
+				TEXT("generate_spline_mesh_segments"),
+				TEXT("rebuild_spline_mesh_segments"),
+				TEXT("clear_generated_spline_segments"),
 				TEXT("scatter_meshes_along_spline"),
 				TEXT("configure_mesh_spacing"),
 				TEXT("configure_mesh_randomization"),
@@ -43,6 +49,10 @@ public:
 				TEXT("create_wall_spline"),
 				TEXT("create_cable_spline"),
 				TEXT("create_pipe_spline"),
+				TEXT("create_path_spline"),
+				TEXT("find_spline_actors"),
+				TEXT("find_spline_components"),
+				TEXT("inspect_spline_points"),
 				TEXT("get_splines_info")
 			}, TEXT("Spline action to perform"))
 			.String(TEXT("actorName"), TEXT("Name of the actor."))
@@ -64,6 +74,7 @@ public:
 			})
 			.Number(TEXT("pointIndex"),
 				TEXT("Index of spline point to modify."))
+			.Number(TEXT("index"), TEXT("Insertion index; omit to append."))
 			.Object(TEXT("position"), TEXT("Position for spline point."),
 				[](FMcpSchemaBuilder& S) {
 				S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z"));
@@ -148,6 +159,7 @@ public:
 				TEXT("Roll angle at spline mesh start (radians)."))
 			.Number(TEXT("endRoll"),
 				TEXT("Roll angle at spline mesh end (radians)."))
+			.Number(TEXT("roll"), TEXT("Spline point roll in degrees."))
 			.Bool(TEXT("bSmoothInterpRollScale"),
 				TEXT("Use smooth interpolation for roll/scale."))
 			.Number(TEXT("spacing"),
@@ -191,6 +203,8 @@ public:
 			.Number(TEXT("cableSlack"),
 				TEXT("Slack/sag amount for cable template."))
 			.ArrayOfObjects(TEXT("points"), TEXT(""))
+			.ArrayOfObjects(TEXT("routePoints"), TEXT("Alias for points; ordered route points."))
+			.Bool(TEXT("collisionEnabled"), TEXT("Enable collision on generated spline meshes."))
 			.String(TEXT("filter"), TEXT("General search filter."))
 			.Bool(TEXT("save"), TEXT("Save the asset(s) after the operation."))
 			.Required({TEXT("action")})
