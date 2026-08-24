@@ -91,6 +91,7 @@ public:
 			}, TEXT("Type of data layer."))
 			.String(TEXT("actorName"), TEXT("Name of the actor."))
 			.String(TEXT("actorPath"), TEXT("Path to actor."))
+			.Bool(TEXT("autoConfigure"), TEXT("When assigning an HLOD layer, configure a StaticMeshActor's spatial, mobility and HLOD flags when safe."))
 			.String(TEXT("hlodLayerName"), TEXT("Name of the HLOD layer."))
 			.String(TEXT("hlodLayerPath"), TEXT("Path to HLOD layer."))
 			.String(TEXT("generatedHlodActor"), TEXT("Generated HLOD actor label for a focused rebuild."))
@@ -102,6 +103,7 @@ public:
 				TEXT("HLOD is spatially loaded."))
 			.Number(TEXT("cellSize"), TEXT("HLOD cell size."))
 			.Number(TEXT("loadingDistance"), TEXT("HLOD loading distance."))
+			.Number(TEXT("timeoutSeconds"), TEXT("Maximum HLOD commandlet runtime before cancellation."))
 			.String(TEXT("volumeName"), TEXT("Name of the volume."))
 			.Object(TEXT("volumeLocation"),
 				TEXT("Location of the volume."),

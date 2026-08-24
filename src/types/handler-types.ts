@@ -914,6 +914,7 @@ export interface NavigationArgs extends HandlerArgs {
     navMeshPath?: string;
     actorName?: string;
     actorPath?: string;
+    autoConfigure?: boolean;
     blueprintPath?: string;
     boundsActorName?: string;
     volumeName?: string;
@@ -1125,6 +1126,7 @@ export interface LevelStructureArgs extends HandlerArgs {
     bIsSpatiallyLoaded?: boolean;
     cellSize?: number;
     loadingDistance?: number;
+    timeoutSeconds?: number;
 
     // Minimap volume
     volumeName?: string;

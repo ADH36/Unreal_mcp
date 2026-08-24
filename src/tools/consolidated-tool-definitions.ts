@@ -3641,6 +3641,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         },
         actorName: commonSchemas.actorName,
         actorPath: commonSchemas.actorPath,
+        autoConfigure: { type: 'boolean', description: 'Configure safe StaticMeshActor HLOD flags during assignment.' },
         hlodLayerName: { type: 'string', description: 'Name of the HLOD layer.' },
         hlodLayerPath: commonSchemas.hlodLayerPath,
         generatedHlodActor: { type: 'string', description: 'Generated HLOD actor label for a focused rebuild.' },
@@ -3650,6 +3651,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         bIsSpatiallyLoaded: { type: 'boolean', description: 'HLOD is spatially loaded.' },
         cellSize: { type: 'number', description: 'HLOD cell size.' },
         loadingDistance: { type: 'number', description: 'HLOD loading distance.' },
+        timeoutSeconds: { type: 'number', description: 'Maximum HLOD commandlet runtime before timeout.' },
         volumeName: commonSchemas.volumeName,
         volumeLocation: {
           type: 'object',

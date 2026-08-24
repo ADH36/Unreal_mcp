@@ -2269,6 +2269,29 @@ static bool IsSafeCommandletName(const FString& Name)
     return true;
 }
 
+static bool ParseFirstLogInteger(const FString& Line, int32& OutValue)
+{
+    for (int32 Index = 0; Index < Line.Len(); ++Index)
+    {
+        if (FChar::IsDigit(Line[Index]) || (Line[Index] == TEXT('-') && Index + 1 < Line.Len() && FChar::IsDigit(Line[Index + 1])))
+        {
+            OutValue = FCString::Atoi(*Line.Mid(Index));
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ParseLogIntegerAfter(const FString& Line, const FString& Marker, int32& OutValue)
+{
+    const int32 MarkerIndex = Line.Find(Marker, ESearchCase::IgnoreCase);
+    if (MarkerIndex == INDEX_NONE)
+    {
+        return false;
+    }
+    return ParseFirstLogInteger(Line.Mid(MarkerIndex + Marker.Len()), OutValue);
+}
+
 static void AddHlodBuildLogFields(TSharedPtr<FJsonObject> Result)
 {
     FString Log;
@@ -2280,17 +2303,79 @@ static void AddHlodBuildLogFields(TSharedPtr<FJsonObject> Result)
     Result->SetStringField(TEXT("logTail"), Log.Mid(TailStart));
     Result->SetStringField(TEXT("logPath"), GMcpHlodBuildProcess.LogPath);
 
-    int32 Warnings = 0;
-    int32 Errors = 0;
+    // UE log severity is encoded in the category prefix ("LogX: Error:") or
+    // in a structured [Error]/[Warning] record.  Do not search for the words
+    // in arbitrary display text (for example, "no errors found").
+    TArray<TSharedPtr<FJsonValue>> WarningRecords;
+    TArray<TSharedPtr<FJsonValue>> ErrorRecords;
+    int32 SummaryWarnings = INDEX_NONE;
+    int32 SummaryErrors = INDEX_NONE;
+    int32 GeneratedActors = INDEX_NONE;
+    int32 ProgressCurrent = INDEX_NONE;
+    int32 ProgressTotal = INDEX_NONE;
     TArray<FString> Lines;
     Log.ParseIntoArrayLines(Lines, false);
     for (const FString& Line : Lines)
     {
-        if (Line.Contains(TEXT("warning"), ESearchCase::IgnoreCase)) ++Warnings;
-        if (Line.Contains(TEXT("error"), ESearchCase::IgnoreCase)) ++Errors;
+        const bool bErrorRecord = Line.Contains(TEXT(": Error:"), ESearchCase::IgnoreCase) || Line.Contains(TEXT("[Error]"), ESearchCase::IgnoreCase);
+        const bool bWarningRecord = Line.Contains(TEXT(": Warning:"), ESearchCase::IgnoreCase) || Line.Contains(TEXT("[Warning]"), ESearchCase::IgnoreCase);
+        if (bErrorRecord)
+        {
+            ErrorRecords.Add(MakeShared<FJsonValueString>(Line));
+        }
+        if (bWarningRecord)
+        {
+            WarningRecords.Add(MakeShared<FJsonValueString>(Line));
+        }
+
+        int32 Parsed = 0;
+        if (ParseLogIntegerAfter(Line, TEXT("Total Errors"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Error Count"), Parsed))
+        {
+            SummaryErrors = Parsed;
+        }
+        if (ParseLogIntegerAfter(Line, TEXT("Total Warnings"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Warning Count"), Parsed))
+        {
+            SummaryWarnings = Parsed;
+        }
+        if (ParseLogIntegerAfter(Line, TEXT("Built "), Parsed) && Line.Contains(TEXT("HLOD actor"), ESearchCase::IgnoreCase))
+        {
+            GeneratedActors = Parsed;
+        }
+        else if (ParseLogIntegerAfter(Line, TEXT("World contains "), Parsed) && Line.Contains(TEXT("HLOD actor"), ESearchCase::IgnoreCase))
+        {
+            GeneratedActors = Parsed;
+        }
+        else if (ParseLogIntegerAfter(Line, TEXT("Deleted "), Parsed) && Line.Contains(TEXT("HLOD actor"), ESearchCase::IgnoreCase))
+        {
+            GeneratedActors = 0;
+        }
+
+        const int32 Open = Line.Find(TEXT("["));
+        const int32 Slash = Open == INDEX_NONE ? INDEX_NONE : Line.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Open + 1);
+        if (Open != INDEX_NONE && Slash != INDEX_NONE)
+        {
+            const int32 Close = Line.Find(TEXT("]"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Slash + 1);
+            if (Close != INDEX_NONE)
+            {
+                ProgressCurrent = FCString::Atoi(*Line.Mid(Open + 1, Slash - Open - 1));
+                ProgressTotal = FCString::Atoi(*Line.Mid(Slash + 1, Close - Slash - 1));
+            }
+        }
     }
-    Result->SetNumberField(TEXT("warningCount"), Warnings);
-    Result->SetNumberField(TEXT("errorCount"), Errors);
+    Result->SetArrayField(TEXT("warnings"), WarningRecords);
+    Result->SetArrayField(TEXT("errors"), ErrorRecords);
+    Result->SetNumberField(TEXT("warningCount"), SummaryWarnings != INDEX_NONE ? SummaryWarnings : WarningRecords.Num());
+    Result->SetNumberField(TEXT("errorCount"), SummaryErrors != INDEX_NONE ? SummaryErrors : ErrorRecords.Num());
+    if (GeneratedActors != INDEX_NONE)
+    {
+        Result->SetNumberField(TEXT("commandletHlodActorCount"), GeneratedActors);
+    }
+    if (ProgressTotal > 0)
+    {
+        Result->SetNumberField(TEXT("progressCurrent"), ProgressCurrent);
+        Result->SetNumberField(TEXT("progressTotal"), ProgressTotal);
+        Result->SetNumberField(TEXT("progressPercent"), 100.0 * (double)ProgressCurrent / (double)ProgressTotal);
+    }
 }
 
 static bool HandleListHlodLayers(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
@@ -2342,6 +2427,157 @@ static bool HandleInspectHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, con
     return true;
 }
 
+struct FMcpHlodCompatibility
+{
+    bool bCompatible = false;
+    FString Code;
+    FString Reason;
+    TArray<UStaticMeshComponent*> MeshComponents;
+};
+
+static FMcpHlodCompatibility InspectHlodCompatibility(AActor* Actor)
+{
+    FMcpHlodCompatibility Result;
+    if (!Actor)
+    {
+        Result.Code = TEXT("ACTOR_NOT_FOUND");
+        Result.Reason = TEXT("Actor was not found.");
+        return Result;
+    }
+    if (Actor->IsA<AWorldPartitionHLOD>())
+    {
+        Result.Code = TEXT("ACTOR_IS_GENERATED_HLOD");
+        Result.Reason = TEXT("Generated HLOD actors cannot be used as HLOD source actors.");
+        return Result;
+    }
+    if (Actor->IsEditorOnly())
+    {
+        Result.Code = TEXT("ACTOR_EDITOR_ONLY");
+        Result.Reason = TEXT("Editor-only actors are excluded from HLOD generation.");
+        return Result;
+    }
+    for (UActorComponent* Component : Actor->GetComponents())
+    {
+        if (UStaticMeshComponent* MeshComponent = Cast<UStaticMeshComponent>(Component))
+        {
+            if (MeshComponent->GetStaticMesh())
+            {
+                Result.MeshComponents.Add(MeshComponent);
+            }
+        }
+    }
+    if (Result.MeshComponents.Num() == 0)
+    {
+        Result.Code = TEXT("ACTOR_NO_STATIC_MESH");
+        Result.Reason = TEXT("Actor has no visible StaticMeshComponent with an assigned non-editor-only mesh.");
+        return Result;
+    }
+    if (!Actor->GetIsSpatiallyLoaded())
+    {
+        Result.Code = TEXT("ACTOR_NOT_SPATIALLY_LOADED");
+        Result.Reason = TEXT("World Partition HLOD sources must be spatially loaded.");
+        return Result;
+    }
+    if (!Actor->bEnableAutoLODGeneration)
+    {
+        Result.Code = TEXT("ACTOR_HLOD_EXCLUDED");
+        Result.Reason = TEXT("Actor Include Actor in HLOD is disabled.");
+        return Result;
+    }
+    for (UStaticMeshComponent* MeshComponent : Result.MeshComponents)
+    {
+        if (!MeshComponent->IsVisible())
+        {
+            Result.Code = TEXT("COMPONENT_HIDDEN");
+            Result.Reason = FString::Printf(TEXT("Static mesh component '%s' is hidden."), *MeshComponent->GetName());
+            return Result;
+        }
+        if (MeshComponent->Mobility == EComponentMobility::Movable)
+        {
+            Result.Code = TEXT("COMPONENT_MOVABLE");
+            Result.Reason = FString::Printf(TEXT("Static mesh component '%s' is Movable; HLOD source components must be Static or Stationary."), *MeshComponent->GetName());
+            return Result;
+        }
+        if (!MeshComponent->bEnableAutoLODGeneration)
+        {
+            Result.Code = TEXT("COMPONENT_HLOD_EXCLUDED");
+            Result.Reason = FString::Printf(TEXT("Static mesh component '%s' is excluded from HLOD."), *MeshComponent->GetName());
+            return Result;
+        }
+        if (!MeshComponent->IsHLODRelevant())
+        {
+            Result.Code = TEXT("COMPONENT_NOT_HLOD_RELEVANT");
+            Result.Reason = FString::Printf(TEXT("Static mesh component '%s' is not HLOD relevant for its current settings."), *MeshComponent->GetName());
+            return Result;
+        }
+    }
+    if (!Actor->IsHLODRelevant())
+    {
+        Result.Code = TEXT("ACTOR_NOT_HLOD_RELEVANT");
+        Result.Reason = TEXT("Actor has no HLOD-relevant components for the current World Partition settings.");
+        return Result;
+    }
+    Result.bCompatible = true;
+    Result.Code = TEXT("HLOD_COMPATIBLE");
+    Result.Reason = TEXT("Actor is a valid World Partition HLOD source.");
+    return Result;
+}
+
+static void AddHlodActorInspection(TSharedPtr<FJsonObject> Entry, AWorldPartitionHLOD* Actor)
+{
+    const int64 SourceActorsStat = Actor->GetStat(FWorldPartitionHLODStats::InputActorCount);
+    const int64 InputTriangles = Actor->GetStat(FWorldPartitionHLODStats::InputTriangleCount);
+    const int64 OutputTriangles = Actor->GetStat(FWorldPartitionHLODStats::MeshTriangleCount);
+    Entry->SetNumberField(TEXT("sourceActorCount"), SourceActorsStat);
+    Entry->SetNumberField(TEXT("inputTriangleCount"), InputTriangles);
+    Entry->SetNumberField(TEXT("outputTriangleCount"), OutputTriangles);
+    Entry->SetNumberField(TEXT("meshInstanceCount"), Actor->GetStat(FWorldPartitionHLODStats::MeshInstanceCount));
+    Entry->SetNumberField(TEXT("materialTextureBytes"), Actor->GetStat(FWorldPartitionHLODStats::MaterialBaseColorTextureSize) + Actor->GetStat(FWorldPartitionHLODStats::MaterialNormalTextureSize) + Actor->GetStat(FWorldPartitionHLODStats::MaterialEmissiveTextureSize));
+    Entry->SetNumberField(TEXT("triangleReductionPercent"), InputTriangles > 0 ? (100.0 * (1.0 - (double)OutputTriangles / (double)InputTriangles)) : 0.0);
+    Entry->SetStringField(TEXT("externalPackagePath"), Actor->GetExternalPackage() ? Actor->GetExternalPackage()->GetName() : TEXT(""));
+
+    TArray<TSharedPtr<FJsonValue>> Meshes;
+    TArray<TSharedPtr<FJsonValue>> Materials;
+    for (UActorComponent* Component : Actor->GetComponents())
+    {
+        if (UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Component))
+        {
+            if (UStaticMeshComponent* MeshComponent = Cast<UStaticMeshComponent>(Primitive))
+            {
+                if (UStaticMesh* Mesh = MeshComponent->GetStaticMesh())
+                {
+                    Meshes.Add(MakeShared<FJsonValueString>(Mesh->GetPathName()));
+                }
+            }
+            for (int32 MaterialIndex = 0; MaterialIndex < Primitive->GetNumMaterials(); ++MaterialIndex)
+            {
+                if (UMaterialInterface* Material = Primitive->GetMaterial(MaterialIndex))
+                {
+                    Materials.Add(MakeShared<FJsonValueString>(Material->GetPathName()));
+                }
+            }
+        }
+    }
+    Entry->SetArrayField(TEXT("generatedMeshPaths"), Meshes);
+    Entry->SetArrayField(TEXT("materialPaths"), Materials);
+
+    TArray<TSharedPtr<FJsonValue>> SourceActorPaths;
+    if (const UWorldPartitionHLODSourceActorsFromCell* SourceActors = Cast<UWorldPartitionHLODSourceActorsFromCell>(Actor->GetSourceActors()))
+    {
+        for (const FWorldPartitionRuntimeCellObjectMapping& Mapping : SourceActors->GetActors())
+        {
+            TSharedPtr<FJsonObject> Source = McpHandlerUtils::CreateResultObject();
+            Source->SetStringField(TEXT("package"), Mapping.Package.ToString());
+            Source->SetStringField(TEXT("path"), Mapping.Path.ToString());
+            Source->SetStringField(TEXT("actorGuid"), Mapping.ActorInstanceGuid.ToString());
+            SourceActorPaths.Add(MakeShared<FJsonValueObject>(Source));
+        }
+    }
+    Entry->SetArrayField(TEXT("sourceActors"), SourceActorPaths);
+    Entry->SetNumberField(TEXT("sourceActorMappingCount"), SourceActorPaths.Num());
+    Entry->SetBoolField(TEXT("valid"), (SourceActorsStat > 0 || SourceActorPaths.Num() > 0) && (Meshes.Num() > 0 || OutputTriangles > 0));
+}
+
 static bool HandleAssignHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket, bool bRemove)
 {
@@ -2354,9 +2590,42 @@ static bool HandleAssignHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, cons
         Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Actor was not found."), nullptr, TEXT("ACTOR_NOT_FOUND"));
         return true;
     }
-    if (Actor->IsA<AWorldPartitionHLOD>() || !Actor->IsHLODRelevant())
+    const bool bAutoConfigure = GetJsonBoolField(Payload, TEXT("autoConfigure"), true);
+    FMcpHlodCompatibility Compatibility = InspectHlodCompatibility(Actor);
+    if (!Compatibility.bCompatible && bAutoConfigure && Actor->IsA<AStaticMeshActor>() && Compatibility.MeshComponents.Num() > 0 &&
+        Compatibility.Code != TEXT("ACTOR_EDITOR_ONLY") && Compatibility.Code != TEXT("ACTOR_IS_GENERATED_HLOD"))
     {
-        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Actor is not compatible with World Partition HLOD assignment."), nullptr, TEXT("ACTOR_NOT_HLOD_COMPATIBLE"));
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Configure HLOD Source Actor")));
+        Actor->Modify();
+        Actor->bEnableAutoLODGeneration = true;
+        if (!Actor->GetIsSpatiallyLoaded() && Actor->CanChangeIsSpatiallyLoadedFlag())
+        {
+            Actor->SetIsSpatiallyLoaded(true);
+        }
+        for (UStaticMeshComponent* MeshComponent : Compatibility.MeshComponents)
+        {
+            MeshComponent->Modify();
+            if (MeshComponent->Mobility == EComponentMobility::Movable)
+            {
+                MeshComponent->SetMobility(EComponentMobility::Static);
+            }
+            MeshComponent->bEnableAutoLODGeneration = true;
+            MeshComponent->MarkRenderStateDirty();
+            MeshComponent->MarkPackageDirty();
+        }
+        Actor->MarkPackageDirty();
+        Compatibility = InspectHlodCompatibility(Actor);
+    }
+    if (!Compatibility.bCompatible)
+    {
+        TSharedPtr<FJsonObject> Diagnostic = McpHandlerUtils::CreateResultObject();
+        Diagnostic->SetStringField(TEXT("actorName"), Actor->GetActorLabel());
+        Diagnostic->SetStringField(TEXT("reason"), Compatibility.Reason);
+        Diagnostic->SetStringField(TEXT("compatibilityCode"), Compatibility.Code);
+        Diagnostic->SetBoolField(TEXT("isSpatiallyLoaded"), Actor->GetIsSpatiallyLoaded());
+        Diagnostic->SetBoolField(TEXT("includeActorInHLOD"), Actor->bEnableAutoLODGeneration);
+        Diagnostic->SetStringField(TEXT("runtimeGrid"), Actor->GetRuntimeGrid().ToString());
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, Compatibility.Reason, Diagnostic, Compatibility.Code.IsEmpty() ? TEXT("ACTOR_NOT_HLOD_COMPATIBLE") : *Compatibility.Code);
         return true;
     }
     UHLODLayer* Layer = nullptr;
@@ -2370,14 +2639,33 @@ static bool HandleAssignHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, cons
             return true;
         }
     }
+    const FScopedTransaction Transaction(FText::FromString(bRemove ? TEXT("Remove HLOD Layer Assignment") : TEXT("Assign HLOD Layer")));
     Actor->Modify();
     Actor->SetHLODLayer(Layer);
     Actor->MarkPackageDirty();
+    for (UStaticMeshComponent* MeshComponent : Compatibility.MeshComponents)
+    {
+        MeshComponent->MarkPackageDirty();
+    }
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     McpHandlerUtils::AddVerification(Result, Actor);
     Result->SetStringField(TEXT("actorName"), Actor->GetActorLabel());
     Result->SetStringField(TEXT("hlodLayerPath"), Layer ? Layer->GetPathName() : TEXT(""));
     Result->SetBoolField(TEXT("assigned"), !bRemove);
+    Result->SetBoolField(TEXT("isSpatiallyLoaded"), Actor->GetIsSpatiallyLoaded());
+    Result->SetBoolField(TEXT("includeActorInHLOD"), Actor->bEnableAutoLODGeneration);
+    Result->SetStringField(TEXT("runtimeGrid"), Actor->GetRuntimeGrid().ToString());
+    Result->SetStringField(TEXT("externalPackagePath"), Actor->GetExternalPackage() ? Actor->GetExternalPackage()->GetName() : TEXT(""));
+    TArray<TSharedPtr<FJsonValue>> DataLayers;
+    for (const UDataLayerAsset* DataLayer : Actor->GetDataLayerAssets())
+    {
+        if (DataLayer)
+        {
+            DataLayers.Add(MakeShared<FJsonValueString>(DataLayer->GetPathName()));
+        }
+    }
+    Result->SetArrayField(TEXT("dataLayerAssets"), DataLayers);
+    Result->SetStringField(TEXT("compatibilityCode"), Compatibility.Code);
     Subsystem->SendAutomationResponse(Socket, RequestId, true, bRemove ? TEXT("Removed actor HLOD Layer assignment.") : TEXT("Assigned actor to HLOD Layer."), Result);
     return true;
 }
@@ -2413,23 +2701,49 @@ static bool HandleInspectGeneratedHlods(UMcpAutomationBridgeSubsystem* Subsystem
     if (!RequireWorldPartitionForHlod(Subsystem, RequestId, Socket, World)) return true;
     TArray<TSharedPtr<FJsonValue>> Actors;
     int32 InvalidCount = 0;
-    for (TActorIterator<AWorldPartitionHLOD> It(World); It; ++It)
+    TSet<FGuid> Seen;
+    auto AddActor = [&Actors, &InvalidCount, &Seen](AWorldPartitionHLOD* Actor, const FWorldPartitionActorDescInstance* Descriptor)
     {
-        AWorldPartitionHLOD* Actor = *It;
-        const int64 SourceActors = Actor->GetStat(FWorldPartitionHLODStats::InputActorCount);
-        const int64 InputTriangles = Actor->GetStat(FWorldPartitionHLODStats::InputTriangleCount);
-        const int64 OutputTriangles = Actor->GetStat(FWorldPartitionHLODStats::MeshTriangleCount);
-        const bool bValid = Actor->GetSourceActors() != nullptr && SourceActors > 0;
-        InvalidCount += bValid ? 0 : 1;
+        if (!Actor || Seen.Contains(Actor->GetActorGuid())) return;
+        Seen.Add(Actor->GetActorGuid());
         TSharedPtr<FJsonObject> Entry = McpHandlerUtils::CreateResultObject();
         Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
+        Entry->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+        Entry->SetStringField(TEXT("actorPackage"), Actor->GetPackage() ? Actor->GetPackage()->GetName() : TEXT(""));
+        if (Descriptor)
+        {
+            Entry->SetStringField(TEXT("runtimeGrid"), Descriptor->GetRuntimeGrid().ToString());
+            Entry->SetStringField(TEXT("actorPackagePath"), Descriptor->GetActorPackage().ToString());
+            TArray<TSharedPtr<FJsonValue>> DescriptorDataLayers;
+            for (const FName& DataLayerName : Descriptor->GetDataLayers())
+            {
+                DescriptorDataLayers.Add(MakeShared<FJsonValueString>(DataLayerName.ToString()));
+            }
+            Entry->SetArrayField(TEXT("dataLayers"), DescriptorDataLayers);
+        }
         Entry->SetNumberField(TEXT("lodLevel"), Actor->GetLODLevel());
-        Entry->SetNumberField(TEXT("sourceActorCount"), SourceActors);
-        Entry->SetNumberField(TEXT("inputTriangleCount"), InputTriangles);
-        Entry->SetNumberField(TEXT("outputTriangleCount"), OutputTriangles);
-        Entry->SetNumberField(TEXT("triangleReductionPercent"), InputTriangles > 0 ? (100.0 * (1.0 - (double)OutputTriangles / (double)InputTriangles)) : 0.0);
-        Entry->SetBoolField(TEXT("valid"), bValid);
+        AddHlodActorInspection(Entry, Actor);
+        if (!Entry->GetBoolField(TEXT("valid"))) ++InvalidCount;
         Actors.Add(MakeShared<FJsonValueObject>(Entry));
+    };
+    for (TActorIterator<AWorldPartitionHLOD> It(World); It; ++It)
+    {
+        AddActor(*It, nullptr);
+    }
+    // HLOD actors are external World Partition actors and are normally not
+    // loaded in the editor after a restart.  Force-load their descriptors so
+    // validation is a real on-disk read-back, not a loaded-actor cache check.
+    if (UWorldPartition* WorldPartition = World->GetWorldPartition())
+    {
+        FWorldPartitionHelpers::FForEachActorWithLoadingParams Params;
+        Params.ActorClasses.Add(AWorldPartitionHLOD::StaticClass());
+        Params.bKeepReferences = true;
+        FWorldPartitionHelpers::ForEachActorWithLoading(WorldPartition,
+            [&AddActor](const FWorldPartitionActorDescInstance* Descriptor)
+            {
+                AddActor(Cast<AWorldPartitionHLOD>(Descriptor->GetActor()), Descriptor);
+                return true;
+            }, Params);
     }
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("mapPath"), World->GetOutermost()->GetName());
@@ -2440,6 +2754,52 @@ static bool HandleInspectGeneratedHlods(UMcpAutomationBridgeSubsystem* Subsystem
     Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess,
         bValidate ? (bSuccess ? TEXT("HLOD validation passed after reload.") : TEXT("HLOD validation failed: generated actors are missing or have no source actors.")) : TEXT("Inspected generated HLOD actors."),
         Result, bSuccess ? TEXT("") : TEXT("HLOD_VALIDATION_FAILED"));
+    return true;
+}
+
+static bool SaveHlodWorldAndExternalActors(UWorld* World, TArray<TSharedPtr<FJsonValue>>& SavedPackages, FString& OutError)
+{
+    if (!World || !World->PersistentLevel)
+    {
+        OutError = TEXT("World or persistent level is unavailable.");
+        return false;
+    }
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!Actor || Actor->IsA<AWorldPartitionHLOD>() || !Actor->GetExternalPackage())
+        {
+            continue;
+        }
+        if (Actor->GetExternalPackage()->IsDirty() || Actor->IsHLODRelevant())
+        {
+            if (!McpSafeAssetSave(Actor))
+            {
+                OutError = FString::Printf(TEXT("Failed to save external HLOD source actor package '%s'."), *Actor->GetExternalPackage()->GetName());
+                return false;
+            }
+            if (Actor->GetExternalPackage()->IsDirty())
+            {
+                OutError = FString::Printf(TEXT("External HLOD source actor package remained dirty after save: '%s'."), *Actor->GetExternalPackage()->GetName());
+                return false;
+            }
+            SavedPackages.Add(MakeShared<FJsonValueString>(Actor->GetExternalPackage()->GetName()));
+        }
+    }
+    const FString MapPath = World->GetOutermost()->GetName();
+    if (World->GetOutermost()->IsDirty() || World->GetOutermost()->HasAnyPackageFlags(PKG_NewlyCreated))
+    {
+        if (!McpSafeLevelSave(World->PersistentLevel, MapPath))
+        {
+            OutError = FString::Printf(TEXT("Failed to save World Partition map '%s'."), *MapPath);
+            return false;
+        }
+    }
+    if (World->GetOutermost()->IsDirty())
+    {
+        OutError = FString::Printf(TEXT("World Partition map remained dirty after save: '%s'."), *MapPath);
+        return false;
+    }
     return true;
 }
 
@@ -2458,19 +2818,12 @@ static bool StartHlodCommandlet(UMcpAutomationBridgeSubsystem* Subsystem, const 
         Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("delete_hlod_output requires confirm=true."), nullptr, TEXT("CONFIRMATION_REQUIRED"));
         return true;
     }
-    if (World->GetOutermost()->HasAnyPackageFlags(PKG_NewlyCreated) || World->GetOutermost()->IsDirty())
+    TArray<TSharedPtr<FJsonValue>> SavedPackages;
+    FString SaveError;
+    if (!SaveHlodWorldAndExternalActors(World, SavedPackages, SaveError))
     {
-        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Save the current World Partition map explicitly before building HLODs."), nullptr, TEXT("MAP_NOT_SAVED"));
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, SaveError, nullptr, TEXT("HLOD_SAVE_FAILED"));
         return true;
-    }
-    for (TActorIterator<AActor> It(World); It; ++It)
-    {
-        AActor* Actor = *It;
-        if (Actor && !Actor->IsA<AWorldPartitionHLOD>() && Actor->IsHLODRelevant() && Actor->GetPackage()->IsDirty())
-        {
-            Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Save dirty HLOD source actors before building; MCP will not open an editor confirmation dialog."), nullptr, TEXT("UNSAVED_HLOD_SOURCE_ACTORS"));
-            return true;
-        }
     }
     const FString ProjectPath = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
     if (ProjectPath.IsEmpty() || !FPaths::FileExists(ProjectPath))
@@ -2522,6 +2875,8 @@ static bool StartHlodCommandlet(UMcpAutomationBridgeSubsystem* Subsystem, const 
     GMcpHlodBuildProcess.MapPath = World->GetOutermost()->GetName();
     GMcpHlodBuildProcess.LogPath = HlodLogPath;
     GMcpHlodBuildProcess.Mode = bDelete ? TEXT("delete") : TEXT("build");
+    GMcpHlodBuildProcess.StartTimeSeconds = FPlatformTime::Seconds();
+    GMcpHlodBuildProcess.TimeoutSeconds = FMath::Clamp(GetJsonNumberField(Payload, TEXT("timeoutSeconds"), 900.0), 10.0, 3600.0);
     Subsystem->SendProgressUpdate(RequestId, 0.0f, TEXT("HLOD commandlet launched; poll get_hlod_build_status for streamed log progress."), true);
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetBoolField(TEXT("started"), true);
@@ -2529,6 +2884,8 @@ static bool StartHlodCommandlet(UMcpAutomationBridgeSubsystem* Subsystem, const 
     Result->SetStringField(TEXT("commandletPath"), EditorCmdPath);
     Result->SetStringField(TEXT("arguments"), Arguments);
     Result->SetStringField(TEXT("logPath"), HlodLogPath);
+    Result->SetNumberField(TEXT("timeoutSeconds"), GMcpHlodBuildProcess.TimeoutSeconds);
+    Result->SetArrayField(TEXT("savedExternalActorPackages"), SavedPackages);
     Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("HLOD commandlet started without blocking the active editor."), Result);
     return true;
 }
@@ -2549,16 +2906,27 @@ static bool HandleHlodBuildStatus(UMcpAutomationBridgeSubsystem* Subsystem, cons
         GMcpHlodBuildProcess.bCancellationRequested = true;
         FPlatformProcess::TerminateProc(GMcpHlodBuildProcess.Process, false);
     }
-    const bool bRunning = FPlatformProcess::IsProcRunning(GMcpHlodBuildProcess.Process);
+    bool bRunning = FPlatformProcess::IsProcRunning(GMcpHlodBuildProcess.Process);
+    const double ElapsedSeconds = FPlatformTime::Seconds() - GMcpHlodBuildProcess.StartTimeSeconds;
+    if (bRunning && !GMcpHlodBuildProcess.bCancellationRequested && ElapsedSeconds > GMcpHlodBuildProcess.TimeoutSeconds)
+    {
+        GMcpHlodBuildProcess.bTimedOut = true;
+        FPlatformProcess::TerminateProc(GMcpHlodBuildProcess.Process, false);
+        bRunning = false;
+    }
     Result->SetBoolField(TEXT("running"), bRunning);
     Result->SetBoolField(TEXT("cancelRequested"), GMcpHlodBuildProcess.bCancellationRequested);
+    Result->SetBoolField(TEXT("timedOut"), GMcpHlodBuildProcess.bTimedOut);
+    Result->SetNumberField(TEXT("elapsedSeconds"), ElapsedSeconds);
+    Result->SetNumberField(TEXT("timeoutSeconds"), GMcpHlodBuildProcess.TimeoutSeconds);
     Result->SetStringField(TEXT("mapPath"), GMcpHlodBuildProcess.MapPath);
     Result->SetStringField(TEXT("mode"), GMcpHlodBuildProcess.Mode);
     AddHlodBuildLogFields(Result);
     if (bRunning)
     {
         Result->SetStringField(TEXT("status"), TEXT("running"));
-        Subsystem->SendProgressUpdate(RequestId, 50.0f, TEXT("HLOD commandlet is running; log tail, warnings, and errors are included in this response."), true);
+        const float Progress = Result->HasField(TEXT("progressPercent")) ? (float)Result->GetNumberField(TEXT("progressPercent")) : 50.0f;
+        Subsystem->SendProgressUpdate(RequestId, Progress, TEXT("HLOD commandlet is running; structured log progress is included in this response."), true);
         Subsystem->SendAutomationResponse(Socket, RequestId, true, bCancel ? TEXT("HLOD commandlet cancellation requested.") : TEXT("HLOD commandlet is running."), Result);
         return true;
     }
@@ -2566,13 +2934,15 @@ static bool HandleHlodBuildStatus(UMcpAutomationBridgeSubsystem* Subsystem, cons
     FPlatformProcess::GetProcReturnCode(GMcpHlodBuildProcess.Process, &ExitCode);
     FPlatformProcess::CloseProc(GMcpHlodBuildProcess.Process);
     GMcpHlodBuildProcess.Process = FProcHandle();
+    GMcpHlodBuildProcess.ExitCode = ExitCode;
     Result->SetNumberField(TEXT("exitCode"), ExitCode);
-    Result->SetStringField(TEXT("status"), ExitCode == 0 ? TEXT("completed") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("cancelled") : TEXT("failed")));
-    Result->SetBoolField(TEXT("reloadRequired"), ExitCode == 0);
-    const bool bSuccess = ExitCode == 0;
-    Subsystem->SendProgressUpdate(RequestId, 100.0f, bSuccess ? TEXT("HLOD commandlet completed; reload the map before validation.") : TEXT("HLOD commandlet ended with an error; inspect the log tail."), false);
-    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess, bSuccess ? TEXT("HLOD commandlet completed. Reload the map, then call validate_hlods.") : FString::Printf(TEXT("HLOD commandlet exited with code %d."), ExitCode), Result,
-        bSuccess ? TEXT("") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("HLOD_BUILD_CANCELLED") : TEXT("HLOD_BUILD_FAILED")));
+    const bool bTimedOut = GMcpHlodBuildProcess.bTimedOut;
+    const bool bSuccess = ExitCode == 0 && !GMcpHlodBuildProcess.bCancellationRequested && !bTimedOut;
+    Result->SetStringField(TEXT("status"), bSuccess ? TEXT("completed") : (bTimedOut ? TEXT("timed_out") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("cancelled") : TEXT("failed"))));
+    Result->SetBoolField(TEXT("reloadRequired"), bSuccess);
+    Subsystem->SendProgressUpdate(RequestId, 100.0f, bSuccess ? TEXT("HLOD commandlet completed; reload the map before validation.") : (bTimedOut ? TEXT("HLOD commandlet timed out.") : TEXT("HLOD commandlet ended; inspect exit code and structured log records.")), false);
+    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess, bSuccess ? TEXT("HLOD commandlet completed. Reload the map, then call validate_hlods.") : (bTimedOut ? TEXT("HLOD commandlet timed out.") : FString::Printf(TEXT("HLOD commandlet exited with code %d."), ExitCode)), Result,
+        bSuccess ? TEXT("") : (bTimedOut ? TEXT("HLOD_BUILD_TIMEOUT") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("HLOD_BUILD_CANCELLED") : TEXT("HLOD_BUILD_FAILED"))));
     return true;
 }
 
