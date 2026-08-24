@@ -79,6 +79,7 @@
 #include "WorldPartition/DataLayer/WorldDataLayers.h"
 #include "WorldPartition/HLOD/HLODLayer.h"
 #include "WorldPartition/HLOD/HLODActor.h"
+#include "WorldPartition/HLOD/HLODStats.h"
 #include "Engine/LODActor.h"
 #include "LevelInstance/LevelInstanceActor.h"
 #include "LevelInstance/LevelInstanceSubsystem.h"
@@ -2071,7 +2072,12 @@ static bool HandleConfigureHlodLayer(
         FullPath = TEXT("/Game/") + FullPath;
     }
 
-    // Create the package for the HLOD layer asset
+    // Reuse an existing asset.  This keeps configure_hlod_layer idempotent and
+    // makes create_hlod_layer a safe compatibility alias.
+    UHLODLayer* NewHLODLayer = LoadObject<UHLODLayer>(nullptr,
+        *(FullPath + TEXT(".") + HlodLayerName));
+
+    // Create the package for the HLOD layer asset only when it does not exist.
     UPackage* AssetPackage = CreatePackage(*FullPath);
     if (!AssetPackage)
     {
@@ -2080,19 +2086,25 @@ static bool HandleConfigureHlodLayer(
         return true;
     }
 
-    // Create the UHLODLayer asset
-    UHLODLayer* NewHLODLayer = NewObject<UHLODLayer>(AssetPackage, *HlodLayerName, RF_Public | RF_Standalone);
     if (!NewHLODLayer)
     {
-        Subsystem->SendAutomationResponse(Socket, RequestId, false,
-            TEXT("Failed to create UHLODLayer object"), nullptr, TEXT("ASSET_CREATION_FAILED"));
-        return true;
+        NewHLODLayer = NewObject<UHLODLayer>(AssetPackage, *HlodLayerName, RF_Public | RF_Standalone);
+        if (!NewHLODLayer)
+        {
+            Subsystem->SendAutomationResponse(Socket, RequestId, false,
+                TEXT("Failed to create UHLODLayer object"), nullptr, TEXT("ASSET_CREATION_FAILED"));
+            return true;
+        }
+
+        FAssetRegistryModule::AssetCreated(NewHLODLayer);
     }
 
     // Configure the HLOD layer
-    // UE 5.1-5.6: SetIsSpatiallyLoaded is available
-    // UE 5.7+: Deprecated - streaming grid properties are in partition settings
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1 && ENGINE_MINOR_VERSION < 7
+    // The setters remain available in UE 5.8 (with deprecation warnings). They
+    // preserve the asset contract for 5.0-5.8; 5.7+ derives runtime grids from
+    // partition settings, so the returned values are descriptive rather than a
+    // promise that a grid will be created by the layer itself.
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
     NewHLODLayer->SetIsSpatiallyLoaded(bIsSpatiallyLoaded);
 
     // Set layer type
@@ -2112,11 +2124,24 @@ static bool HandleConfigureHlodLayer(
     {
         NewHLODLayer->SetLayerType(EHLODLayerType::MeshMerge);
     }
+
+    // CellSize and LoadingRange have no public setters.  Set the editor-only
+    // properties through UE reflection so UE 5.8 assets receive the requested
+    // serialized values without accessing UHLODLayer private fields.
+    if (FIntProperty* CellSizeProperty = FindFProperty<FIntProperty>(UHLODLayer::StaticClass(), TEXT("CellSize")))
+    {
+        CellSizeProperty->SetPropertyValue_InContainer(NewHLODLayer, CellSize);
+    }
+    if (FDoubleProperty* LoadingRangeProperty = FindFProperty<FDoubleProperty>(UHLODLayer::StaticClass(), TEXT("LoadingRange")))
+    {
+        LoadingRangeProperty->SetPropertyValue_InContainer(NewHLODLayer, LoadingDistance);
+    }
+    NewHLODLayer->Modify();
+    NewHLODLayer->PostEditChange();
 #endif
 
     // Mark package dirty and notify asset registry
     AssetPackage->MarkPackageDirty();
-    FAssetRegistryModule::AssetCreated(NewHLODLayer);
 
     // Save the asset
     McpSafeAssetSave(NewHLODLayer);
@@ -2132,6 +2157,410 @@ static bool HandleConfigureHlodLayer(
     FString Message = FString::Printf(TEXT("Created HLOD layer '%s' at '%s'"),
         *HlodLayerName, *FullPath);
     Subsystem->SendAutomationResponse(Socket, RequestId, true, Message, ResponseJson);
+    return true;
+}
+
+// ============================================================================
+// World Partition HLOD automation (UE 5.8)
+//
+// HLOD builds are deliberately executed in a separate UnrealEditor-Cmd
+// commandlet.  Running UWorldPartitionHLODsBuilder synchronously in this
+// editor would block the game thread and can show modal unsaved-actor prompts.
+// The commandlet is launched only after the active map and relevant actors are
+// saved; it never closes or terminates the interactive editor.
+// ============================================================================
+
+struct FMcpHlodBuildProcess
+{
+    FProcHandle Process;
+    FString MapPath;
+    FString LogPath;
+    FString Mode;
+    bool bCancellationRequested = false;
+};
+
+static FMcpHlodBuildProcess GMcpHlodBuildProcess;
+
+static bool RequireWorldPartitionForHlod(
+    UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    TSharedPtr<FMcpBridgeWebSocket> Socket, UWorld*& OutWorld)
+{
+    OutWorld = LevelStructureHelpers::GetEditorWorld();
+    if (!OutWorld)
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("No editor world is available for HLOD automation."), nullptr, TEXT("NO_EDITOR_WORLD"));
+        return false;
+    }
+    if (!OutWorld->GetWorldPartition())
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("HLOD automation requires the current level to use World Partition."), nullptr,
+            TEXT("WORLD_PARTITION_NOT_ENABLED"));
+        return false;
+    }
+    return true;
+}
+
+static AActor* FindHlodCompatibleActor(UWorld* World, const FString& Name)
+{
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (Actor && (Actor->GetName() == Name || Actor->GetActorLabel() == Name))
+        {
+            return Actor;
+        }
+    }
+    return nullptr;
+}
+
+static UHLODLayer* ResolveHlodLayer(const FString& Name, const FString& Path)
+{
+    FString AssetPath = Path;
+    if (!AssetPath.IsEmpty())
+    {
+        AssetPath = SanitizeProjectRelativePath(AssetPath);
+        if (!AssetPath.IsEmpty())
+        {
+            if (!AssetPath.EndsWith(TEXT("/") + Name))
+            {
+                AssetPath /= Name;
+            }
+            return LoadObject<UHLODLayer>(nullptr, *(AssetPath + TEXT(".") + Name));
+        }
+    }
+
+    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    TArray<FAssetData> Assets;
+    AssetRegistryModule.Get().GetAssetsByClass(UHLODLayer::StaticClass()->GetClassPathName(), Assets);
+    for (const FAssetData& Asset : Assets)
+    {
+        if (Asset.AssetName.ToString() == Name)
+        {
+            return Cast<UHLODLayer>(Asset.GetAsset());
+        }
+    }
+    return nullptr;
+}
+
+static bool IsSafeCommandletName(const FString& Name)
+{
+    if (Name.IsEmpty()) return false;
+    for (const TCHAR Character : Name)
+    {
+        if (!(FChar::IsAlnum(Character) || Character == TEXT('_')))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void AddHlodBuildLogFields(TSharedPtr<FJsonObject> Result)
+{
+    FString Log;
+    if (!GMcpHlodBuildProcess.LogPath.IsEmpty())
+    {
+        FFileHelper::LoadFileToString(Log, *GMcpHlodBuildProcess.LogPath);
+    }
+    const int32 TailStart = FMath::Max(0, Log.Len() - 16384);
+    Result->SetStringField(TEXT("logTail"), Log.Mid(TailStart));
+    Result->SetStringField(TEXT("logPath"), GMcpHlodBuildProcess.LogPath);
+
+    int32 Warnings = 0;
+    int32 Errors = 0;
+    TArray<FString> Lines;
+    Log.ParseIntoArrayLines(Lines, false);
+    for (const FString& Line : Lines)
+    {
+        if (Line.Contains(TEXT("warning"), ESearchCase::IgnoreCase)) ++Warnings;
+        if (Line.Contains(TEXT("error"), ESearchCase::IgnoreCase)) ++Errors;
+    }
+    Result->SetNumberField(TEXT("warningCount"), Warnings);
+    Result->SetNumberField(TEXT("errorCount"), Errors);
+}
+
+static bool HandleListHlodLayers(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    TArray<FAssetData> Assets;
+    AssetRegistryModule.Get().GetAssetsByClass(UHLODLayer::StaticClass()->GetClassPathName(), Assets);
+    TArray<TSharedPtr<FJsonValue>> Layers;
+    for (const FAssetData& Asset : Assets)
+    {
+        TSharedPtr<FJsonObject> Layer = McpHandlerUtils::CreateResultObject();
+        Layer->SetStringField(TEXT("name"), Asset.AssetName.ToString());
+        Layer->SetStringField(TEXT("path"), Asset.GetSoftObjectPath().ToString());
+        if (const UHLODLayer* Loaded = Cast<UHLODLayer>(Asset.GetAsset()))
+        {
+            Layer->SetStringField(TEXT("layerType"), StaticEnum<EHLODLayerType>()->GetNameStringByValue((int64)Loaded->GetLayerType()));
+            Layer->SetNumberField(TEXT("cellSize"), Loaded->GetCellSize());
+            Layer->SetNumberField(TEXT("loadingDistance"), Loaded->GetLoadingRange());
+        }
+        Layers.Add(MakeShared<FJsonValueObject>(Layer));
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetArrayField(TEXT("hlodLayers"), Layers);
+    Result->SetNumberField(TEXT("count"), Layers.Num());
+    Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("Listed HLOD Layer assets."), Result);
+    return true;
+}
+
+static bool HandleInspectHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    const FString Name = GetJsonStringField(Payload, TEXT("hlodLayerName"), TEXT(""));
+    UHLODLayer* Layer = ResolveHlodLayer(Name, GetJsonStringField(Payload, TEXT("hlodLayerPath"), TEXT("")));
+    if (!Layer)
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("HLOD Layer asset was not found."), nullptr, TEXT("HLOD_LAYER_NOT_FOUND"));
+        return true;
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("name"), Layer->GetName());
+    Result->SetStringField(TEXT("path"), Layer->GetPathName());
+    Result->SetStringField(TEXT("layerType"), StaticEnum<EHLODLayerType>()->GetNameStringByValue((int64)Layer->GetLayerType()));
+    Result->SetBoolField(TEXT("isSpatiallyLoaded"), Layer->IsSpatiallyLoaded());
+    Result->SetNumberField(TEXT("cellSize"), Layer->GetCellSize());
+    Result->SetNumberField(TEXT("loadingDistance"), Layer->GetLoadingRange());
+    Result->SetStringField(TEXT("parentLayer"), Layer->GetParentLayer() ? Layer->GetParentLayer()->GetPathName() : TEXT(""));
+    Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("Inspected HLOD Layer."), Result);
+    return true;
+}
+
+static bool HandleAssignHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket, bool bRemove)
+{
+    UWorld* World = nullptr;
+    if (!RequireWorldPartitionForHlod(Subsystem, RequestId, Socket, World)) return true;
+    const FString ActorName = GetJsonStringField(Payload, TEXT("actorName"), TEXT(""));
+    AActor* Actor = FindHlodCompatibleActor(World, ActorName);
+    if (!Actor)
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Actor was not found."), nullptr, TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+    if (Actor->IsA<AWorldPartitionHLOD>() || !Actor->IsHLODRelevant())
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Actor is not compatible with World Partition HLOD assignment."), nullptr, TEXT("ACTOR_NOT_HLOD_COMPATIBLE"));
+        return true;
+    }
+    UHLODLayer* Layer = nullptr;
+    if (!bRemove)
+    {
+        Layer = ResolveHlodLayer(GetJsonStringField(Payload, TEXT("hlodLayerName"), TEXT("")),
+            GetJsonStringField(Payload, TEXT("hlodLayerPath"), TEXT("")));
+        if (!Layer)
+        {
+            Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("HLOD Layer asset was not found."), nullptr, TEXT("HLOD_LAYER_NOT_FOUND"));
+            return true;
+        }
+    }
+    Actor->Modify();
+    Actor->SetHLODLayer(Layer);
+    Actor->MarkPackageDirty();
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    McpHandlerUtils::AddVerification(Result, Actor);
+    Result->SetStringField(TEXT("actorName"), Actor->GetActorLabel());
+    Result->SetStringField(TEXT("hlodLayerPath"), Layer ? Layer->GetPathName() : TEXT(""));
+    Result->SetBoolField(TEXT("assigned"), !bRemove);
+    Subsystem->SendAutomationResponse(Socket, RequestId, true, bRemove ? TEXT("Removed actor HLOD Layer assignment.") : TEXT("Assigned actor to HLOD Layer."), Result);
+    return true;
+}
+
+static bool HandleReportMissingHlodAssignments(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    UWorld* World = nullptr;
+    if (!RequireWorldPartitionForHlod(Subsystem, RequestId, Socket, World)) return true;
+    TArray<TSharedPtr<FJsonValue>> Missing;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (Actor && !Actor->IsA<AWorldPartitionHLOD>() && Actor->IsHLODRelevant() && !Actor->GetHLODLayer())
+        {
+            TSharedPtr<FJsonObject> Entry = McpHandlerUtils::CreateResultObject();
+            Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
+            Entry->SetStringField(TEXT("class"), Actor->GetClass()->GetPathName());
+            Missing.Add(MakeShared<FJsonValueObject>(Entry));
+        }
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetArrayField(TEXT("missingHlodActors"), Missing);
+    Result->SetNumberField(TEXT("count"), Missing.Num());
+    Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("Reported HLOD-compatible actors missing an HLOD Layer."), Result);
+    return true;
+}
+
+static bool HandleInspectGeneratedHlods(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    TSharedPtr<FMcpBridgeWebSocket> Socket, bool bValidate)
+{
+    UWorld* World = nullptr;
+    if (!RequireWorldPartitionForHlod(Subsystem, RequestId, Socket, World)) return true;
+    TArray<TSharedPtr<FJsonValue>> Actors;
+    int32 InvalidCount = 0;
+    for (TActorIterator<AWorldPartitionHLOD> It(World); It; ++It)
+    {
+        AWorldPartitionHLOD* Actor = *It;
+        const int64 SourceActors = Actor->GetStat(FWorldPartitionHLODStats::InputActorCount);
+        const int64 InputTriangles = Actor->GetStat(FWorldPartitionHLODStats::InputTriangleCount);
+        const int64 OutputTriangles = Actor->GetStat(FWorldPartitionHLODStats::MeshTriangleCount);
+        const bool bValid = Actor->GetSourceActors() != nullptr && SourceActors > 0;
+        InvalidCount += bValid ? 0 : 1;
+        TSharedPtr<FJsonObject> Entry = McpHandlerUtils::CreateResultObject();
+        Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
+        Entry->SetNumberField(TEXT("lodLevel"), Actor->GetLODLevel());
+        Entry->SetNumberField(TEXT("sourceActorCount"), SourceActors);
+        Entry->SetNumberField(TEXT("inputTriangleCount"), InputTriangles);
+        Entry->SetNumberField(TEXT("outputTriangleCount"), OutputTriangles);
+        Entry->SetNumberField(TEXT("triangleReductionPercent"), InputTriangles > 0 ? (100.0 * (1.0 - (double)OutputTriangles / (double)InputTriangles)) : 0.0);
+        Entry->SetBoolField(TEXT("valid"), bValid);
+        Actors.Add(MakeShared<FJsonValueObject>(Entry));
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("mapPath"), World->GetOutermost()->GetName());
+    Result->SetArrayField(TEXT("generatedHlodActors"), Actors);
+    Result->SetNumberField(TEXT("generatedActorCount"), Actors.Num());
+    Result->SetNumberField(TEXT("invalidActorCount"), InvalidCount);
+    const bool bSuccess = !bValidate || (Actors.Num() > 0 && InvalidCount == 0);
+    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess,
+        bValidate ? (bSuccess ? TEXT("HLOD validation passed after reload.") : TEXT("HLOD validation failed: generated actors are missing or have no source actors.")) : TEXT("Inspected generated HLOD actors."),
+        Result, bSuccess ? TEXT("") : TEXT("HLOD_VALIDATION_FAILED"));
+    return true;
+}
+
+static bool StartHlodCommandlet(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket, bool bDelete, bool bRebuild = false)
+{
+    UWorld* World = nullptr;
+    if (!RequireWorldPartitionForHlod(Subsystem, RequestId, Socket, World)) return true;
+    if (GMcpHlodBuildProcess.Process.IsValid() && FPlatformProcess::IsProcRunning(GMcpHlodBuildProcess.Process))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("An HLOD commandlet is already running."), nullptr, TEXT("HLOD_BUILD_IN_PROGRESS"));
+        return true;
+    }
+    if (bDelete && !GetJsonBoolField(Payload, TEXT("confirm"), false))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("delete_hlod_output requires confirm=true."), nullptr, TEXT("CONFIRMATION_REQUIRED"));
+        return true;
+    }
+    if (World->GetOutermost()->HasAnyPackageFlags(PKG_NewlyCreated) || World->GetOutermost()->IsDirty())
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Save the current World Partition map explicitly before building HLODs."), nullptr, TEXT("MAP_NOT_SAVED"));
+        return true;
+    }
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (Actor && !Actor->IsA<AWorldPartitionHLOD>() && Actor->IsHLODRelevant() && Actor->GetPackage()->IsDirty())
+        {
+            Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Save dirty HLOD source actors before building; MCP will not open an editor confirmation dialog."), nullptr, TEXT("UNSAVED_HLOD_SOURCE_ACTORS"));
+            return true;
+        }
+    }
+    const FString ProjectPath = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+    if (ProjectPath.IsEmpty() || !FPaths::FileExists(ProjectPath))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("A valid absolute .uproject path is required to launch the HLOD commandlet."), nullptr, TEXT("PROJECT_FILE_NOT_FOUND"));
+        return true;
+    }
+#if PLATFORM_WINDOWS
+    const FString EditorCmdPath = FPaths::ConvertRelativePathToFull(FPaths::EngineDir() / TEXT("Binaries/Win64/UnrealEditor-Cmd.exe"));
+#elif PLATFORM_MAC
+    const FString EditorCmdPath = FPaths::ConvertRelativePathToFull(FPaths::EngineDir() / TEXT("Binaries/Mac/UnrealEditor-Cmd"));
+#else
+    const FString EditorCmdPath = FPaths::ConvertRelativePathToFull(FPaths::EngineDir() / TEXT("Binaries/Linux/UnrealEditor-Cmd"));
+#endif
+    if (!FPaths::FileExists(EditorCmdPath))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("UnrealEditor-Cmd was not found at the engine's absolute commandlet path."), nullptr, TEXT("COMMANDLET_NOT_FOUND"));
+        return true;
+    }
+    FString BuilderArgs = bDelete ? TEXT("-DeleteHLODs") : TEXT("-SetupHLODs -BuildHLODs");
+    if (!bDelete && bRebuild) BuilderArgs = TEXT("-RebuildHLODs");
+    const FString LayerName = GetJsonStringField(Payload, TEXT("hlodLayerName"), TEXT(""));
+    if (!LayerName.IsEmpty())
+    {
+        UHLODLayer* Layer = ResolveHlodLayer(LayerName, GetJsonStringField(Payload, TEXT("hlodLayerPath"), TEXT("")));
+        if (!Layer || !IsSafeCommandletName(Layer->GetName()))
+        {
+            Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("The requested HLOD Layer is unavailable or has an unsafe commandlet name."), nullptr, TEXT("HLOD_LAYER_NOT_FOUND"));
+            return true;
+        }
+        BuilderArgs += FString::Printf(TEXT(" -BuildHLODLayer=%s"), *Layer->GetName());
+    }
+    if (Payload->HasField(TEXT("cellIds")) || Payload->HasField(TEXT("dataLayerNames")))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("UE 5.8 WorldPartitionHLODsBuilder supports whole-map and HLOD-Layer rebuilds, not cell or Data Layer scopes via commandlet."), nullptr, TEXT("HLOD_SCOPE_NOT_SUPPORTED"));
+        return true;
+    }
+    const FString SafeMapBase = FPaths::GetCleanFilename(World->GetOutermost()->GetName()).Replace(TEXT("/"), TEXT("_"));
+    const FString HlodLogPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectLogDir() / FString::Printf(TEXT("McpHLOD_%s.log"), *SafeMapBase));
+    const FString Arguments = FString::Printf(TEXT("\"%s\" \"%s\" -run=WorldPartitionBuilderCommandlet -Builder=WorldPartitionHLODsBuilder %s -AllowCommandletRendering -Unattended -NoSplash -NoSound -SCCProvider=None -RunningFromUnrealEd -abslog=\"%s\""),
+        *ProjectPath, *World->GetOutermost()->GetName(), *BuilderArgs, *HlodLogPath);
+    GMcpHlodBuildProcess = FMcpHlodBuildProcess();
+    GMcpHlodBuildProcess.Process = FPlatformProcess::CreateProc(*EditorCmdPath, *Arguments, false, true, true, nullptr, 0, *FPaths::ProjectDir(), nullptr);
+    if (!GMcpHlodBuildProcess.Process.IsValid())
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false, TEXT("Failed to launch the isolated HLOD commandlet."), nullptr, TEXT("COMMANDLET_LAUNCH_FAILED"));
+        return true;
+    }
+    GMcpHlodBuildProcess.MapPath = World->GetOutermost()->GetName();
+    GMcpHlodBuildProcess.LogPath = HlodLogPath;
+    GMcpHlodBuildProcess.Mode = bDelete ? TEXT("delete") : TEXT("build");
+    Subsystem->SendProgressUpdate(RequestId, 0.0f, TEXT("HLOD commandlet launched; poll get_hlod_build_status for streamed log progress."), true);
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("started"), true);
+    Result->SetStringField(TEXT("mapPath"), GMcpHlodBuildProcess.MapPath);
+    Result->SetStringField(TEXT("commandletPath"), EditorCmdPath);
+    Result->SetStringField(TEXT("arguments"), Arguments);
+    Result->SetStringField(TEXT("logPath"), HlodLogPath);
+    Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("HLOD commandlet started without blocking the active editor."), Result);
+    return true;
+}
+
+static bool HandleHlodBuildStatus(UMcpAutomationBridgeSubsystem* Subsystem, const FString& RequestId,
+    TSharedPtr<FMcpBridgeWebSocket> Socket, bool bCancel)
+{
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    if (!GMcpHlodBuildProcess.Process.IsValid())
+    {
+        Result->SetBoolField(TEXT("running"), false);
+        Result->SetStringField(TEXT("status"), TEXT("idle"));
+        Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("No HLOD commandlet is active."), Result);
+        return true;
+    }
+    if (bCancel && FPlatformProcess::IsProcRunning(GMcpHlodBuildProcess.Process))
+    {
+        GMcpHlodBuildProcess.bCancellationRequested = true;
+        FPlatformProcess::TerminateProc(GMcpHlodBuildProcess.Process, false);
+    }
+    const bool bRunning = FPlatformProcess::IsProcRunning(GMcpHlodBuildProcess.Process);
+    Result->SetBoolField(TEXT("running"), bRunning);
+    Result->SetBoolField(TEXT("cancelRequested"), GMcpHlodBuildProcess.bCancellationRequested);
+    Result->SetStringField(TEXT("mapPath"), GMcpHlodBuildProcess.MapPath);
+    Result->SetStringField(TEXT("mode"), GMcpHlodBuildProcess.Mode);
+    AddHlodBuildLogFields(Result);
+    if (bRunning)
+    {
+        Result->SetStringField(TEXT("status"), TEXT("running"));
+        Subsystem->SendProgressUpdate(RequestId, 50.0f, TEXT("HLOD commandlet is running; log tail, warnings, and errors are included in this response."), true);
+        Subsystem->SendAutomationResponse(Socket, RequestId, true, bCancel ? TEXT("HLOD commandlet cancellation requested.") : TEXT("HLOD commandlet is running."), Result);
+        return true;
+    }
+    int32 ExitCode = -1;
+    FPlatformProcess::GetProcReturnCode(GMcpHlodBuildProcess.Process, &ExitCode);
+    FPlatformProcess::CloseProc(GMcpHlodBuildProcess.Process);
+    GMcpHlodBuildProcess.Process = FProcHandle();
+    Result->SetNumberField(TEXT("exitCode"), ExitCode);
+    Result->SetStringField(TEXT("status"), ExitCode == 0 ? TEXT("completed") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("cancelled") : TEXT("failed")));
+    Result->SetBoolField(TEXT("reloadRequired"), ExitCode == 0);
+    const bool bSuccess = ExitCode == 0;
+    Subsystem->SendProgressUpdate(RequestId, 100.0f, bSuccess ? TEXT("HLOD commandlet completed; reload the map before validation.") : TEXT("HLOD commandlet ended with an error; inspect the log tail."), false);
+    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess, bSuccess ? TEXT("HLOD commandlet completed. Reload the map, then call validate_hlods.") : FString::Printf(TEXT("HLOD commandlet exited with code %d."), ExitCode), Result,
+        bSuccess ? TEXT("") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("HLOD_BUILD_CANCELLED") : TEXT("HLOD_BUILD_FAILED")));
     return true;
 }
 
@@ -3020,6 +3449,58 @@ bool UMcpAutomationBridgeSubsystem::HandleManageLevelStructureAction(
     else if (SubAction == TEXT("configure_hlod_layer"))
     {
         bHandled = HandleConfigureHlodLayer(this, RequestId, Payload, Socket);
+    }
+    else if (SubAction == TEXT("create_hlod_layer"))
+    {
+        bHandled = HandleConfigureHlodLayer(this, RequestId, Payload, Socket);
+    }
+    else if (SubAction == TEXT("list_hlod_layers"))
+    {
+        bHandled = HandleListHlodLayers(this, RequestId, Socket);
+    }
+    else if (SubAction == TEXT("inspect_hlod_layer"))
+    {
+        bHandled = HandleInspectHlodLayer(this, RequestId, Payload, Socket);
+    }
+    else if (SubAction == TEXT("assign_hlod_layer"))
+    {
+        bHandled = HandleAssignHlodLayer(this, RequestId, Payload, Socket, false);
+    }
+    else if (SubAction == TEXT("remove_hlod_layer"))
+    {
+        bHandled = HandleAssignHlodLayer(this, RequestId, Payload, Socket, true);
+    }
+    else if (SubAction == TEXT("report_missing_hlod_assignments"))
+    {
+        bHandled = HandleReportMissingHlodAssignments(this, RequestId, Socket);
+    }
+    else if (SubAction == TEXT("build_hlods"))
+    {
+        bHandled = StartHlodCommandlet(this, RequestId, Payload, Socket, false);
+    }
+    else if (SubAction == TEXT("rebuild_hlods"))
+    {
+        bHandled = StartHlodCommandlet(this, RequestId, Payload, Socket, false, true);
+    }
+    else if (SubAction == TEXT("delete_hlod_output"))
+    {
+        bHandled = StartHlodCommandlet(this, RequestId, Payload, Socket, true);
+    }
+    else if (SubAction == TEXT("get_hlod_build_status"))
+    {
+        bHandled = HandleHlodBuildStatus(this, RequestId, Socket, false);
+    }
+    else if (SubAction == TEXT("cancel_hlod_build"))
+    {
+        bHandled = HandleHlodBuildStatus(this, RequestId, Socket, true);
+    }
+    else if (SubAction == TEXT("inspect_generated_hlods"))
+    {
+        bHandled = HandleInspectGeneratedHlods(this, RequestId, Socket, false);
+    }
+    else if (SubAction == TEXT("validate_hlods"))
+    {
+        bHandled = HandleInspectGeneratedHlods(this, RequestId, Socket, true);
     }
     else if (SubAction == TEXT("create_minimap_volume"))
     {

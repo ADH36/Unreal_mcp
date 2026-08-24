@@ -75,4 +75,16 @@ describe('handleLevelStructureTools path normalization', () => {
       levelName: 'Sublevel_A'
     }), expect.objectContaining({ timeoutMs: expect.any(Number) }));
   });
+
+  it('routes HLOD build lifecycle actions through manage_level_structure', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+
+    await handleLevelStructureTools('delete_hlod_output', {
+      action: 'delete_hlod_output', confirm: true
+    }, tools);
+
+    expect(sendAutomationRequest).toHaveBeenCalledWith('manage_level_structure', expect.objectContaining({
+      subAction: 'delete_hlod_output', confirm: true
+    }), expect.objectContaining({ timeoutMs: expect.any(Number) }));
+  });
 });

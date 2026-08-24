@@ -14,7 +14,7 @@ public:
 	FString GetDescription() const override
 	{
 		return TEXT("Create levels and sublevels. Configure World Partition, streaming, "
-			"data layers, HLOD, level instances, and world volumes.");
+			"data layers, safe UE 5.8 HLOD automation, level instances, and world volumes.");
 	}
 
 	FString GetCategory() const override { return TEXT("world"); }
@@ -93,6 +93,10 @@ public:
 			.String(TEXT("actorPath"), TEXT("Path to actor."))
 			.String(TEXT("hlodLayerName"), TEXT("Name of the HLOD layer."))
 			.String(TEXT("hlodLayerPath"), TEXT("Path to HLOD layer."))
+			.String(TEXT("generatedHlodActor"), TEXT("Generated HLOD actor label for a focused rebuild."))
+			.Bool(TEXT("confirm"), TEXT("Required true before deleting generated HLOD output."))
+			.Array(TEXT("dataLayerNames"), TEXT("Requested Data Layer scope; UE 5.8 commandlets do not support this scope."), TEXT("string"))
+			.Array(TEXT("cellIds"), TEXT("Requested cell scope; UE 5.8 commandlets do not support this scope."), TEXT("string"))
 			.String(TEXT("layerType"), TEXT("HLOD layer type."))
 			.Bool(TEXT("bIsSpatiallyLoaded"),
 				TEXT("HLOD is spatially loaded."))

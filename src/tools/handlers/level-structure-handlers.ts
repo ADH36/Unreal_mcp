@@ -108,7 +108,7 @@ export async function handleLevelStructureTools(
       return sendRequest('configure_level_bounds');
 
     // ========================================================================
-    // World Partition (6 actions)
+    // World Partition and HLOD
     // ========================================================================
     case 'enable_world_partition':
       return sendRequest('enable_world_partition');
@@ -124,6 +124,21 @@ export async function handleLevelStructureTools(
 
     case 'configure_hlod_layer':
       return sendRequest('configure_hlod_layer');
+
+    case 'create_hlod_layer':
+    case 'list_hlod_layers':
+    case 'inspect_hlod_layer':
+    case 'assign_hlod_layer':
+    case 'remove_hlod_layer':
+    case 'report_missing_hlod_assignments':
+    case 'build_hlods':
+    case 'rebuild_hlods':
+    case 'delete_hlod_output':
+    case 'get_hlod_build_status':
+    case 'cancel_hlod_build':
+    case 'inspect_generated_hlods':
+    case 'validate_hlods':
+      return sendRequest(action);
 
     case 'create_minimap_volume':
       return sendRequest('create_minimap_volume');
