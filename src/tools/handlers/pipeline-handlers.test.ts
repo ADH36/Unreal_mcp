@@ -73,17 +73,19 @@ describe('handlePipelineTools run_ubt validation', () => {
       await fs.mkdir(path.dirname(ubtPath), { recursive: true });
       await fs.mkdir(dotnetRoot, { recursive: true });
       await fs.mkdir(path.dirname(projectPath), { recursive: true });
-      await fs.writeFile(ubtPath, 'fake ubt dll');
-      await fs.writeFile(projectPath, '{"FileVersion":3}');
-      await fs.writeFile(dotnetPath, [
-        '#!/usr/bin/env node',
+      // A text file named dotnet.exe is not a runnable Windows executable.
+      // Use Node itself as the launcher and make the fake DLL the JS entry
+      // point so this test exercises the real spawn path on every platform.
+      await fs.writeFile(ubtPath, [
         "const fs = require('node:fs');",
         'fs.writeFileSync(process.env.DOTNET_CAPTURE_PATH, JSON.stringify({',
-        '  argv: process.argv.slice(2),',
+        '  argv: process.argv.slice(1),',
         '  dotnetRoot: process.env.DOTNET_ROOT,',
         '  path: process.env.PATH',
         '}));'
       ].join('\n'));
+      await fs.writeFile(projectPath, '{"FileVersion":3}');
+      await fs.copyFile(process.execPath, dotnetPath);
       await fs.chmod(dotnetPath, 0o755);
 
       process.env.UE_ENGINE_PATH = enginePath;

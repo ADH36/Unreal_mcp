@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { expectedCondition } from './expectation-utils.mjs';
+import { stripShebang } from './parameter-combination-audit-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
@@ -149,6 +150,41 @@ function testSuiteFiles() {
   return files.sort();
 }
 
+function extractExecuteToolCases(filePath, source) {
+  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const cases = [];
+
+  function visit(node) {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'executeTool' && node.arguments.length >= 2) {
+      const [toolNode, argumentsNode] = node.arguments;
+      const actionNode = ts.isObjectLiteralExpression(argumentsNode) ? getProperty(argumentsNode, 'action') : undefined;
+      if (ts.isStringLiteral(toolNode) && ts.isStringLiteral(actionNode) && ts.isObjectLiteralExpression(argumentsNode)) {
+        cases.push({
+          toolName: toolNode.text,
+          arguments: {
+            action: actionNode.text,
+            ...Object.fromEntries(
+              argumentsNode.properties
+                .map((property) => (
+                  ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)
+                    ? propertyName(property)
+                    : undefined
+                ))
+                .filter((name) => typeof name === 'string' && name !== 'action')
+                .map((name) => [name, true])
+            )
+          }
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return cases;
+}
+
 function auditRequire(specifier) {
   if (specifier === 'node:fs') {
     return {
@@ -165,26 +201,46 @@ function auditRequire(specifier) {
 
 async function captureTestSuites() {
   const suites = [];
+  const auditProcess = {
+    env: {
+      ...process.env,
+      MCP_PCG_TREE_MESHES: '/Engine/BasicShapes/Cube|/Engine/BasicShapes/Sphere|/Engine/BasicShapes/Cylinder'
+    }
+  };
   for (const filePath of testSuiteFiles()) {
-    let code = fs.readFileSync(filePath, 'utf8').replace(/^#!.*\n/, '');
+    const source = stripShebang(fs.readFileSync(filePath, 'utf8'));
+    let code = source;
     code = code.replace(
       /import \{ runToolTests \} from ['"](?:\.\.\/\.\.\/test-runner|\.\/test-runner)\.mjs['"];?/g,
       'const runToolTests = (name, cases) => { __captured.push({ name, cases }); };'
     );
     code = code.replace(/import fs from ['"]node:fs['"];?/g, "const fs = require('node:fs');");
     code = code.replace(/import path from ['"]node:path['"];?/g, "const path = require('node:path');");
+    code = code.replace(
+      /import \{ TestRunner \} from ['"]\.\.\/\.\.\/test-runner\.mjs['"];?/g,
+      'class TestRunner { addStep() {} async run() {} }'
+    );
 
     const captured = [];
     await AsyncFunction('require', '__captured', 'process', 'console', 'Date', code)(
       auditRequire,
       captured,
-      process,
+      auditProcess,
       { log() {}, warn() {}, error() {} },
       Date
     );
 
     for (const suite of captured) {
       suites.push({ filePath: path.relative(repoRoot, filePath), name: suite.name, cases: suite.cases ?? [] });
+    }
+
+    const executeToolCases = extractExecuteToolCases(filePath, source);
+    if (executeToolCases.length > 0) {
+      suites.push({
+        filePath: path.relative(repoRoot, filePath),
+        name: path.basename(filePath),
+        cases: executeToolCases
+      });
     }
   }
   return suites;
