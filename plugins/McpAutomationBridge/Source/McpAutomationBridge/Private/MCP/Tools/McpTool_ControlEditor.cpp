@@ -12,8 +12,8 @@ public:
 
 	FString GetDescription() const override
 	{
-		return TEXT("Start/stop PIE, control viewport camera, run console commands, "
-			"take screenshots, simulate input.");
+		return TEXT("Start/stop PIE, control viewport camera, and run bounded automated "
+			"play-tests with PIE-world validation, screenshots, runtime probes, and cleanup.");
 	}
 
 	FString GetCategory() const override { return TEXT("core"); }
@@ -23,6 +23,7 @@ public:
 		return FMcpSchemaBuilder()
 			.StringEnum(TEXT("action"), {
 				TEXT("play"),
+				TEXT("start_pie"),
 				TEXT("stop"),
 				TEXT("stop_pie"),
 				TEXT("pause"),
@@ -54,6 +55,20 @@ public:
 				TEXT("open_asset"),
 				TEXT("close_asset"),
 				TEXT("simulate_input"),
+				TEXT("get_pie_state"),
+				TEXT("query_pie_actor"),
+				TEXT("get_pie_metrics"),
+				TEXT("detect_pie_issues"),
+				TEXT("send_input"),
+				TEXT("send_enhanced_input"),
+				TEXT("move"),
+				TEXT("look"),
+				TEXT("jump"),
+				TEXT("sprint"),
+				TEXT("interact"),
+				TEXT("capture_pie_screenshot"),
+				TEXT("read_pie_logs"),
+				TEXT("run_playtest_sequence"),
 				TEXT("open_level"),
 				TEXT("focus_actor"),
 				TEXT("show_stats"),
@@ -110,6 +125,21 @@ public:
 			.Number(TEXT("x"), TEXT("Mouse X coordinate for simulate_input."))
 			.Number(TEXT("y"), TEXT("Mouse Y coordinate for simulate_input."))
 			.String(TEXT("button"), TEXT("Mouse button for simulate_input."))
+			.StringEnum(TEXT("pieMode"), { TEXT("viewport"), TEXT("new_window"), TEXT("standalone") }, TEXT("PIE destination. Standalone cannot be runtime-probed in-process."))
+			.String(TEXT("playerStart"), TEXT("PIE PlayerStart name used when starting or possessing."))
+			.String(TEXT("pawnName"), TEXT("PIE pawn name used when starting or possessing."))
+			.String(TEXT("enhancedAction"), TEXT("Enhanced Input action label; key delivery still uses the PIE input stack."))
+			.Number(TEXT("durationMs"), TEXT("Bounded input hold duration in milliseconds."))
+			.Number(TEXT("timeoutMs"), TEXT("Client-side operation deadline in milliseconds."))
+			.Number(TEXT("axisX"), TEXT("Horizontal movement input."))
+			.Number(TEXT("axisY"), TEXT("Vertical movement input."))
+			.Number(TEXT("minMovementCm"), TEXT("Minimum expected displacement for blocked movement detection."))
+			.Bool(TEXT("expectedMovement"), TEXT("Whether blocked movement detection should expect displacement."))
+			.Object(TEXT("previousLocation"), TEXT("Previous PIE actor location for blocked movement detection."),
+				[](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
+			.ArrayOfObjects(TEXT("sequence"), TEXT("Ordered run_playtest_sequence steps with action and optional assertion."))
+			.Bool(TEXT("autoStop"), TEXT("Stop PIE in a finally block after run_playtest_sequence; default true."))
+			.Bool(TEXT("saveRuntimeChanges"), TEXT("Explicit save opt-in. Runtime changes are not saved by this feature."))
 			.Required({TEXT("action")})
 			.Build();
 	}

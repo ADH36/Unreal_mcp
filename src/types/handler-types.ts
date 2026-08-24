@@ -266,6 +266,20 @@ export interface EditorArgs extends HandlerArgs {
     category?: string;
     preferences?: Record<string, unknown>;
     timeoutMs?: number;
+    pieMode?: 'viewport' | 'new_window' | 'standalone';
+    playerStart?: string;
+    pawnName?: string;
+    enhancedAction?: string;
+    value?: number;
+    durationMs?: number;
+    axisX?: number;
+    axisY?: number;
+    minMovementCm?: number;
+    expectedMovement?: boolean;
+    previousLocation?: Vector3;
+    sequence?: Array<Record<string, unknown>>;
+    autoStop?: boolean;
+    saveRuntimeChanges?: boolean;
 }
 
 // ============================================================================

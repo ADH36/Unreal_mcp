@@ -63,6 +63,9 @@ describe('handleEditorTools', () => {
       expect(properties).toHaveProperty('button');
       expect(properties).toHaveProperty('mode');
       expect(properties).toHaveProperty('returnBase64');
+      expect(properties).toHaveProperty('pieMode');
+      expect(properties).toHaveProperty('sequence');
+      expect(properties).toHaveProperty('durationMs');
     }
   });
 
@@ -172,5 +175,41 @@ describe('handleEditorTools', () => {
     await expect(handleEditorTools('simulate_input', { action: 'simulate_input', key: 'K' }, tools))
       .rejects.toThrow('type|inputType|inputAction');
     expect(sendAutomationRequest).not.toHaveBeenCalled();
+  });
+
+  it('exposes PIE play-test actions in the public schemas', async () => {
+    const { consolidatedToolDefinitions } = await import('../consolidated-tool-definitions.js');
+    const editorTool = consolidatedToolDefinitions.find((tool) => tool.name === 'control_editor');
+    const actions = ((editorTool?.inputSchema as { properties?: { action?: { enum?: string[] } } })
+      .properties?.action?.enum) ?? [];
+
+    expect(actions).toEqual(expect.arrayContaining([
+      'start_pie', 'get_pie_state', 'query_pie_actor', 'get_pie_metrics',
+      'detect_pie_issues', 'send_enhanced_input', 'capture_pie_screenshot',
+      'read_pie_logs', 'run_playtest_sequence'
+    ]));
+  });
+
+  it('stops PIE after a failed play-test step', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+    sendAutomationRequest
+      .mockResolvedValueOnce({ success: true, isInPIE: true })
+      .mockResolvedValueOnce({ success: false, error: 'FORCED_TIMEOUT' })
+      .mockResolvedValueOnce({ success: true, alreadyStopped: false })
+      .mockResolvedValueOnce({ success: true, isInPIE: false });
+
+    const result = await handleEditorTools('run_playtest_sequence', {
+      action: 'run_playtest_sequence',
+      timeoutMs: 100,
+      sequence: [
+        { action: 'get_pie_state' },
+        { action: 'get_pie_metrics' }
+      ]
+    }, tools) as { success: boolean; report: { steps: Array<{ action: string; cleanup?: boolean }> } };
+
+    expect(result.success).toBe(false);
+    expect(result.report.steps.at(-1)).toMatchObject({ action: 'stop', cleanup: true });
+    expect(sendAutomationRequest).toHaveBeenCalledWith('control_editor', { action: 'stop' }, { timeoutMs: 100 });
+    expect(sendAutomationRequest).toHaveBeenLastCalledWith('control_editor', { action: 'get_pie_state' }, { timeoutMs: 100 });
   });
 });

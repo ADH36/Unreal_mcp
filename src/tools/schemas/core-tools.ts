@@ -267,14 +267,14 @@ export const coreToolDefinitions: ToolDefinition[] = [
   {
     name: 'control_editor',
     category: 'core',
-    description: 'Start/stop PIE, control viewport camera, run console commands, take screenshots, simulate input.',
+    description: 'Start/stop PIE, control viewport camera, and run bounded automated play-tests with PIE-world validation, screenshots, runtime probes, and guaranteed cleanup.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: [
-            'play', 'stop', 'stop_pie', 'pause', 'resume', 'eject', 'possess',
+            'play', 'start_pie', 'stop', 'stop_pie', 'pause', 'resume', 'eject', 'possess',
             'set_game_speed', 'set_fixed_delta_time',
             'set_camera', 'set_camera_position', 'set_viewport_camera', 'set_camera_fov',
             'set_view_mode', 'set_viewport_resolution',
@@ -284,6 +284,9 @@ export const coreToolDefinitions: ToolDefinition[] = [
             'create_bookmark', 'jump_to_bookmark',
             'set_preferences', 'set_viewport_realtime',
             'open_asset', 'close_asset', 'simulate_input',
+            'get_pie_state', 'query_pie_actor', 'get_pie_metrics', 'detect_pie_issues',
+            'send_input', 'send_enhanced_input', 'move', 'look', 'jump', 'sprint', 'interact',
+            'capture_pie_screenshot', 'read_pie_logs', 'run_playtest_sequence',
             'open_level', 'focus_actor',
             'show_stats', 'hide_stats',
             'set_editor_mode', 'set_immersive_mode', 'set_game_view',
@@ -328,7 +331,22 @@ export const coreToolDefinitions: ToolDefinition[] = [
         inputAction: commonSchemas.stringProp,
         x: commonSchemas.numberProp,
         y: commonSchemas.numberProp,
-        button: commonSchemas.stringProp
+        button: commonSchemas.stringProp,
+        pieMode: { type: 'string', enum: ['viewport', 'new_window', 'standalone'], description: 'PIE destination. Only viewport supports in-process input and runtime validation.' },
+        playerStart: commonSchemas.actorName,
+        pawnName: commonSchemas.actorName,
+        enhancedAction: commonSchemas.stringProp,
+        value: commonSchemas.numberProp,
+        durationMs: { type: 'number', minimum: 1, maximum: 120000, description: 'Bounded input hold or operation duration in milliseconds.' },
+        timeoutMs: { type: 'number', minimum: 1, maximum: 300000, description: 'Client-side deadline for this operation; sent nowhere else.' },
+        axisX: commonSchemas.numberProp,
+        axisY: commonSchemas.numberProp,
+        minMovementCm: commonSchemas.numberProp,
+        expectedMovement: commonSchemas.booleanProp,
+        previousLocation: commonSchemas.location,
+        sequence: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Ordered play-test steps.' },
+        autoStop: commonSchemas.booleanProp,
+        saveRuntimeChanges: commonSchemas.booleanProp
       },
       required: ['action']
     },
@@ -343,7 +361,17 @@ export const coreToolDefinitions: ToolDefinition[] = [
         sizeBytes: commonSchemas.numberProp,
         path: commonSchemas.stringProp,
         screenshotPath: commonSchemas.stringProp,
-        mode: commonSchemas.stringProp
+        mode: commonSchemas.stringProp,
+        report: commonSchemas.objectProp,
+        summary: commonSchemas.stringProp,
+        isInPIE: commonSchemas.booleanProp,
+        pieWorld: commonSchemas.stringProp,
+        editorWorld: commonSchemas.stringProp,
+        actorWorld: commonSchemas.stringProp,
+        fps: commonSchemas.numberProp,
+        frameTimeMs: commonSchemas.numberProp,
+        memoryBytes: commonSchemas.numberProp,
+        actorCount: commonSchemas.numberProp
       }
     }
   },

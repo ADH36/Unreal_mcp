@@ -1236,6 +1236,9 @@ private:
   bool HandleControlEditorSimulateInput(const FString &RequestId,
                                         const TSharedPtr<FJsonObject> &Payload,
                                         TSharedPtr<FMcpBridgeWebSocket> Socket);
+  bool HandleControlEditorRuntimeProbe(const FString &RequestId,
+                                       const TSharedPtr<FJsonObject> &Payload,
+                                       TSharedPtr<FMcpBridgeWebSocket> Socket);
   // Additional editor handlers for test compatibility
   bool HandleControlEditorCloseAsset(const FString &RequestId,
                                      const TSharedPtr<FJsonObject> &Payload,

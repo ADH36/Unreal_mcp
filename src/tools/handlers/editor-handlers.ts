@@ -9,6 +9,7 @@ import { sanitizeCommandArgument } from '../../utils/validation.js';
  * Maps test action names to handler action names
  */
 const EDITOR_ACTION_ALIASES: Record<string, string> = {
+  'start_pie': 'play',
   'focus_actor': 'focus',
   'set_game_view_target': 'set_view_target',
   'set_camera_position': 'set_camera',
@@ -61,6 +62,9 @@ const ACTION_REQUIRED_PARAMS: Record<string, string[]> = {
   'set_preferences': ['category', 'preferences'],
   'execute_command': ['command'],
   'console_command': ['command'],
+  'query_pie_actor': ['actorName'],
+  'send_input': ['key', 'type'],
+  'send_enhanced_input': ['key'],
 };
 
 /**
@@ -69,7 +73,7 @@ const ACTION_REQUIRED_PARAMS: Record<string, string[]> = {
  * NOTE: Includes both original and normalized action names for proper validation.
  */
 const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
-  'play': [],
+  'play': ['pieMode', 'playerStart', 'pawnName'],
   'stop': [],
   'stop_pie': [],
   'pause': [],
@@ -108,6 +112,20 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'stop_recording': [],
   'set_viewport_realtime': ['enabled', 'realtime'],
   'simulate_input': ['key', 'type', 'inputType', 'inputAction', 'x', 'y', 'button'],
+  'get_pie_state': [],
+  'query_pie_actor': ['actorName'],
+  'get_pie_metrics': [],
+  'detect_pie_issues': ['actorName', 'previousLocation', 'minMovementCm', 'expectedMovement'],
+  'send_input': ['key', 'type', 'x', 'y', 'button', 'durationMs'],
+  'send_enhanced_input': ['key', 'enhancedAction', 'type', 'durationMs', 'value'],
+  'move': ['key', 'axisX', 'axisY', 'durationMs'],
+  'look': ['x', 'y', 'durationMs'],
+  'jump': ['key', 'durationMs'],
+  'sprint': ['key', 'durationMs'],
+  'interact': ['key', 'durationMs'],
+  'capture_pie_screenshot': ['filename', 'resolution', 'returnBase64', 'includeMetadata', 'metadata'],
+  'read_pie_logs': [],
+  'run_playtest_sequence': ['sequence', 'autoStop', 'timeoutMs', 'pieMode', 'actorName'],
 };
 
 const INPUT_TYPE_ALIASES: Record<string, string> = {
@@ -201,6 +219,138 @@ function getScreenshotMode(args: EditorArgs): { mode?: string; error?: string } 
   return { mode };
 }
 
+const MAX_PLAYTEST_TIMEOUT_MS = 300_000;
+
+function getBoundedTimeoutMs(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 60_000;
+  return Math.max(1, Math.min(Math.floor(value), MAX_PLAYTEST_TIMEOUT_MS));
+}
+
+function getBoundedDurationMs(value: unknown, fallback: number = 100): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.floor(value), 120_000));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isSuccessful(response: unknown): boolean {
+  return typeof response === 'object' && response !== null &&
+    (response as Record<string, unknown>).success === true;
+}
+
+function getBooleanField(response: unknown, field: string): boolean | undefined {
+  if (!response || typeof response !== 'object') return undefined;
+  const record = response as Record<string, unknown>;
+  if (typeof record[field] === 'boolean') return record[field];
+  const result = record.result;
+  return result && typeof result === 'object' && typeof (result as Record<string, unknown>)[field] === 'boolean'
+    ? (result as Record<string, unknown>)[field] as boolean
+    : undefined;
+}
+
+async function stopPieAndVerify(tools: ITools, timeoutMs: number): Promise<Record<string, unknown>> {
+  const options = { timeoutMs };
+  const stopResult = cleanObject(await executeAutomationRequest(tools, 'control_editor', { action: 'stop' }, undefined, options) as Record<string, unknown>);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await executeAutomationRequest(tools, 'control_editor', { action: 'get_pie_state' }, undefined, options) as Record<string, unknown>;
+    if (getBooleanField(state, 'isInPIE') === false) return { ...stopResult, pieStopped: true };
+    await delay(50);
+  }
+  return { ...stopResult, success: false, pieStopped: false, error: 'PIE_STOP_TIMEOUT', message: 'PIE did not stop before the cleanup deadline.' };
+}
+
+async function sendHeldPieKey(tools: ITools, key: string, durationMs: number, timeoutMs: number): Promise<Record<string, unknown>> {
+  const options = { timeoutMs };
+  let pressed = false;
+  try {
+    const down = await executeAutomationRequest(tools, 'control_editor', {
+      action: 'simulate_input', type: 'key_down', key
+    }, undefined, options) as Record<string, unknown>;
+    pressed = isSuccessful(down);
+    if (!pressed) return cleanObject(down);
+    await delay(durationMs);
+    return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
+      action: 'simulate_input', type: 'key_up', key
+    }, undefined, options) as Record<string, unknown>);
+  } finally {
+    // A timeout/error after key-down must never leave an input latched in PIE.
+    if (pressed) {
+      try {
+        await executeAutomationRequest(tools, 'control_editor', {
+          action: 'simulate_input', type: 'key_up', key
+        }, undefined, options);
+      } catch {
+        // The primary request error is more useful; PIE cleanup still runs in the caller.
+      }
+    }
+  }
+}
+
+function getMoveKey(args: EditorArgs): string {
+  const x = typeof args.axisX === 'number' ? args.axisX : 0;
+  const y = typeof args.axisY === 'number' ? args.axisY : 1;
+  if (Math.abs(y) >= Math.abs(x)) return y < 0 ? 'S' : 'W';
+  return x < 0 ? 'A' : 'D';
+}
+
+async function runPlaytestSequence(args: EditorArgs, tools: ITools): Promise<Record<string, unknown>> {
+  const sequence = Array.isArray(args.sequence) ? args.sequence : [];
+  const timeoutMs = getBoundedTimeoutMs(args.timeoutMs);
+  const autoStop = args.autoStop !== false;
+  const startedAt = Date.now();
+  const steps: Array<Record<string, unknown>> = [];
+  let failure: string | undefined;
+
+  try {
+    for (let index = 0; index < sequence.length; index += 1) {
+      const step = sequence[index];
+      const action = typeof step.action === 'string' ? step.action : '';
+      if (!action) throw new Error(`Play-test step ${index + 1} is missing action`);
+      const stepArgs: EditorArgs = { ...args, ...step, action, timeoutMs: getBoundedTimeoutMs(step.timeoutMs ?? timeoutMs) };
+      delete stepArgs.sequence;
+      delete stepArgs.autoStop;
+      const startedStepAt = Date.now();
+      const result = await handleEditorTools(action, stepArgs, tools) as Record<string, unknown>;
+      const passed = isSuccessful(result);
+      steps.push({ index, action, passed, durationMs: Date.now() - startedStepAt, result });
+      if (!passed) throw new Error(`Play-test step ${index + 1} (${action}) failed`);
+    }
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (autoStop) {
+      try {
+        const stopResult = await stopPieAndVerify(tools, timeoutMs);
+        steps.push({ action: 'stop', cleanup: true, passed: isSuccessful(stopResult), result: stopResult });
+      } catch (error) {
+        failure = failure ?? `PIE cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+  }
+
+  const passed = failure === undefined;
+  const report = {
+    passed,
+    startedAt: new Date(startedAt).toISOString(),
+    durationMs: Date.now() - startedAt,
+    autoStop,
+    savedRuntimeChanges: false,
+    steps,
+    failure
+  };
+  return {
+    success: passed,
+    report,
+    summary: passed
+      ? `Play-test passed (${steps.filter(step => step.passed === true).length} steps; PIE stopped).`
+      : `Play-test failed: ${failure}. PIE cleanup was requested.`,
+    ...(passed ? {} : { error: 'PLAYTEST_FAILED', message: failure })
+  };
+}
+
 export async function handleEditorTools(action: string, args: EditorArgs, tools: ITools) {
   // Normalize action name for test compatibility
   const normalizedAction = normalizeEditorAction(action);
@@ -214,7 +364,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
 
   switch (normalizedAction) {
     case 'play': {
-      const res = await executeAutomationRequest(tools, 'control_editor', { action: 'play' }, undefined, { timeoutMs: args.timeoutMs }) as Record<string, unknown>;
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        action: 'play', pieMode: editorArgs.pieMode, playerStart: editorArgs.playerStart, pawnName: editorArgs.pawnName
+      }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>;
       return cleanObject(res);
     }
     case 'stop':
@@ -479,6 +631,51 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       });
       return cleanObject(res);
     }
+    case 'get_pie_state':
+    case 'query_pie_actor':
+    case 'get_pie_metrics':
+    case 'detect_pie_issues':
+    case 'read_pie_logs': {
+      return cleanObject(await executeAutomationRequest(tools, 'control_editor', editorArgs, undefined, {
+        timeoutMs: getBoundedTimeoutMs(args.timeoutMs)
+      }) as Record<string, unknown>);
+    }
+    case 'capture_pie_screenshot': {
+      return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
+        action: 'screenshot', filename: editorArgs.filename, resolution: editorArgs.resolution,
+        mode: 'game_viewport', returnBase64: editorArgs.returnBase64 ?? true,
+        includeMetadata: editorArgs.includeMetadata, metadata: editorArgs.metadata
+      }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
+    }
+    case 'send_input': {
+      const mappedType = getInputType(editorArgs);
+      if (mappedType === 'key_down' && typeof editorArgs.durationMs === 'number') {
+        return sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+      }
+      return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
+        action: 'simulate_input', type: mappedType, key: editorArgs.key, x: editorArgs.x, y: editorArgs.y, button: editorArgs.button
+      }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
+    }
+    case 'send_enhanced_input': {
+      // Enhanced Input receives simulated keys through the PIE viewport's normal input stack.
+      // Callers supply a mapped key; enhancedAction is retained for reporting by the bridge.
+      const result = await sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+      return cleanObject({ ...result, enhancedAction: editorArgs.enhancedAction, inputPath: 'pie_viewport' });
+    }
+    case 'move':
+      return sendHeldPieKey(tools, editorArgs.key ?? getMoveKey(editorArgs), getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs));
+    case 'look':
+      return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
+        action: 'simulate_input', type: 'mouse_move', x: editorArgs.x ?? 0, y: editorArgs.y ?? 0
+      }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
+    case 'jump':
+      return sendHeldPieKey(tools, editorArgs.key ?? 'SpaceBar', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+    case 'sprint':
+      return sendHeldPieKey(tools, editorArgs.key ?? 'LeftShift', getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs));
+    case 'interact':
+      return sendHeldPieKey(tools, editorArgs.key ?? 'E', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+    case 'run_playtest_sequence':
+      return runPlaytestSequence(editorArgs, tools);
     case 'focus':
     case 'focus_actor': {
       const actorName = requireNonEmptyString(args.actorName || args.name, 'actorName');

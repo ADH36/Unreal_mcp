@@ -52,6 +52,10 @@
 #include "Async/Async.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerStart.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpHandlerUtils.h"
@@ -136,6 +140,8 @@
 #include "GameFramework/PlayerController.h"
 #include "Camera/PlayerCameraManager.h"
 #include "GameFramework/PlayerInput.h"
+#include "GameplayTagAssetInterface.h"
+#include "GameplayTagContainer.h"
 #include "Materials/MaterialInterface.h"
 #if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
 #include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
@@ -156,6 +162,7 @@
 #include "Engine/StaticMeshActor.h"
 #include "Engine/World.h"
 #include "UnrealEngine.h"
+#include "UObject/UnrealType.h"
 
 #if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
 #define MCP_CONTROL_HAS_INPUT_DEVICE_ID 1
@@ -183,6 +190,7 @@
 #include "Misc/OutputDevice.h"
 #include "Slate/SceneViewport.h"
 #include "RenderingThread.h"
+#include "RHIStats.h"
 #include "UnrealClient.h"
 #include "Widgets/SWindow.h"
 
@@ -3090,13 +3098,28 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPlay(
     return true;
   }
 
+  FString PieMode = TEXT("viewport");
+  Payload->TryGetStringField(TEXT("pieMode"), PieMode);
+  PieMode = PieMode.ToLower();
+  if (PieMode != TEXT("viewport") && PieMode != TEXT("new_window") &&
+      PieMode != TEXT("standalone")) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("INVALID_ARGUMENT"),
+                              TEXT("pieMode must be viewport, new_window, or standalone"), nullptr);
+    return true;
+  }
+
   FRequestPlaySessionParams PlayParams;
+  // A standalone session is a separate process by design and cannot safely
+  // accept in-process PIE input/probes. Viewport and new-window remain PIE.
   PlayParams.WorldType = EPlaySessionWorldType::PlayInEditor;
+  PlayParams.SessionDestination = PieMode == TEXT("standalone")
+      ? EPlaySessionDestinationType::NewProcess
+      : EPlaySessionDestinationType::InProcess;
 #if MCP_HAS_LEVEL_EDITOR_PLAY_SETTINGS
   PlayParams.EditorPlaySettings = GetMutableDefault<ULevelEditorPlaySettings>();
 #endif
 #if MCP_HAS_LEVEL_EDITOR_MODULE
-  if (FLevelEditorModule *LevelEditorModule =
+  if (PieMode == TEXT("viewport")) if (FLevelEditorModule *LevelEditorModule =
           FModuleManager::GetModulePtr<FLevelEditorModule>(
               TEXT("LevelEditor"))) {
     TSharedPtr<IAssetViewport> DestinationViewport =
@@ -3109,6 +3132,8 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPlay(
   GEditor->RequestPlaySession(PlayParams);
   TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
   Resp->SetBoolField(TEXT("success"), true);
+  Resp->SetStringField(TEXT("pieMode"), PieMode);
+  Resp->SetBoolField(TEXT("supportsRuntimeProbes"), PieMode != TEXT("standalone"));
   SendAutomationResponse(Socket, RequestId, true,
                          TEXT("Play in Editor started"), Resp, FString());
   return true;
@@ -3185,31 +3210,52 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPossess(
     return true;
   }
 
-  AActor *Found = FindActorByName(ActorName);
+  if (!GEditor || !GEditor->PlayWorld) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_IN_PIE"),
+                              TEXT("Cannot possess actor while not in PIE"), nullptr);
+    return true;
+  }
+
+  UWorld* PlayWorld = GEditor->PlayWorld.Get();
+  AActor *Found = FindActorByNameInWorldForMcp(PlayWorld, ActorName, true);
   if (!Found) {
     SendStandardErrorResponse(this, Socket, RequestId, TEXT("ACTOR_NOT_FOUND"),
                               FString::Printf(TEXT("Actor not found: %s"), *ActorName), nullptr);
     return true;
   }
 
-  if (GEditor) {
-    GEditor->SelectNone(true, true, false);
-    GEditor->SelectActor(Found, true, true, true);
-    // 'POSSESS' command works on selected actor in PIE
-    if (GEditor->PlayWorld) {
-      GEditor->Exec(GEditor->PlayWorld, TEXT("POSSESS"));
-      SendAutomationResponse(Socket, RequestId, true, TEXT("Possessed actor"),
-                             nullptr);
-    } else {
-      // If not in PIE, we can't possess
-      SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_IN_PIE"),
-                              TEXT("Cannot possess actor while not in PIE"), nullptr);
-    }
+  APlayerController* PlayerController = PlayWorld->GetFirstPlayerController();
+  if (!PlayerController) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("PLAYER_CONTROLLER_NOT_FOUND"),
+                              TEXT("PIE has no player controller"), nullptr);
     return true;
   }
 
-  SendStandardErrorResponse(this, Socket, RequestId, TEXT("EDITOR_NOT_AVAILABLE"),
-                              TEXT("Editor not available"), nullptr);
+  if (APlayerStart* PlayerStart = Cast<APlayerStart>(Found)) {
+    if (AGameModeBase* GameMode = PlayWorld->GetAuthGameMode()) {
+      GameMode->RestartPlayerAtPlayerStart(PlayerController, PlayerStart);
+    } else {
+      SendStandardErrorResponse(this, Socket, RequestId, TEXT("GAME_MODE_NOT_FOUND"),
+                                TEXT("PIE has no authoritative GameMode for PlayerStart possession"), nullptr);
+      return true;
+    }
+  } else if (APawn* Pawn = Cast<APawn>(Found)) {
+    PlayerController->Possess(Pawn);
+  } else {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_A_PAWN_OR_PLAYER_START"),
+                              TEXT("actorName must resolve to a PIE pawn or PlayerStart"), nullptr);
+    return true;
+  }
+
+  APawn* PossessedPawn = PlayerController->GetPawn();
+  TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+  Resp->SetBoolField(TEXT("success"), PossessedPawn != nullptr);
+  Resp->SetStringField(TEXT("actorWorld"), PlayWorld->GetName());
+  Resp->SetStringField(TEXT("requestedActor"), Found->GetName());
+  if (PossessedPawn) Resp->SetStringField(TEXT("pawn"), PossessedPawn->GetName());
+  SendAutomationResponse(Socket, RequestId, PossessedPawn != nullptr,
+                         PossessedPawn ? TEXT("Possessed PIE actor") : TEXT("Possession did not produce a pawn"),
+                         Resp, PossessedPawn ? FString() : TEXT("POSSESSION_FAILED"));
   return true;
 #else
   return false;
@@ -3666,7 +3712,7 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorAction(
     return true;
   }
 
-  if (LowerSub == TEXT("play"))
+  if (LowerSub == TEXT("play") || LowerSub == TEXT("start_pie"))
     return HandleControlEditorPlay(RequestId, Payload, RequestingSocket);
   if (LowerSub == TEXT("stop") || LowerSub == TEXT("stop_pie"))
     return HandleControlEditorStop(RequestId, Payload, RequestingSocket);
@@ -3715,6 +3761,10 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorAction(
     return HandleControlEditorSetViewportRealtime(RequestId, Payload, RequestingSocket);
   if (LowerSub == TEXT("simulate_input"))
     return HandleControlEditorSimulateInput(RequestId, Payload, RequestingSocket);
+  if (LowerSub == TEXT("get_pie_state") || LowerSub == TEXT("query_pie_actor") ||
+      LowerSub == TEXT("get_pie_metrics") || LowerSub == TEXT("detect_pie_issues") ||
+      LowerSub == TEXT("read_pie_logs"))
+    return HandleControlEditorRuntimeProbe(RequestId, Payload, RequestingSocket);
   // Additional actions for test compatibility
   if (LowerSub == TEXT("close_asset"))
     return HandleControlEditorCloseAsset(RequestId, Payload, RequestingSocket);
@@ -4790,6 +4840,190 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
 #else
   SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_IMPLEMENTED"),
                               TEXT("Simulate input requires editor build."), nullptr);
+  return true;
+#endif
+}
+
+bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
+    const FString& RequestId, const TSharedPtr<FJsonObject>& Payload,
+    TSharedPtr<FMcpBridgeWebSocket> Socket) {
+#if WITH_EDITOR
+  FString SubAction;
+  Payload->TryGetStringField(TEXT("action"), SubAction);
+  const FString Action = SubAction.ToLower();
+
+  auto AddVector = [](const TSharedPtr<FJsonObject>& Result, const TCHAR* Name, const FVector& Value) {
+    TSharedPtr<FJsonObject> Vector = MakeShared<FJsonObject>();
+    Vector->SetNumberField(TEXT("x"), Value.X);
+    Vector->SetNumberField(TEXT("y"), Value.Y);
+    Vector->SetNumberField(TEXT("z"), Value.Z);
+    Result->SetObjectField(Name, Vector);
+  };
+  auto AddRotator = [](const TSharedPtr<FJsonObject>& Result, const TCHAR* Name, const FRotator& Value) {
+    TSharedPtr<FJsonObject> Rotation = MakeShared<FJsonObject>();
+    Rotation->SetNumberField(TEXT("pitch"), Value.Pitch);
+    Rotation->SetNumberField(TEXT("yaw"), Value.Yaw);
+    Rotation->SetNumberField(TEXT("roll"), Value.Roll);
+    Result->SetObjectField(Name, Rotation);
+  };
+  auto RequirePlayWorld = [this, Socket, &RequestId]() -> UWorld* {
+    if (!GEditor || !GEditor->PlayWorld) {
+      SendStandardErrorResponse(this, Socket, RequestId, TEXT("NO_ACTIVE_SESSION"),
+                                TEXT("PIE runtime probes require an active in-process PIE world"), nullptr);
+      return nullptr;
+    }
+    return GEditor->PlayWorld.Get();
+  };
+
+  if (Action == TEXT("get_pie_state")) {
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    UWorld* PlayWorld = GEditor ? GEditor->PlayWorld.Get() : nullptr;
+    UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetBoolField(TEXT("isInPIE"), PlayWorld != nullptr);
+    Result->SetBoolField(TEXT("isPaused"), PlayWorld && PlayWorld->bDebugPauseExecution);
+    if (PlayWorld) Result->SetStringField(TEXT("pieWorld"), PlayWorld->GetName());
+    if (EditorWorld) Result->SetStringField(TEXT("editorWorld"), EditorWorld->GetName());
+    if (PlayWorld) {
+      if (APlayerController* Controller = PlayWorld->GetFirstPlayerController()) {
+        if (APawn* Pawn = Controller->GetPawn()) Result->SetStringField(TEXT("possessedPawn"), Pawn->GetName());
+      }
+    }
+    SendAutomationResponse(Socket, RequestId, true, TEXT("PIE state queried"), Result, FString());
+    return true;
+  }
+
+  UWorld* PlayWorld = RequirePlayWorld();
+  if (!PlayWorld) return true;
+
+  if (Action == TEXT("query_pie_actor") || Action == TEXT("detect_pie_issues")) {
+    FString ActorName;
+    Payload->TryGetStringField(TEXT("actorName"), ActorName);
+    AActor* Actor = FindActorByNameInWorldForMcp(PlayWorld, ActorName, true);
+    if (!Actor) {
+      SendStandardErrorResponse(this, Socket, RequestId, TEXT("PIE_ACTOR_NOT_FOUND"),
+                                TEXT("actorName did not resolve in the PIE world; editor-world actors are intentionally excluded"), nullptr);
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("actorName"), Actor->GetName());
+    Result->SetStringField(TEXT("actorWorld"), PlayWorld->GetName());
+    Result->SetStringField(TEXT("worldKind"), TEXT("PIE"));
+    AddVector(Result, TEXT("location"), Actor->GetActorLocation());
+    AddRotator(Result, TEXT("rotation"), Actor->GetActorRotation());
+    AddVector(Result, TEXT("velocity"), Actor->GetVelocity());
+
+    TArray<TSharedPtr<FJsonValue>> Tags;
+    for (const FName& Tag : Actor->Tags) Tags.Add(MakeShared<FJsonValueString>(Tag.ToString()));
+    Result->SetArrayField(TEXT("actorTags"), Tags);
+    if (const IGameplayTagAssetInterface* TaggedActor = Cast<IGameplayTagAssetInterface>(Actor)) {
+      FGameplayTagContainer GameplayTags;
+      TaggedActor->GetOwnedGameplayTags(GameplayTags);
+      TArray<TSharedPtr<FJsonValue>> GameplayTagValues;
+      for (const FGameplayTag& Tag : GameplayTags) {
+        GameplayTagValues.Add(MakeShared<FJsonValueString>(Tag.ToString()));
+      }
+      Result->SetArrayField(TEXT("gameplayTags"), GameplayTagValues);
+    }
+    if (FNumericProperty* Health = FindFProperty<FNumericProperty>(Actor->GetClass(), TEXT("Health"))) {
+      const void* ValueAddress = Health->ContainerPtrToValuePtr<void>(Actor);
+      Result->SetNumberField(TEXT("health"), Health->IsFloatingPoint()
+          ? Health->GetFloatingPointPropertyValue(ValueAddress)
+          : static_cast<double>(Health->GetSignedIntPropertyValue(ValueAddress)));
+    }
+    if (ACharacter* Character = Cast<ACharacter>(Actor)) {
+      if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement()) {
+        Result->SetNumberField(TEXT("movementMode"), static_cast<int32>(Movement->MovementMode));
+      }
+    }
+
+    if (Action == TEXT("detect_pie_issues")) {
+      bool bExpectedMovement = false;
+      double MinMovementCm = 5.0;
+      Payload->TryGetBoolField(TEXT("expectedMovement"), bExpectedMovement);
+      Payload->TryGetNumberField(TEXT("minMovementCm"), MinMovementCm);
+      double PreviousX = 0.0, PreviousY = 0.0, PreviousZ = 0.0;
+      bool bHasPreviousLocation = false;
+      const TSharedPtr<FJsonObject>* PreviousLocation = nullptr;
+      if (Payload->TryGetObjectField(TEXT("previousLocation"), PreviousLocation) && PreviousLocation && PreviousLocation->IsValid()) {
+        bHasPreviousLocation = (*PreviousLocation)->TryGetNumberField(TEXT("x"), PreviousX) &&
+            (*PreviousLocation)->TryGetNumberField(TEXT("y"), PreviousY) &&
+            (*PreviousLocation)->TryGetNumberField(TEXT("z"), PreviousZ);
+      }
+      const FVector CurrentLocation = Actor->GetActorLocation();
+      const double DistanceMoved = bHasPreviousLocation
+          ? FVector::Dist(CurrentLocation, FVector(PreviousX, PreviousY, PreviousZ)) : -1.0;
+      const bool bBlocked = bExpectedMovement && bHasPreviousLocation && DistanceMoved < FMath::Max(0.0, MinMovementCm);
+      const float KillZ = PlayWorld->GetWorldSettings() ? PlayWorld->GetWorldSettings()->KillZ : -HALF_WORLD_MAX;
+      const bool bFallingThroughTerrain = CurrentLocation.Z < KillZ;
+      Result->SetBoolField(TEXT("blockedMovement"), bBlocked);
+      Result->SetBoolField(TEXT("fallingThroughTerrain"), bFallingThroughTerrain);
+      Result->SetNumberField(TEXT("distanceMovedCm"), DistanceMoved);
+      Result->SetNumberField(TEXT("killZ"), KillZ);
+    }
+    SendAutomationResponse(Socket, RequestId, true, TEXT("PIE actor queried"), Result, FString());
+    return true;
+  }
+
+  if (Action == TEXT("get_pie_metrics")) {
+    int32 ActorCount = 0;
+    for (TActorIterator<AActor> It(PlayWorld); It; ++It) ++ActorCount;
+    const double DeltaSeconds = FApp::GetDeltaTime();
+    const FPlatformMemoryStats Memory = FPlatformMemory::GetStats();
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("pieWorld"), PlayWorld->GetName());
+    Result->SetNumberField(TEXT("fps"), DeltaSeconds > SMALL_NUMBER ? 1.0 / DeltaSeconds : 0.0);
+    Result->SetNumberField(TEXT("frameTimeMs"), DeltaSeconds * 1000.0);
+    Result->SetNumberField(TEXT("memoryBytes"), static_cast<double>(Memory.UsedPhysical));
+    Result->SetNumberField(TEXT("actorCount"), ActorCount);
+    Result->SetNumberField(TEXT("drawCalls"), GNumDrawCallsRHI[0]);
+    Result->SetBoolField(TEXT("drawCallsAvailable"), true);
+    SendAutomationResponse(Socket, RequestId, true, TEXT("PIE metrics queried"), Result, FString());
+    return true;
+  }
+
+  if (Action == TEXT("read_pie_logs")) {
+    const FString LogPath = FPaths::ProjectLogDir() / (FString(FApp::GetProjectName()) + TEXT(".log"));
+    FString LogText;
+    FFileHelper::LoadFileToString(LogText, *LogPath);
+    const int32 Start = FMath::Max(0, LogText.Len() - 65536);
+    TArray<FString> Lines;
+    LogText.Mid(Start).ParseIntoArrayLines(Lines, true);
+    TArray<TSharedPtr<FJsonValue>> Entries;
+    int32 Warnings = 0, Errors = 0, Crashes = 0, BlueprintErrors = 0;
+    for (const FString& Line : Lines) {
+      const FString LowerLine = Line.ToLower();
+      if (LowerLine.Contains(TEXT("warning"))) ++Warnings;
+      if (LowerLine.Contains(TEXT("error"))) ++Errors;
+      if (LowerLine.Contains(TEXT("fatal error")) || LowerLine.Contains(TEXT("crash"))) ++Crashes;
+      if (LowerLine.Contains(TEXT("blueprint")) && (LowerLine.Contains(TEXT("error")) || LowerLine.Contains(TEXT("warning")))) ++BlueprintErrors;
+      if (LowerLine.Contains(TEXT("token")) || LowerLine.Contains(TEXT("password")) || LowerLine.Contains(TEXT("secret")) || LowerLine.Contains(TEXT("apikey"))) {
+        Entries.Add(MakeShared<FJsonValueString>(TEXT("[REDACTED SENSITIVE LOG LINE]")));
+      } else if (Entries.Num() < 200) {
+        Entries.Add(MakeShared<FJsonValueString>(Line));
+      }
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetNumberField(TEXT("warningCount"), Warnings);
+    Result->SetNumberField(TEXT("errorCount"), Errors);
+    Result->SetNumberField(TEXT("crashCount"), Crashes);
+    Result->SetNumberField(TEXT("blueprintErrorCount"), BlueprintErrors);
+    Result->SetArrayField(TEXT("entries"), Entries);
+    Result->SetBoolField(TEXT("sensitiveValuesRedacted"), true);
+    SendAutomationResponse(Socket, RequestId, true, TEXT("Runtime log tail read"), Result, FString());
+    return true;
+  }
+
+  SendStandardErrorResponse(this, Socket, RequestId, TEXT("UNKNOWN_ACTION"),
+                            TEXT("Unknown PIE runtime probe action"), nullptr);
+  return true;
+#else
+  SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_IMPLEMENTED"),
+                            TEXT("PIE runtime probes require editor build."), nullptr);
   return true;
 #endif
 }
