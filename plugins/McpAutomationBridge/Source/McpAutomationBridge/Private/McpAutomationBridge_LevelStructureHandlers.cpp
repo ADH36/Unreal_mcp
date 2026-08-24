@@ -83,6 +83,8 @@
 #include "WorldPartition/HLOD/HLODSourceActorsFromCell.h"
 #include "WorldPartition/WorldPartitionHelpers.h"
 #include "WorldPartition/WorldPartitionActorDescInstance.h"
+#include "WorldPartition/RuntimeHashSet/WorldPartitionRuntimeHashSet.h"
+#include "WorldPartition/RuntimeHashSet/RuntimePartition.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Engine/StaticMeshActor.h"
@@ -2034,6 +2036,136 @@ static bool HandleAssignActorToDataLayer(
     return true;
 }
 
+/**
+ * RuntimeHashSet maps actor HLOD layers to explicit HLOD runtime partitions.
+ * A layer asset by itself is not enough for UE 5.8 RuntimeHashSet maps: the
+ * layer must be present in a FRuntimePartitionHLODSetup, otherwise streaming
+ * generation reports the actor assignment as an invalid HLOD layer and drops
+ * it from the build.  RuntimePartitions is editor-only/private, so use the
+ * reflected property containers while staying on the game thread.
+ */
+static bool EnsureRuntimeHashSetHlodSetup(UWorld* World, UHLODLayer* HLODLayer, FString& OutReason)
+{
+    if (!World || !HLODLayer || !World->GetWorldPartition())
+    {
+        OutReason = TEXT("World, HLOD layer or World Partition is unavailable.");
+        return false;
+    }
+
+    UWorldPartitionRuntimeHashSet* RuntimeHashSet =
+        Cast<UWorldPartitionRuntimeHashSet>(World->GetWorldPartition()->RuntimeHash);
+    if (!RuntimeHashSet)
+    {
+        // RuntimeSpatialHash accepts HLOD layers without an explicit setup.
+        return true;
+    }
+
+    FArrayProperty* RuntimePartitionsProperty =
+        FindFProperty<FArrayProperty>(RuntimeHashSet->GetClass(), TEXT("RuntimePartitions"));
+    if (!RuntimePartitionsProperty || !RuntimePartitionsProperty->Inner)
+    {
+        OutReason = TEXT("RuntimeHashSet RuntimePartitions property is unavailable.");
+        return false;
+    }
+
+    void* RuntimePartitionsValue = RuntimePartitionsProperty->ContainerPtrToValuePtr<void>(RuntimeHashSet);
+    FScriptArrayHelper RuntimePartitions(RuntimePartitionsProperty, RuntimePartitionsValue);
+    for (int32 PartitionIndex = 0; PartitionIndex < RuntimePartitions.Num(); ++PartitionIndex)
+    {
+        void* PartitionDesc = RuntimePartitions.GetRawPtr(PartitionIndex);
+        FArrayProperty* HLODSetupsArray =
+            FindFProperty<FArrayProperty>(RuntimePartitionsProperty->Inner->GetClass(), TEXT("HLODSetups"));
+        FObjectProperty* MainLayerProperty =
+            FindFProperty<FObjectProperty>(RuntimePartitionsProperty->Inner->GetClass(), TEXT("MainLayer"));
+        if (!HLODSetupsArray || !HLODSetupsArray->Inner || !MainLayerProperty)
+        {
+            OutReason = TEXT("RuntimeHashSet partition descriptor has no HLOD setup or main layer property.");
+            return false;
+        }
+
+        URuntimePartition* MainLayer = Cast<URuntimePartition>(
+            MainLayerProperty->GetObjectPropertyValue_InContainer(PartitionDesc));
+        if (!MainLayer)
+        {
+            continue;
+        }
+
+        FScriptArrayHelper HLODSetups(HLODSetupsArray,
+            HLODSetupsArray->ContainerPtrToValuePtr<void>(PartitionDesc));
+        for (int32 SetupIndex = 0; SetupIndex < HLODSetups.Num(); ++SetupIndex)
+        {
+            void* Setup = HLODSetups.GetRawPtr(SetupIndex);
+            FArrayProperty* LayersProperty =
+                FindFProperty<FArrayProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("HLODLayers"));
+            if (!LayersProperty)
+            {
+                OutReason = TEXT("RuntimeHashSet HLOD setup has no HLODLayers property.");
+                return false;
+            }
+            FScriptArrayHelper Layers(LayersProperty,
+                LayersProperty->ContainerPtrToValuePtr<void>(Setup));
+            for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+            {
+                FObjectPropertyBase* LayerProperty = CastField<FObjectPropertyBase>(LayersProperty->Inner);
+                if (LayerProperty && LayerProperty->GetObjectPropertyValue(Layers.GetRawPtr(LayerIndex)) == HLODLayer)
+                {
+                    return true;
+                }
+            }
+        }
+
+        const int32 NewSetupIndex = HLODSetups.Num();
+        const int32 NewSetupIndexAllocated = HLODSetups.AddValue();
+        void* NewSetup = HLODSetups.GetRawPtr(NewSetupIndexAllocated);
+        if (!NewSetup)
+        {
+            OutReason = TEXT("Failed to allocate RuntimeHashSet HLOD setup.");
+            return false;
+        }
+
+        FNameProperty* NameProperty = FindFProperty<FNameProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("Name"));
+        FBoolProperty* SpatialProperty = FindFProperty<FBoolProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("bIsSpatiallyLoaded"));
+        FObjectProperty* PartitionLayerProperty = FindFProperty<FObjectProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("PartitionLayer"));
+        FArrayProperty* LayersProperty = FindFProperty<FArrayProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("HLODLayers"));
+        if (!NameProperty || !SpatialProperty || !PartitionLayerProperty || !LayersProperty)
+        {
+            OutReason = TEXT("RuntimeHashSet HLOD setup properties are incomplete.");
+            return false;
+        }
+
+        NameProperty->SetPropertyValue_InContainer(NewSetup, *FString::Printf(TEXT("HLOD_%d"), NewSetupIndex));
+        SpatialProperty->SetPropertyValue_InContainer(NewSetup, true);
+        URuntimePartition* HLODPartition = MainLayer->CreateHLODRuntimePartition(NewSetupIndex);
+        if (!HLODPartition)
+        {
+            OutReason = TEXT("Failed to create the HLOD runtime partition.");
+            return false;
+        }
+        PartitionLayerProperty->SetObjectPropertyValue_InContainer(NewSetup, HLODPartition);
+
+        FScriptArrayHelper Layers(LayersProperty, LayersProperty->ContainerPtrToValuePtr<void>(NewSetup));
+        FObjectPropertyBase* LayerProperty = CastField<FObjectPropertyBase>(LayersProperty->Inner);
+        if (!LayerProperty)
+        {
+            OutReason = TEXT("RuntimeHashSet HLOD layer array has an unsupported element type.");
+            return false;
+        }
+        const int32 NewLayerIndex = Layers.AddValue();
+        void* NewLayerValue = Layers.GetRawPtr(NewLayerIndex);
+        LayerProperty->SetObjectPropertyValue(NewLayerValue, HLODLayer);
+
+        RuntimeHashSet->Modify();
+        RuntimeHashSet->PostEditChange();
+        RuntimeHashSet->MarkPackageDirty();
+        World->GetWorldPartition()->Modify();
+        World->GetWorldPartition()->MarkPackageDirty();
+        return true;
+    }
+
+    OutReason = TEXT("RuntimeHashSet contains no runtime partitions.");
+    return false;
+}
+
 static bool HandleConfigureHlodLayer(
     UMcpAutomationBridgeSubsystem* Subsystem,
     const FString& RequestId,
@@ -2152,7 +2284,26 @@ static bool HandleConfigureHlodLayer(
     AssetPackage->MarkPackageDirty();
 
     // Save the asset
-    McpSafeAssetSave(NewHLODLayer);
+    if (!McpSafeAssetSave(NewHLODLayer))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Failed to save the HLOD layer asset."), nullptr, TEXT("HLOD_LAYER_SAVE_FAILED"));
+        return true;
+    }
+
+    UWorld* HLODWorld = LevelStructureHelpers::GetEditorWorld();
+    FString RuntimeSetupReason;
+    if (HLODWorld && !EnsureRuntimeHashSetHlodSetup(HLODWorld, NewHLODLayer, RuntimeSetupReason))
+    {
+        Subsystem->SendAutomationResponse(Socket, RequestId, false,
+            FString::Printf(TEXT("Failed to register HLOD layer with the World Partition runtime hash: %s"), *RuntimeSetupReason),
+            nullptr, TEXT("HLOD_RUNTIME_SETUP_FAILED"));
+        return true;
+    }
+    if (HLODWorld && HLODWorld->PersistentLevel)
+    {
+        McpSafeLevelSave(HLODWorld->PersistentLevel, HLODWorld->GetOutermost()->GetName());
+    }
 
     TSharedPtr<FJsonObject> ResponseJson = McpHandlerUtils::CreateResultObject();
     ResponseJson->SetStringField(TEXT("hlodLayerName"), HlodLayerName);
@@ -2329,11 +2480,11 @@ static void AddHlodBuildLogFields(TSharedPtr<FJsonObject> Result)
         }
 
         int32 Parsed = 0;
-        if (ParseLogIntegerAfter(Line, TEXT("Total Errors"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Error Count"), Parsed))
+        if (ParseLogIntegerAfter(Line, TEXT("Total Errors"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Error Count"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Errors:"), Parsed))
         {
             SummaryErrors = Parsed;
         }
-        if (ParseLogIntegerAfter(Line, TEXT("Total Warnings"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Warning Count"), Parsed))
+        if (ParseLogIntegerAfter(Line, TEXT("Total Warnings"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Warning Count"), Parsed) || ParseLogIntegerAfter(Line, TEXT("Warnings:"), Parsed))
         {
             SummaryWarnings = Parsed;
         }
@@ -2532,6 +2683,8 @@ static void AddHlodActorInspection(TSharedPtr<FJsonObject> Entry, AWorldPartitio
     Entry->SetNumberField(TEXT("inputTriangleCount"), InputTriangles);
     Entry->SetNumberField(TEXT("outputTriangleCount"), OutputTriangles);
     Entry->SetNumberField(TEXT("meshInstanceCount"), Actor->GetStat(FWorldPartitionHLODStats::MeshInstanceCount));
+    Entry->SetStringField(TEXT("sourceCellGuid"), Actor->GetSourceCellGuid().ToString());
+    Entry->SetStringField(TEXT("hlodResourcesPackagePath"), Actor->GetHLODResourcesPackagePath().ToString());
     Entry->SetNumberField(TEXT("materialTextureBytes"), Actor->GetStat(FWorldPartitionHLODStats::MaterialBaseColorTextureSize) + Actor->GetStat(FWorldPartitionHLODStats::MaterialNormalTextureSize) + Actor->GetStat(FWorldPartitionHLODStats::MaterialEmissiveTextureSize));
     Entry->SetNumberField(TEXT("triangleReductionPercent"), InputTriangles > 0 ? (100.0 * (1.0 - (double)OutputTriangles / (double)InputTriangles)) : 0.0);
     Entry->SetStringField(TEXT("externalPackagePath"), Actor->GetExternalPackage() ? Actor->GetExternalPackage()->GetName() : TEXT(""));
@@ -2682,7 +2835,7 @@ static bool HandleReportMissingHlodAssignments(UMcpAutomationBridgeSubsystem* Su
         if (Actor && !Actor->IsA<AWorldPartitionHLOD>() && Actor->IsHLODRelevant() && !Actor->GetHLODLayer())
         {
             TSharedPtr<FJsonObject> Entry = McpHandlerUtils::CreateResultObject();
-            Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
+    Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
             Entry->SetStringField(TEXT("class"), Actor->GetClass()->GetPathName());
             Missing.Add(MakeShared<FJsonValueObject>(Entry));
         }
