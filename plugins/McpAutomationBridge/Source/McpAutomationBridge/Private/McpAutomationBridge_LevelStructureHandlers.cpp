@@ -80,6 +80,14 @@
 #include "WorldPartition/HLOD/HLODLayer.h"
 #include "WorldPartition/HLOD/HLODActor.h"
 #include "WorldPartition/HLOD/HLODStats.h"
+#include "WorldPartition/HLOD/HLODSourceActorsFromCell.h"
+#include "WorldPartition/WorldPartitionHelpers.h"
+#include "WorldPartition/WorldPartitionActorDescInstance.h"
+#include "Components/StaticMeshComponent.h"
+#include "Components/PrimitiveComponent.h"
+#include "Engine/StaticMeshActor.h"
+#include "ScopedTransaction.h"
+#include "Internationalization/Regex.h"
 #include "Engine/LODActor.h"
 #include "LevelInstance/LevelInstanceActor.h"
 #include "LevelInstance/LevelInstanceSubsystem.h"
@@ -2176,7 +2184,11 @@ struct FMcpHlodBuildProcess
     FString MapPath;
     FString LogPath;
     FString Mode;
+    double StartTimeSeconds = 0.0;
+    double TimeoutSeconds = 900.0;
+    int32 ExitCode = INDEX_NONE;
     bool bCancellationRequested = false;
+    bool bTimedOut = false;
 };
 
 static FMcpHlodBuildProcess GMcpHlodBuildProcess;
