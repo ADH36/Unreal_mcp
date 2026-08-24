@@ -599,6 +599,13 @@ private:
   HandleSetLandscapeMaterial(const FString &RequestId, const FString &Action,
                              const TSharedPtr<FJsonObject> &Payload,
                              TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
+  // UE 5.8.1 landscape inspection, procedural height authoring, and
+  // deterministic tool-owned HISM foliage. Kept separate from the legacy
+  // handlers so existing landscape/foliage actions remain source compatible.
+  bool HandleLandscapeFoliageAuthoring(
+      const FString &RequestId, const FString &Action,
+      const TSharedPtr<FJsonObject> &Payload,
+      TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
   bool HandleCreateNiagaraSystemNative(
       const FString &RequestId, const FString &Action,
       const TSharedPtr<FJsonObject> &Payload,

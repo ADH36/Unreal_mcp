@@ -39,6 +39,15 @@ const PHASE_28_ENVIRONMENT_ACTIONS = [
   'create_buoyancy_component'
 ] as const;
 
+const UE_581_LANDSCAPE_FOLIAGE_ACTIONS = [
+  'inspect_landscape', 'delete_landscape', 'resize_landscape',
+  'generate_landscape_heightmap', 'apply_landscape_erosion',
+  'sculpt_landscape_region', 'paint_landscape_by_rule',
+  'create_landscape_material', 'configure_landscape_layer_blend',
+  'scatter_landscape_foliage', 'inspect_generated_foliage',
+  'regenerate_generated_foliage', 'clear_generated_foliage'
+] as const;
+
 function getBuildEnvironmentActionEnum(): readonly string[] {
   const tool = consolidatedToolDefinitions.find(def => def.name === 'build_environment');
   const inputSchema = tool?.inputSchema as { properties?: { action?: { enum?: string[] } } } | undefined;
@@ -302,5 +311,35 @@ describe('handleEnvironmentTools path normalization', () => {
       path: './tmp/unreal-mcp/build-environment',
       filename: 'snapshot.json'
     });
+  });
+});
+
+describe('UE 5.8.1 landscape and foliage authoring contract', () => {
+  beforeEach(() => executeAutomationRequestMock.mockClear());
+
+  it('exposes the complete landscape and tool-generated foliage action family', () => {
+    const actions = getBuildEnvironmentActionEnum();
+    const properties = getBuildEnvironmentProperties();
+    for (const action of UE_581_LANDSCAPE_FOLIAGE_ACTIONS) expect(actions).toContain(action);
+    for (const property of ['resolutionX', 'resolutionY', 'terrainFeature', 'placementMode', 'exclusionZones', 'minSlope', 'maxSlope', 'minHeight', 'maxHeight', 'surfaceOffset', 'cancel']) {
+      expect(properties).toHaveProperty(property);
+    }
+  });
+
+  it('normalizes requested foliage mesh paths and preserves deterministic scatter constraints', async () => {
+    await handleEnvironmentTools('scatter_landscape_foliage', {
+      action: 'scatter_landscape_foliage',
+      landscapeName: 'Landscape_A',
+      seed: 8128,
+      foliageTypes: [{ meshPath: 'Game/Meshes/SM_Tree', count: 12, minScale: 0.8, maxScale: 1.2 }],
+      exclusionZones: [{ min: { x: 0, y: 0, z: -100 }, max: { x: 200, y: 200, z: 1000 } }]
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenCalledWith(
+      {}, 'build_environment', expect.objectContaining({
+        action: 'scatter_landscape_foliage', seed: 8128,
+        foliageTypes: [{ meshPath: '/Game/Meshes/SM_Tree', count: 12, minScale: 0.8, maxScale: 1.2 }]
+      }), 'Automation bridge not available for landscape and foliage authoring operations'
+    );
   });
 });

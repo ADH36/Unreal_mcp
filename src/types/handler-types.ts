@@ -482,6 +482,17 @@ export interface EnvironmentArgs extends HandlerArgs {
     seed?: number;
     heightData?: number[];
     layerName?: string;
+    resolutionX?: number;
+    resolutionY?: number;
+    terrainFeature?: 'mountains' | 'hills' | 'valleys' | 'plains' | 'lakeshore' | 'erosion';
+    placementMode?: 'auto' | 'landscape_grass' | 'pcg' | 'hism';
+    exclusionZones?: Array<Record<string, unknown>>;
+    minSlope?: number;
+    maxSlope?: number;
+    minHeight?: number;
+    maxHeight?: number;
+    surfaceOffset?: number;
+    generatedOnly?: boolean;
 }
 
 // ============================================================================

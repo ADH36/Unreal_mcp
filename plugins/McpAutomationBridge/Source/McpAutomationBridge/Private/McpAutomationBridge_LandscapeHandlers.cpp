@@ -320,6 +320,24 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
   Payload->TryGetNumberField(TEXT("sectionsPerComponent"),
                              SectionsPerComponent);
 
+  // UE landscape components have a constrained topology.  Accepting arbitrary
+  // values can create an actor that looks valid but cannot build collision or
+  // paint layers after reload.  Validate before scheduling any editor work.
+  const bool bValidSectionSize = QuadsPerComponent == 7 ||
+      QuadsPerComponent == 15 || QuadsPerComponent == 31 ||
+      QuadsPerComponent == 63 || QuadsPerComponent == 127 ||
+      QuadsPerComponent == 255;
+  if (!bValidSectionSize || (SectionsPerComponent != 1 && SectionsPerComponent != 2) ||
+      ComponentsX < 1 || ComponentsY < 1 || ComponentsX > 32 || ComponentsY > 32 ||
+      ComponentsX * ComponentsY > 1024)
+  {
+    SendAutomationError(
+        RequestingSocket, RequestId,
+        TEXT("Invalid landscape resolution. quadsPerSection/sectionSize must be 7, 15, 31, 63, 127, or 255; sectionsPerComponent must be 1 or 2; component dimensions must be 1..32 (max 1024 components)."),
+        TEXT("INVALID_LANDSCAPE_RESOLUTION"));
+    return true;
+  }
+
   FString MaterialPath;
   Payload->TryGetStringField(TEXT("materialPath"), MaterialPath);
   if (MaterialPath.IsEmpty()) {

@@ -765,10 +765,36 @@ bool UMcpAutomationBridgeSubsystem::HandleAddFoliageType(
     return true;
   }
 
+  // Honour an explicit /Game destination.  The legacy default remains
+  // /Game/Foliage so existing clients continue to create the same assets.
   FString PackagePath = TEXT("/Game/Foliage");
+  FString RequestedAssetPath;
+  FString RequestedDirectory;
+  Payload->TryGetStringField(TEXT("foliageTypePath"), RequestedAssetPath);
+  Payload->TryGetStringField(TEXT("path"), RequestedDirectory);
+  if (!RequestedAssetPath.IsEmpty()) {
+    const FString SafeDestination = SanitizeProjectRelativePath(RequestedAssetPath);
+    if (SafeDestination.IsEmpty() || !SafeDestination.StartsWith(TEXT("/Game/"))) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("foliageTypePath/path must be a valid /Game destination."),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    const FString DestinationAssetName = FPaths::GetBaseFilename(SafeDestination);
+    PackagePath = FPaths::GetPath(SafeDestination);
+    Name = DestinationAssetName;
+  } else if (!RequestedDirectory.IsEmpty()) {
+    const FString SafeDirectory = SanitizeProjectRelativePath(RequestedDirectory);
+    if (SafeDirectory.IsEmpty() || !SafeDirectory.StartsWith(TEXT("/Game/"))) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("path must be a valid /Game directory."),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    PackagePath = SafeDirectory;
+  }
   FString AssetName = Name;
-  FString FullPackagePath =
-      FString::Printf(TEXT("%s/%s"), *PackagePath, *AssetName);
+  FString FullPackagePath = FString::Printf(TEXT("%s/%s"), *PackagePath, *AssetName);
 
   UPackage *Package = CreatePackage(*FullPackagePath);
   if (!Package) {

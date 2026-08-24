@@ -46,6 +46,19 @@ function getString(value: unknown): string | undefined {
 
 const ENVIRONMENT_PATH_FIELDS_BY_ACTION: Record<string, readonly string[]> = {
   create_landscape: ['materialPath', 'path'],
+  resize_landscape: ['landscapePath'],
+  inspect_landscape: ['landscapePath'],
+  delete_landscape: ['landscapePath'],
+  generate_landscape_heightmap: ['landscapePath'],
+  apply_landscape_erosion: ['landscapePath'],
+  sculpt_landscape_region: ['landscapePath'],
+  paint_landscape_by_rule: ['landscapePath', 'layerInfoPath'],
+  create_landscape_material: ['path', 'materialPath'],
+  configure_landscape_layer_blend: ['materialPath'],
+  scatter_landscape_foliage: ['landscapePath'],
+  inspect_generated_foliage: ['landscapePath'],
+  regenerate_generated_foliage: ['landscapePath'],
+  clear_generated_foliage: ['landscapePath'],
   modify_heightmap: ['landscapePath'],
   sculpt: ['landscapePath'],
   sculpt_landscape: ['landscapePath'],
@@ -116,7 +129,7 @@ function normalizeEnvironmentPathArgs(action: string, args: Record<string, unkno
   if (action === 'generate_lods') {
     normalized.assetPaths = normalizePathArray(normalized.assetPaths);
     normalized.assets = normalizePathArray(normalized.assets);
-  } else if (action === 'create_procedural_foliage') {
+  } else if (action === 'create_procedural_foliage' || action === 'scatter_landscape_foliage' || action === 'regenerate_generated_foliage') {
     normalized.foliageTypes = normalizeFoliageTypes(normalized.foliageTypes);
     normalized.types = normalizeFoliageTypes(normalized.types);
   }
@@ -398,6 +411,23 @@ export async function handleEnvironmentTools(action: string, args: HandlerArgs, 
         ...argsRecord,
         action: 'configure_landscape_material'
       }, 'Automation bridge not available for environment building operations')) as Record<string, unknown>;
+    case 'inspect_landscape':
+    case 'delete_landscape':
+    case 'resize_landscape':
+    case 'generate_landscape_heightmap':
+    case 'apply_landscape_erosion':
+    case 'sculpt_landscape_region':
+    case 'paint_landscape_by_rule':
+    case 'create_landscape_material':
+    case 'configure_landscape_layer_blend':
+    case 'scatter_landscape_foliage':
+    case 'inspect_generated_foliage':
+    case 'regenerate_generated_foliage':
+    case 'clear_generated_foliage':
+      return cleanObject(await executeAutomationRequest(tools, 'build_environment', {
+        ...argsRecord,
+        action: envAction
+      }, 'Automation bridge not available for landscape and foliage authoring operations')) as Record<string, unknown>;
     case 'set_time_of_day': {
       const time = getNumber(argsRecord.time) ?? getNumber(argsRecord.hour) ?? getNumber(argsRecord.propertyValue) ?? 12;
       return cleanObject(await executeAutomationRequest(tools, 'build_environment', {

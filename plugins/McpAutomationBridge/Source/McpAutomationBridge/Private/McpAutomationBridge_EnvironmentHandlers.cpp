@@ -2378,6 +2378,31 @@ bool UMcpAutomationBridgeSubsystem::HandleBuildEnvironmentAction(
                                               RequestingSocket);
     }
 
+    // Keep landscape material creation and layer-blend authoring available
+    // from build_environment without duplicating the material graph code.
+    if (LowerSub == TEXT("create_landscape_material") ||
+        LowerSub == TEXT("configure_landscape_layer_blend"))
+    {
+        TSharedPtr<FJsonObject> MaterialPayload = MakeShared<FJsonObject>(*Payload);
+        MaterialPayload->SetStringField(
+            TEXT("subAction"),
+            LowerSub == TEXT("configure_landscape_layer_blend")
+                ? TEXT("configure_layer_blend")
+                : TEXT("create_landscape_material"));
+        return HandleManageMaterialAuthoringAction(
+            RequestId, TEXT("manage_material_authoring"), MaterialPayload,
+            RequestingSocket);
+    }
+
+    // UE 5.8.1 landscape / foliage authoring is deliberately claimed before
+    // legacy aliases below. The handler only accepts its explicit actions, so
+    // no existing route changes behaviour.
+    if (HandleLandscapeFoliageAuthoring(RequestId, LowerSub, Payload,
+                                        RequestingSocket))
+    {
+        return true;
+    }
+
     // =========================================================================
     // Foliage Sub-actions (dispatch to dedicated handlers)
     // =========================================================================
