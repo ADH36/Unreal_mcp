@@ -9,6 +9,7 @@
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
+#include "McpSafeOperations.h"
 
 #if WITH_EDITOR
 #include "Async/Async.h"
@@ -21,7 +22,13 @@
 #include "EngineUtils.h"
 #include "HAL/PlatformTime.h"
 #include "Landscape.h"
+#include "LandscapeComponent.h"
+#include "LandscapeEdit.h"
+#include "LandscapeInfo.h"
+#include "LandscapeLayerInfoObject.h"
 #include "LandscapeProxy.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpressionLandscapeLayerBlend.h"
 #include "Math/NumericLimits.h"
 #include "Math/RandomStream.h"
 #include "ScopedTransaction.h"
@@ -117,6 +124,97 @@ static void McpAddGeneratedFoliageSummary(AActor* Actor, TSharedPtr<FJsonObject>
     Result->SetNumberField(TEXT("maxX"), Bounds.Max.X);
     Result->SetNumberField(TEXT("maxY"), Bounds.Max.Y);
 }
+
+static FString McpExternalOrOwningPackagePath(const UObject* Object)
+{
+    if (!Object) return FString();
+    if (const UPackage* ExternalPackage = Object->GetExternalPackage()) return ExternalPackage->GetName();
+    return Object->GetOutermost() ? Object->GetOutermost()->GetName() : FString();
+}
+
+static bool McpSaveLandscapeActorAndWorld(AActor* Actor, FString& OutError)
+{
+    UWorld* World = Actor ? Actor->GetWorld() : nullptr;
+    if (!Actor || !World || !World->PersistentLevel || !World->GetOutermost()->GetName().StartsWith(TEXT("/Game/"))) {
+        OutError = TEXT("Landscape authoring requires a saved /Game world.");
+        return false;
+    }
+    Actor->MarkPackageDirty();
+    World->PersistentLevel->MarkPackageDirty();
+    if (!McpSafeAssetSave(Actor) || !McpSafeLevelSave(World->PersistentLevel, World->GetOutermost()->GetName())) {
+        OutError = FString::Printf(TEXT("Failed to save actor package %s or owning world %s."),
+            *McpExternalOrOwningPackagePath(Actor), *World->GetOutermost()->GetName());
+        return false;
+    }
+    return true;
+}
+
+static void McpAddLandscapeInspection(ALandscape* Landscape, TSharedPtr<FJsonObject> Result)
+{
+    ULandscapeInfo* LandscapeInfo = Landscape->CreateLandscapeInfo();
+    if (!LandscapeInfo) return;
+    LandscapeInfo->UpdateLayerInfoMap(Landscape);
+
+    Result->SetNumberField(TEXT("componentCount"), Landscape->LandscapeComponents.Num());
+    Result->SetStringField(TEXT("actorPackagePath"), McpExternalOrOwningPackagePath(Landscape));
+    Result->SetStringField(TEXT("externalPackagePath"), McpExternalOrOwningPackagePath(Landscape));
+
+    TArray<TSharedPtr<FJsonValue>> ComponentPaths;
+    for (const ULandscapeComponent* Component : Landscape->LandscapeComponents) {
+        if (Component) ComponentPaths.Add(MakeShared<FJsonValueString>(Component->GetPathName()));
+    }
+    Result->SetArrayField(TEXT("componentPaths"), ComponentPaths);
+
+    TArray<TSharedPtr<FJsonValue>> ProxyPackagePaths;
+    for (TActorIterator<ALandscapeProxy> It(Landscape->GetWorld()); It; ++It) {
+        ALandscapeProxy* Proxy = *It;
+        if (Proxy && Proxy->GetLandscapeGuid() == Landscape->GetLandscapeGuid()) {
+            ProxyPackagePaths.Add(MakeShared<FJsonValueString>(McpExternalOrOwningPackagePath(Proxy)));
+        }
+    }
+    Result->SetArrayField(TEXT("proxyPackagePaths"), ProxyPackagePaths);
+
+    int32 MinX = 0, MinY = 0, MaxX = -1, MaxY = -1;
+    LandscapeInfo->GetLandscapeExtent(MinX, MinY, MaxX, MaxY);
+    const int64 PixelCount = MaxX >= MinX && MaxY >= MinY
+        ? static_cast<int64>(MaxX - MinX + 1) * static_cast<int64>(MaxY - MinY + 1) : 0;
+    TArray<TSharedPtr<FJsonValue>> LayerAssignments;
+    for (const FLandscapeInfoLayerSettings& Settings : LandscapeInfo->Layers) {
+        ULandscapeLayerInfoObject* LayerInfo = Settings.LayerInfoObj;
+        if (!LayerInfo) continue;
+        int32 NonZeroWeightCount = 0;
+        if (PixelCount > 0 && PixelCount <= 16777216) {
+            TArray<uint8> Weights;
+            Weights.SetNumUninitialized(static_cast<int32>(PixelCount));
+            FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo, false);
+            LandscapeEdit.GetWeightData(LayerInfo, MinX, MinY, MaxX, MaxY, Weights.GetData(), MaxX - MinX + 1);
+            for (uint8 Weight : Weights) if (Weight > 0) ++NonZeroWeightCount;
+        }
+        TSharedPtr<FJsonObject> Assignment = McpHandlerUtils::CreateResultObject();
+        Assignment->SetStringField(TEXT("layerName"), Settings.LayerName.ToString());
+        Assignment->SetStringField(TEXT("layerInfoPath"), LayerInfo->GetPathName());
+        Assignment->SetNumberField(TEXT("nonZeroWeightCount"), NonZeroWeightCount);
+        LayerAssignments.Add(MakeShared<FJsonValueObject>(Assignment));
+    }
+    Result->SetArrayField(TEXT("layerAssignments"), LayerAssignments);
+
+    int32 LayerBlendCount = 0;
+    bool bConnectedToBaseColor = false;
+    if (UMaterial* Material = Cast<UMaterial>(Landscape->LandscapeMaterial)) {
+#if WITH_EDITORONLY_DATA
+        for (UMaterialExpression* Expression : MCP_GET_MATERIAL_EXPRESSIONS(Material)) {
+            if (UMaterialExpressionLandscapeLayerBlend* Blend = Cast<UMaterialExpressionLandscapeLayerBlend>(Expression)) {
+                LayerBlendCount += Blend->Layers.Num();
+                if (const FExpressionInput* BaseColor = Material->GetExpressionInputForProperty(MP_BaseColor)) {
+                    bConnectedToBaseColor |= BaseColor->Expression == Blend;
+                }
+            }
+        }
+#endif
+    }
+    Result->SetNumberField(TEXT("layerCount"), LayerBlendCount);
+    Result->SetBoolField(TEXT("layerBlendConnectedToBaseColor"), bConnectedToBaseColor);
+}
 }
 #endif
 
@@ -164,6 +262,7 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
         Result->SetNumberField(TEXT("minY"), Bounds.Min.Y);
         Result->SetNumberField(TEXT("maxX"), Bounds.Max.X);
         Result->SetNumberField(TEXT("maxY"), Bounds.Max.Y);
+        McpAddLandscapeInspection(Landscape, Result);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Landscape inspected."), Result, FString());
         return true;
     }
@@ -403,7 +502,12 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
                 ++TotalAdded;
             }
         }
-        Actor->MarkPackageDirty();
+        FString SaveError;
+        if (!McpSaveLandscapeActorAndWorld(Actor, SaveError))
+        {
+            Subsystem->SendAutomationError(RequestingSocket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+            return;
+        }
         Subsystem->SendProgressUpdate(RequestId, 100.0f, TEXT("Deterministic landscape foliage scatter completed."), false);
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetBoolField(TEXT("success"), true);
@@ -414,6 +518,7 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
         Result->SetNumberField(TEXT("instancesRejected"), TotalRejected);
         Result->SetNumberField(TEXT("excludedAreaViolations"), 0);
         Result->SetNumberField(TEXT("durationMs"), (FPlatformTime::Seconds() - StartSeconds) * 1000.0);
+        Result->SetStringField(TEXT("externalPackagePath"), McpExternalOrOwningPackagePath(Actor));
         McpAddGeneratedFoliageSummary(Actor, Result);
         Subsystem->SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Deterministic HISM foliage scattered on landscape."), Result, FString());
     });

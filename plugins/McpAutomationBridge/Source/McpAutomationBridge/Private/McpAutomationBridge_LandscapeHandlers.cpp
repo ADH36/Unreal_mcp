@@ -113,6 +113,7 @@
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
 #include "McpLandscapeMetadataTags.h"
+#include "McpSafeOperations.h"
 #include "ScopedTransaction.h"
 
 // =============================================================================
@@ -125,6 +126,7 @@
 // -----------------------------------------------------------------------------
 #include "Async/Async.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "Misc/ScopedSlowTask.h"
 
 // -----------------------------------------------------------------------------
@@ -138,6 +140,7 @@
 #include "LandscapeEditorUtils.h"
 #include "LandscapeGrassType.h"
 #include "LandscapeInfo.h"
+#include "LandscapeLayerInfoObject.h"
 #include "LandscapeProxy.h"
 #include "LandscapeStreamingProxy.h"
 
@@ -165,6 +168,70 @@
 // Logging Category
 // =============================================================================
 DEFINE_LOG_CATEGORY_STATIC(LogMcpLandscapeHandlers, Log, All);
+
+#if WITH_EDITOR
+namespace
+{
+static FString McpLandscapePackagePath(const UObject* Object)
+{
+  if (!Object) return FString();
+  if (const UPackage* ExternalPackage = Object->GetExternalPackage()) {
+    return ExternalPackage->GetName();
+  }
+  return Object->GetOutermost() ? Object->GetOutermost()->GetName() : FString();
+}
+
+static bool McpSaveLandscapePersistence(UWorld* World, ALandscape* Landscape, FString& OutError)
+{
+  if (!World || !World->PersistentLevel || !Landscape) {
+    OutError = TEXT("Landscape world is unavailable for saving.");
+    return false;
+  }
+
+  const FString WorldPackagePath = World->GetOutermost()->GetName();
+  if (!WorldPackagePath.StartsWith(TEXT("/Game/"))) {
+    OutError = TEXT("Landscape creation requires a saved /Game map so actor packages can persist.");
+    return false;
+  }
+
+  Landscape->MarkPackageDirty();
+  World->PersistentLevel->MarkPackageDirty();
+  const bool bActorSaved = McpSafeAssetSave(Landscape);
+  const bool bWorldSaved = McpSafeLevelSave(World->PersistentLevel, WorldPackagePath);
+  if (!bActorSaved || !bWorldSaved) {
+    OutError = FString::Printf(TEXT("Failed to save landscape actor package (%s) or map package (%s)."),
+      *McpLandscapePackagePath(Landscape), *WorldPackagePath);
+    return false;
+  }
+  return true;
+}
+
+static void McpAddLandscapePackageDetails(ALandscape* Landscape, TSharedPtr<FJsonObject> Result)
+{
+  Result->SetStringField(TEXT("actorPath"), Landscape->GetPathName());
+  Result->SetStringField(TEXT("actorPackagePath"), McpLandscapePackagePath(Landscape));
+  Result->SetStringField(TEXT("externalPackagePath"), McpLandscapePackagePath(Landscape));
+  Result->SetNumberField(TEXT("componentCount"), Landscape->LandscapeComponents.Num());
+
+  TArray<TSharedPtr<FJsonValue>> ComponentPaths;
+  for (const ULandscapeComponent* Component : Landscape->LandscapeComponents) {
+    if (Component) ComponentPaths.Add(MakeShared<FJsonValueString>(Component->GetPathName()));
+  }
+  Result->SetArrayField(TEXT("componentPaths"), ComponentPaths);
+
+  TArray<TSharedPtr<FJsonValue>> ProxyPaths;
+  if (UWorld* World = Landscape->GetWorld()) {
+    for (TActorIterator<ALandscapeProxy> It(World); It; ++It) {
+      ALandscapeProxy* Proxy = *It;
+      if (Proxy && Proxy->GetLandscapeGuid() == Landscape->GetLandscapeGuid()) {
+        ProxyPaths.Add(MakeShared<FJsonValueString>(McpLandscapePackagePath(Proxy)));
+      }
+    }
+  }
+  Result->SetArrayField(TEXT("proxyPackagePaths"), ProxyPaths);
+}
+}
+#endif
 
 // =============================================================================
 // Section A: Landscape Dispatch
@@ -352,6 +419,12 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
                         TEXT("EDITOR_NOT_AVAILABLE"));
     return true;
   }
+  if (!GEditor->GetEditorWorldContext().World()->GetOutermost()->GetName().StartsWith(TEXT("/Game/"))) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("create_landscape requires a saved /Game map. Create or load the destination map before creating the landscape."),
+                        TEXT("MAP_NOT_SAVED"));
+    return true;
+  }
 
   FString NameOverride;
   if (!Payload->TryGetStringField(TEXT("name"), NameOverride) ||
@@ -418,6 +491,7 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
     FActorSpawnParameters SpawnParams;
     SpawnParams.SpawnCollisionHandlingOverride =
         ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    SpawnParams.ObjectFlags |= RF_Transactional;
     ALandscape *Landscape =
         World->SpawnActor<ALandscape>(ALandscape::StaticClass(), CaptLocation,
                                       FRotator::ZeroRotator, SpawnParams);
@@ -434,14 +508,14 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
       Landscape->SetActorLabel(FString::Printf(
           TEXT("Landscape_%dx%d"), CaptComponentsX, CaptComponentsY));
     }
-    Landscape->ComponentSizeQuads = CaptQuadsPerComponent;
-    Landscape->SubsectionSizeQuads =
-        CaptQuadsPerComponent / CaptSectionsPerComponent;
+    const int32 QuadsPerComponent = CaptSectionsPerComponent * CaptQuadsPerComponent;
+    Landscape->ComponentSizeQuads = QuadsPerComponent;
+    Landscape->SubsectionSizeQuads = CaptQuadsPerComponent;
     Landscape->NumSubsections = CaptSectionsPerComponent;
     // Keep authoring metadata on the actor so generic actor bounds can still
     // report a useful footprint when UE has not generated landscape components.
     McpLandscapeMetadataTags::EncodeLandscapeMetadata(
-        Landscape, CaptComponentsX, CaptComponentsY, CaptQuadsPerComponent);
+        Landscape, CaptComponentsX, CaptComponentsY, QuadsPerComponent);
 
     if (!CaptMaterialPath.IsEmpty()) {
       UMaterialInterface *Mat =
@@ -451,127 +525,39 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
       }
     }
 
-    // CRITICAL INITIALIZATION ORDER:
-    // 1. Set Landscape GUID first. CreateLandscapeInfo depends on this.
-    if (!Landscape->GetLandscapeGuid().IsValid()) {
-      Landscape->SetLandscapeGuid(FGuid::NewGuid());
-    }
-
-    // 2. Create Landscape Info. This will register itself with the Landscape's
-    // GUID.
-    Landscape->CreateLandscapeInfo();
-
-    const int32 VertX = CaptComponentsX * CaptQuadsPerComponent + 1;
-    const int32 VertY = CaptComponentsY * CaptQuadsPerComponent + 1;
+    const int32 VertX = CaptComponentsX * QuadsPerComponent + 1;
+    const int32 VertY = CaptComponentsY * QuadsPerComponent + 1;
 
     TArray<uint16> HeightArray;
     HeightArray.Init(32768, VertX * VertY);
 
     const int32 InMinX = 0;
     const int32 InMinY = 0;
-    const int32 InMaxX = CaptComponentsX * CaptQuadsPerComponent;
-    const int32 InMaxY = CaptComponentsY * CaptQuadsPerComponent;
-    const int32 NumSubsections = CaptSectionsPerComponent;
-    const int32 SubsectionSizeQuads =
-        CaptQuadsPerComponent / FMath::Max(1, CaptSectionsPerComponent);
-
-    // 3. Use a valid GUID for Import call, but zero GUID for map keys.
-    // Analysis of Landscape.cpp shows:
-    // - Import() asserts InGuid.IsValid()
-    // - BUT Import() uses FGuid() (zero) to look up data in the maps:
-    // InImportHeightData.FindChecked(FinalLayerGuid) where FinalLayerGuid is
-    // default constructed.
-    const FGuid ImportGuid =
-        FGuid::NewGuid(); // Valid GUID for the function call
-    const FGuid DataKey;  // Zero GUID for the map keys
-
-    // 3. Populate maps with FGuid() keys because ALandscape::Import uses
-    // default GUID to look up data regardless of the GUID passed to the
-    // function (which is used for the layer definition itself).
+    // ALandscape::Import is the UE 5.8 editor creation path. It creates and
+    // registers the component/proxy structure; writing height data to a bare
+    // spawned actor leaves no serializable landscape components.
     TMap<FGuid, TArray<uint16>> ImportHeightData;
     ImportHeightData.Add(FGuid(), HeightArray);
 
     TMap<FGuid, TArray<FLandscapeImportLayerInfo>> ImportLayerInfos;
     ImportLayerInfos.Add(FGuid(), TArray<FLandscapeImportLayerInfo>());
 
-    TArray<FLandscapeLayer> EditLayers;
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Create MCP Landscape")));
+    Landscape->Modify();
+    Landscape->Import(FGuid::NewGuid(), InMinX, InMinY, VertX - 1, VertY - 1,
+        CaptSectionsPerComponent, CaptQuadsPerComponent, ImportHeightData, nullptr,
+        ImportLayerInfos, ELandscapeImportAlphamapType::Additive,
+        TArrayView<const FLandscapeLayer>());
 
-    // Use a transaction to ensure undo/redo and proper notification
-    {
-      const FScopedTransaction Transaction(
-          FText::FromString(TEXT("Create Landscape")));
-      Landscape->Modify();
-
-      // -----------------------------------------------------------------------
-      // Version-specific landscape initialization
-      // -----------------------------------------------------------------------
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
-      // UE 5.7+: The Import() function has a known issue with fresh landscapes.
-      // Use CreateDefaultLayer instead to initialize a valid landscape
-      // structure. Note: bCanHaveLayersContent is deprecated/removed in 5.7 as
-      // all landscapes use edit layers.
-
-      // Create default edit layer to enable modification
-      if (Landscape->GetLayersConst().Num() == 0) {
-        Landscape->CreateDefaultLayer();
-      }
-
-      // Explicitly request layer initialization to ensure components are ready
-      // Landscape->RequestLayersInitialization(true, true); // Removed to
-      // prevent crash: LandscapeEditLayers.cpp confirms this resets init state
-      // which is unstable here
-
-      // UE 5.7 Safe Height Application:
-      // Instead of using Import() which crashes, we apply height data via
-      // FLandscapeEditDataInterface after landscape creation. This bypasses
-      // the problematic Import codepath while still allowing heightmap data.
-      ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-      if (LandscapeInfo && HeightArray.Num() > 0) {
-        // Register components first to ensure landscape is fully initialized
-        if (Landscape->GetRootComponent() &&
-            !Landscape->GetRootComponent()->IsRegistered()) {
-          Landscape->RegisterAllComponents();
-        }
-
-        // Use FLandscapeEditDataInterface for safe height modification
-        FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo);
-        LandscapeEdit.SetHeightData(
-            InMinX, InMinY,  // Min X, Y
-            InMaxX, InMaxY,  // Max X, Y
-            HeightArray.GetData(),
-            0,     // Stride (0 = use default)
-            true   // Calc normals
-        );
-		LandscapeEdit.Flush();
-	}
-
-#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
-      // UE 5.5-5.6: Use FLandscapeEditDataInterface to avoid deprecated Import() warning
-      ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-      if (LandscapeInfo && HeightArray.Num() > 0) {
-        if (Landscape->GetRootComponent() &&
-            !Landscape->GetRootComponent()->IsRegistered()) {
-          Landscape->RegisterAllComponents();
-        }
-        FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo);
-        LandscapeEdit.SetHeightData(
-            InMinX, InMinY,
-            InMaxX, InMaxY,
-            HeightArray.GetData(),
-            0,
-            true
-        );
-        LandscapeEdit.Flush();
-      }
-      Landscape->CreateDefaultLayer();
-#else
-      // UE 5.0-5.4: Use standard Import() workflow
-      PRAGMA_DISABLE_DEPRECATION_WARNINGS
-      Landscape->Import(FGuid::NewGuid(), 0, 0, CaptComponentsX - 1, CaptComponentsY - 1, CaptSectionsPerComponent, CaptQuadsPerComponent, ImportHeightData, nullptr, ImportLayerInfos, ELandscapeImportAlphamapType::Layered, EditLayers.Num() > 0 ? &EditLayers : nullptr);
-      PRAGMA_ENABLE_DEPRECATION_WARNINGS
-      Landscape->CreateDefaultLayer();
-#endif
+    ULandscapeInfo* LandscapeInfo = Landscape->CreateLandscapeInfo();
+    if (!LandscapeInfo || Landscape->LandscapeComponents.Num() == 0) {
+      World->DestroyActor(Landscape, true);
+      Subsystem->SendAutomationError(RequestingSocket, RequestId,
+          TEXT("Landscape import did not create registered landscape components."),
+          TEXT("LANDSCAPE_IMPORT_FAILED"));
+      return;
     }
+    LandscapeInfo->UpdateLayerInfoMap(Landscape);
 
     // Initialize properties AFTER import to avoid conflicts during component
     // creation
@@ -604,16 +590,23 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
       Landscape->PostEditChange();
     }
 
+    FString SaveError;
+    if (!McpSaveLandscapePersistence(World, Landscape, SaveError)) {
+      Subsystem->SendAutomationError(RequestingSocket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+      return;
+    }
+
     TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPackage()->GetPathName());
+    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPathName());
     Resp->SetStringField(TEXT("actorLabel"), Landscape->GetActorLabel());
     Resp->SetStringField(TEXT("landscapeName"), Landscape->GetActorLabel());
     Resp->SetNumberField(TEXT("componentsX"), CaptComponentsX);
     Resp->SetNumberField(TEXT("componentsY"), CaptComponentsY);
-    Resp->SetNumberField(TEXT("quadsPerComponent"), CaptQuadsPerComponent);
-    Resp->SetNumberField(TEXT("extentX"), CaptComponentsX * CaptQuadsPerComponent * Landscape->GetActorScale3D().X * 0.5);
-    Resp->SetNumberField(TEXT("extentY"), CaptComponentsY * CaptQuadsPerComponent * Landscape->GetActorScale3D().Y * 0.5);
+    Resp->SetNumberField(TEXT("quadsPerComponent"), QuadsPerComponent);
+    Resp->SetNumberField(TEXT("extentX"), CaptComponentsX * QuadsPerComponent * Landscape->GetActorScale3D().X * 0.5);
+    Resp->SetNumberField(TEXT("extentY"), CaptComponentsY * QuadsPerComponent * Landscape->GetActorScale3D().Y * 0.5);
+    McpAddLandscapePackageDetails(Landscape, Resp);
 
     Subsystem->SendAutomationResponse(RequestingSocket, RequestId, true,
                                       TEXT("Landscape created successfully"),
@@ -1397,6 +1390,15 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
                         TEXT("INVALID_ARGUMENT"));
     return true;
   }
+  FString LayerInfoPath;
+  Payload->TryGetStringField(TEXT("layerInfoPath"), LayerInfoPath);
+  if (!LayerInfoPath.IsEmpty()) {
+    LayerInfoPath = SanitizeProjectRelativePath(LayerInfoPath);
+    if (LayerInfoPath.IsEmpty()) {
+      SendAutomationError(RequestingSocket, RequestId, TEXT("Invalid layerInfoPath."), TEXT("SECURITY_VIOLATION"));
+      return true;
+    }
+  }
 
   // Paint region (optional - if not specified, paint entire landscape)
   int32 MinX = -1, MinY = -1, MaxX = -1, MaxY = -1;
@@ -1425,7 +1427,7 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
 
   AsyncTask(ENamedThreads::GameThread, [WeakSubsystem, RequestId,
                                         RequestingSocket, LandscapePath,
-                                        LandscapeName, LayerName, MinX, MinY,
+                                        LandscapeName, LayerName, LayerInfoPath, MinX, MinY,
                                         MaxX, MaxY, Strength, bSkipFlush]() {
     UMcpAutomationBridgeSubsystem *Subsystem = WeakSubsystem.Get();
     if (!Subsystem)
@@ -1504,42 +1506,63 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
       }
     }
 
-    // Auto-create layer if it doesn't exist (matches UE Landscape Editor behavior)
-	if (!LayerInfo) {
-
-      // Create a new layer info object
-      ULandscapeLayerInfoObject* NewLayerInfo = NewObject<ULandscapeLayerInfoObject>(
-          Landscape, FName(*FString::Printf(TEXT("LayerInfo_%s"), *LayerName)),
-          RF_Public | RF_Transactional);
-
-      if (NewLayerInfo) {
-        // -----------------------------------------------------------------------
-        // Version-specific layer name assignment
-        // -----------------------------------------------------------------------
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
-        // UE 5.7+: LayerName property deprecated, use SetLayerName()
-        NewLayerInfo->SetLayerName(FName(*LayerName), true);
-#else
-        // UE 5.0-5.6: Direct property assignment
-        PRAGMA_DISABLE_DEPRECATION_WARNINGS
-        NewLayerInfo->LayerName = FName(*LayerName);
-        PRAGMA_ENABLE_DEPRECATION_WARNINGS
-#endif
-
-        // Add to landscape info layers
-        FLandscapeInfoLayerSettings NewLayerSettings(NewLayerInfo, Landscape);
-        LandscapeInfo->Layers.Add(NewLayerSettings);
-
-		LayerInfo = NewLayerInfo;
-	} else {
-        Subsystem->SendAutomationError(
-            RequestingSocket, RequestId,
-            FString::Printf(TEXT("Failed to create layer '%s'"),
-                            *LayerName),
-            TEXT("LAYER_CREATION_FAILED"));
+    if (!LayerInfo && !LayerInfoPath.IsEmpty()) {
+      LayerInfo = LoadObject<ULandscapeLayerInfoObject>(nullptr, *LayerInfoPath);
+      if (!LayerInfo) {
+        Subsystem->SendAutomationError(RequestingSocket, RequestId,
+          FString::Printf(TEXT("Landscape Layer Info asset not found: %s"), *LayerInfoPath),
+          TEXT("ASSET_NOT_FOUND"));
+        return;
+      }
+      if (LayerInfo->GetLayerName() != FName(*LayerName)) {
+        Subsystem->SendAutomationError(RequestingSocket, RequestId,
+          TEXT("layerInfoPath does not match layerName."), TEXT("INVALID_ARGUMENT"));
         return;
       }
     }
+
+    if (!LayerInfo) {
+      const FString NewLayerPackagePath = FPackageName::GetLongPackagePath(
+          Landscape->GetWorld()->GetOutermost()->GetName()) /
+          FString::Printf(TEXT("%s_LayerInfo"), *LayerName);
+      UPackage* NewLayerPackage = CreatePackage(*NewLayerPackagePath);
+      ULandscapeLayerInfoObject* NewLayerInfo = NewObject<ULandscapeLayerInfoObject>(
+          NewLayerPackage, FName(*FString::Printf(TEXT("%s_LayerInfo"), *LayerName)),
+          RF_Public | RF_Standalone | RF_Transactional);
+      if (!NewLayerInfo) {
+        Subsystem->SendAutomationError(RequestingSocket, RequestId,
+          FString::Printf(TEXT("Failed to create layer '%s'"), *LayerName),
+          TEXT("LAYER_CREATION_FAILED"));
+        return;
+      }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+      NewLayerInfo->SetLayerName(FName(*LayerName), true);
+#else
+      PRAGMA_DISABLE_DEPRECATION_WARNINGS
+      NewLayerInfo->LayerName = FName(*LayerName);
+      PRAGMA_ENABLE_DEPRECATION_WARNINGS
+#endif
+      NewLayerInfo->MarkPackageDirty();
+      if (!McpSafeAssetSave(NewLayerInfo)) {
+        Subsystem->SendAutomationError(RequestingSocket, RequestId,
+          TEXT("Auto-created Landscape Layer Info package could not be saved."), TEXT("SAVE_FAILED"));
+        return;
+      }
+      LayerInfo = NewLayerInfo;
+    }
+
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Paint MCP Landscape Layer")));
+    Landscape->Modify();
+    if (!Landscape->HasTargetLayer(FName(*LayerName))) {
+      Landscape->AddTargetLayer(FName(*LayerName), FLandscapeTargetLayerSettings(LayerInfo));
+    }
+    LandscapeInfo->UpdateLayerInfoMap(Landscape);
+    const int32 LayerInfoIndex = LandscapeInfo->GetLayerInfoIndex(FName(*LayerName));
+    if (LayerInfoIndex == INDEX_NONE) {
+      Subsystem->SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to register landscape target layer."), TEXT("LAYER_REGISTRATION_FAILED"));
+      return;
+    }
+    LandscapeInfo->Layers[LayerInfoIndex].LayerInfoObj = LayerInfo;
 
     // Note: Do NOT call MakeDialog() - it blocks indefinitely in headless environments
     FScopedSlowTask SlowTask(
@@ -1598,16 +1621,30 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
       LandscapeEdit.Flush();
     }
 
-    // Use MarkPackageDirty instead of PostEditChange to avoid full landscape rebuild
-    // PostEditChange triggers collision rebuild, shader recompilation, and nav mesh update
-    Landscape->MarkPackageDirty();
+    TArray<uint8> SavedAlphaData;
+    SavedAlphaData.SetNumUninitialized(RegionSizeX * RegionSizeY);
+    LandscapeEdit.GetWeightData(LayerInfo, PaintMinX, PaintMinY, PaintMaxX, PaintMaxY,
+        SavedAlphaData.GetData(), RegionSizeX);
+    int32 NonZeroWeightCount = 0;
+    for (uint8 Weight : SavedAlphaData) {
+      if (Weight > 0) ++NonZeroWeightCount;
+    }
+
+    FString SaveError;
+    if (!McpSaveLandscapePersistence(Landscape->GetWorld(), Landscape, SaveError)) {
+      Subsystem->SendAutomationError(RequestingSocket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+      return;
+    }
 
     TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPackage()->GetPathName());
+    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPathName());
     Resp->SetStringField(TEXT("landscapeName"), Landscape->GetActorLabel());
     Resp->SetStringField(TEXT("layerName"), LayerName);
     Resp->SetNumberField(TEXT("strength"), Strength);
+    Resp->SetStringField(TEXT("layerInfoPath"), LayerInfo->GetPathName());
+    Resp->SetNumberField(TEXT("nonZeroWeightCount"), NonZeroWeightCount);
+    McpAddLandscapePackageDetails(Landscape, Resp);
 
     Subsystem->SendAutomationResponse(RequestingSocket, RequestId, true,
                                       TEXT("Layer painted successfully"), Resp,
@@ -1767,14 +1804,23 @@ bool UMcpAutomationBridgeSubsystem::HandleSetLandscapeMaterial(
       return;
     }
 
+    const FScopedTransaction Transaction(FText::FromString(TEXT("Set MCP Landscape Material")));
+    Landscape->Modify();
     Landscape->LandscapeMaterial = Mat;
     Landscape->PostEditChange();
 
+    FString SaveError;
+    if (!McpSaveLandscapePersistence(Landscape->GetWorld(), Landscape, SaveError)) {
+      Subsystem->SendAutomationError(RequestingSocket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+      return;
+    }
+
     TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPackage()->GetPathName());
+    Resp->SetStringField(TEXT("landscapePath"), Landscape->GetPathName());
     Resp->SetStringField(TEXT("landscapeName"), Landscape->GetActorLabel());
     Resp->SetStringField(TEXT("materialPath"), MaterialPath);
+    McpAddLandscapePackageDetails(Landscape, Resp);
 
     Subsystem->SendAutomationResponse(RequestingSocket, RequestId, true,
                                       TEXT("Landscape material set"), Resp,

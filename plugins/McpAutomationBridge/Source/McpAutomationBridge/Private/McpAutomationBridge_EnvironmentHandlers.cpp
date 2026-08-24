@@ -1148,7 +1148,12 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
     FAssetRegistryModule::AssetCreated(LayerInfo);
     LayerInfo->MarkPackageDirty();
-    McpSafeAssetSave(LayerInfo);
+    if (!McpSafeAssetSave(LayerInfo))
+    {
+        OutMessage = FString::Printf(TEXT("Failed to save landscape layer info package: %s"), *LayerInfo->GetPathName());
+        OutErrorCode = TEXT("SAVE_FAILED");
+        return false;
+    }
 
     Resp->SetStringField(TEXT("layerName"), LayerName);
     Resp->SetStringField(TEXT("assetPath"), LayerInfo->GetPathName());

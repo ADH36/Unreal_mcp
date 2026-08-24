@@ -8,7 +8,7 @@ import { TestRunner } from '../../test-runner.mjs';
 
 const suffix = Date.now();
 const folder = `/Game/MCPTest/UE581Landscape_${suffix}`;
-const levelPath = `${folder}_Level`;
+const levelPath = `${folder}/L_UE581Landscape_${suffix}`;
 const landscape = `MCP_UE581_Landscape_${suffix}`;
 const foliageName = `MCP_UE581_Foliage_${suffix}`;
 const materialName = `MCP_UE581_LandscapeMaterial_${suffix}`;
@@ -35,8 +35,12 @@ function ensureSuccess(response, label) {
 
 const runner = new TestRunner('UE 5.8.1 landscape and foliage authoring');
 
-runner.addStep('create a temporary landscape and shape hills, valley, and flat building area', async (tools) => {
+runner.addStep('create a World Partition map before creating a temporary landscape', async (tools) => {
   ensureSuccess(await tools.executeTool('manage_asset', { action: 'create_folder', path: folder }), 'create test folder');
+  ensureSuccess(await tools.executeTool('manage_level', {
+    action: 'create_level', levelName: `L_UE581Landscape_${suffix}`, levelPath: folder,
+    template: '/Engine/Maps/Templates/OpenWorld', useWorldPartition: true, saveDirtyPackages: true
+  }), 'create World Partition test map');
   ensureSuccess(await tools.executeTool('build_environment', {
     action: 'create_landscape', name: landscape, location: { x: 0, y: 0, z: 0 },
     quadsPerSection: 31, sectionsPerComponent: 1, componentCount: { x: 2, y: 2 }
@@ -49,25 +53,30 @@ runner.addStep('create a temporary landscape and shape hills, valley, and flat b
   return true;
 });
 
-runner.addStep('create layer infos, paint grass/dirt/rock, and apply a landscape material', async (tools) => {
+runner.addStep('create layer infos, apply a real layer-blend material, and paint grass/dirt/rock', async (tools) => {
+  ensureSuccess(await tools.executeTool('build_environment', {
+    action: 'create_landscape_material', name: materialName, path: folder, save: true
+  }), 'create landscape material');
+  const blend = ensureSuccess(await tools.executeTool('build_environment', {
+    action: 'configure_landscape_layer_blend', materialPath,
+    layers: layers.map((layerName) => ({ layerName, blendType: 'LB_WeightBlend' }))
+  }), 'configure layer blend');
+  if (blend.layerCount !== 3 || blend.connectedToBaseColor !== true) {
+    throw new Error(`layer blend was not created from material expressions: ${JSON.stringify(blend)}`);
+  }
+  ensureSuccess(await tools.executeTool('build_environment', {
+    action: 'set_landscape_material', landscapeName: landscape, materialPath
+  }), 'apply landscape material');
   for (const layerName of layers) {
+    const layerInfoPath = `${folder}/${layerName}_${suffix}`;
     ensureSuccess(await tools.executeTool('build_environment', {
       action: 'create_landscape_layer_info', name: `${layerName}_${suffix}`, path: folder, layerName
     }), `create ${layerName} layer info`);
     ensureSuccess(await tools.executeTool('build_environment', {
-      action: 'paint_landscape_layer', landscapeName: landscape, layerName,
+      action: 'paint_landscape_layer', landscapeName: landscape, layerName, layerInfoPath,
       region: { minX: 0, minY: 0, maxX: 62, maxY: 62 }, strength: layerName === 'Grass' ? 1 : 0.35
     }), `paint ${layerName}`);
   }
-  ensureSuccess(await tools.executeTool('build_environment', {
-    action: 'create_landscape_material', name: materialName, path: folder, save: true
-  }), 'create landscape material');
-  ensureSuccess(await tools.executeTool('build_environment', {
-    action: 'configure_landscape_layer_blend', materialPath, layers: layers.map((layerName) => ({ layerName, blendType: 'LB_WeightBlend' }))
-  }), 'configure layer blend');
-  ensureSuccess(await tools.executeTool('build_environment', {
-    action: 'set_landscape_material', landscapeName: landscape, materialPath
-  }), 'apply landscape material');
   return true;
 });
 
@@ -87,10 +96,12 @@ runner.addStep('scatter deterministic HISM foliage with road and building exclus
 });
 
 runner.addStep('save, reload, and verify material, landscape, and generated instance persistence', async (tools) => {
-  ensureSuccess(await tools.executeTool('manage_level_structure', { action: 'save_level_as', savePath: levelPath }), 'save level');
-  ensureSuccess(await tools.executeTool('manage_level_structure', { action: 'load_level', levelPath }), 'reload level');
+  ensureSuccess(await tools.executeTool('manage_level', { action: 'save' }), 'save level');
+  ensureSuccess(await tools.executeTool('manage_level', { action: 'load_level', levelPath, saveDirtyPackages: true }), 'reload level');
   const landscapeResult = ensureSuccess(await tools.executeTool('build_environment', { action: 'inspect_landscape', landscapeName: landscape }), 'inspect reloaded landscape');
   if (landscapeResult.materialPath !== `${materialPath}.${materialName}`) throw new Error(`material was not retained: ${JSON.stringify(landscapeResult)}`);
+  if (landscapeResult.componentCount <= 0 || landscapeResult.layerCount !== 3) throw new Error(`landscape components or material layers were not retained: ${JSON.stringify(landscapeResult)}`);
+  if ((landscapeResult.layerAssignments ?? []).filter((layer) => layer.nonZeroWeightCount > 0).length !== 3) throw new Error(`painted layer data was not retained: ${JSON.stringify(landscapeResult)}`);
   const foliageResult = ensureSuccess(await tools.executeTool('build_environment', { action: 'inspect_generated_foliage', foliageName }), 'inspect reloaded foliage');
   if (foliageResult.instanceCount < 3) throw new Error(`foliage was not retained: ${JSON.stringify(foliageResult)}`);
   return true;

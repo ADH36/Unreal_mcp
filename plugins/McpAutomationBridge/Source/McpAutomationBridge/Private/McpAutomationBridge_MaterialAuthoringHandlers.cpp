@@ -137,6 +137,7 @@
 // Landscape (UE 5.0+)
 #if ENGINE_MAJOR_VERSION >= 5
 #include "LandscapeLayerInfoObject.h"
+#include "Materials/MaterialExpressionLandscapeLayerBlend.h"
 #define MCP_HAS_LANDSCAPE_LAYER 1
 #else
 #define MCP_HAS_LANDSCAPE_LAYER 0
@@ -2758,7 +2759,8 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
   }
 
   if (SubAction == TEXT("configure_layer_blend")) {
-    // Configure layer blend by adding layer weight parameters and blend setup
+    // Configure a real LandscapeLayerBlend expression. Scalar parameters are
+    // not landscape paint targets and do not survive target-layer discovery.
     FString AssetPath;
     // Accept both assetPath and materialPath as parameter names
     if (Payload->TryGetStringField(TEXT("assetPath"), AssetPath) && !AssetPath.IsEmpty()) {
@@ -2797,43 +2799,80 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
       return true;
     }
 
-    TArray<FString> CreatedNodeIds;
     int32 BaseX = 0, BaseY = 0;
     Payload->TryGetNumberField(TEXT("x"), BaseX);
     Payload->TryGetNumberField(TEXT("y"), BaseY);
 
-    // For each layer, create a scalar parameter for layer weight
+    Material->Modify();
+    UMaterialExpressionLandscapeLayerBlend* LayerBlend = nullptr;
+#if WITH_EDITORONLY_DATA
+    for (UMaterialExpression* Expression : MCP_GET_MATERIAL_EXPRESSIONS(Material)) {
+      if (UMaterialExpressionLandscapeLayerBlend* Existing = Cast<UMaterialExpressionLandscapeLayerBlend>(Expression)) {
+        LayerBlend = Existing;
+        break;
+      }
+    }
+#endif
+    if (!LayerBlend) {
+      LayerBlend = NewObject<UMaterialExpressionLandscapeLayerBlend>(
+          Material, UMaterialExpressionLandscapeLayerBlend::StaticClass(), NAME_None,
+          RF_Transactional);
+      if (!LayerBlend) {
+        SendAutomationError(Socket, RequestId, TEXT("Failed to create LandscapeLayerBlend expression."), TEXT("CREATION_ERROR"));
+        return true;
+      }
+#if WITH_EDITORONLY_DATA
+      MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(LayerBlend);
+#endif
+    }
+
+    LayerBlend->Modify();
+    LayerBlend->MaterialExpressionEditorX = BaseX;
+    LayerBlend->MaterialExpressionEditorY = BaseY;
+    LayerBlend->Layers.Reset();
+
+    static const FVector PreviewColors[] = {
+      FVector(0.08f, 0.45f, 0.10f), FVector(0.32f, 0.16f, 0.05f),
+      FVector(0.28f, 0.28f, 0.28f), FVector(0.55f, 0.50f, 0.35f)
+    };
     for (int32 i = 0; i < LayersArray->Num(); ++i) {
-      const TSharedPtr<FJsonObject> *LayerObj;
-      if (!(*LayersArray)[i]->TryGetObject(LayerObj)) {
-        continue;
+      const TSharedPtr<FJsonObject>* LayerObj = nullptr;
+      if (!(*LayersArray)[i].IsValid() || !(*LayersArray)[i]->TryGetObject(LayerObj) || !LayerObj || !LayerObj->IsValid()) {
+        SendAutomationError(Socket, RequestId, TEXT("Every layer entry must be an object."), TEXT("INVALID_ARGUMENT"));
+        return true;
       }
 
       FString LayerName;
-      if (!(*LayerObj)->TryGetStringField(TEXT("name"), LayerName) ||
-          LayerName.IsEmpty()) {
-        continue;
+      if (!(*LayerObj)->TryGetStringField(TEXT("layerName"), LayerName) || LayerName.IsEmpty()) {
+        (*LayerObj)->TryGetStringField(TEXT("name"), LayerName);
+      }
+      if (LayerName.IsEmpty()) {
+        SendAutomationError(Socket, RequestId, TEXT("Every layer entry requires layerName or name."), TEXT("INVALID_ARGUMENT"));
+        return true;
       }
 
       FString BlendType;
       (*LayerObj)->TryGetStringField(TEXT("blendType"), BlendType);
+      FLayerBlendInput& Layer = LayerBlend->Layers.AddDefaulted_GetRef();
+      Layer.LayerName = FName(*LayerName);
+      Layer.BlendType = BlendType.Equals(TEXT("LB_AlphaBlend"), ESearchCase::IgnoreCase)
+          ? LB_AlphaBlend
+          : (BlendType.Equals(TEXT("LB_HeightBlend"), ESearchCase::IgnoreCase) ? LB_HeightBlend : LB_WeightBlend);
+      Layer.PreviewWeight = i == 0 ? 1.0f : 0.0f;
+      Layer.ConstLayerInput = PreviewColors[i % UE_ARRAY_COUNT(PreviewColors)];
+    }
 
-      // Create scalar parameter for layer weight
-      UMaterialExpressionScalarParameter *WeightParam =
-          NewObject<UMaterialExpressionScalarParameter>(
-              Material, UMaterialExpressionScalarParameter::StaticClass(),
-              NAME_None, RF_Transactional);
-
-      WeightParam->ParameterName = FName(*LayerName);
-      WeightParam->DefaultValue = (i == 0) ? 1.0f : 0.0f; // First layer enabled by default
-      WeightParam->MaterialExpressionEditorX = BaseX;
-      WeightParam->MaterialExpressionEditorY = BaseY + (i * 150);
-
-#if WITH_EDITORONLY_DATA
-      MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(WeightParam);
-#endif
-
-      CreatedNodeIds.Add(MCP_NODE_ID(WeightParam));
+    if (FExpressionInput* BaseColor = Material->GetExpressionInputForProperty(MP_BaseColor)) {
+      BaseColor->Expression = LayerBlend;
+      BaseColor->OutputIndex = 0;
+      BaseColor->Mask = 0;
+      BaseColor->MaskR = 0;
+      BaseColor->MaskG = 0;
+      BaseColor->MaskB = 0;
+      BaseColor->MaskA = 0;
+    } else {
+      SendAutomationError(Socket, RequestId, TEXT("Material does not expose a Base Color input."), TEXT("MATERIAL_CONNECTION_FAILED"));
+      return true;
     }
 
     Material->PostEditChange();
@@ -2842,23 +2881,25 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
     // Save if requested
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
-    if (bSave) {
-      SaveMaterialAsset(Material);
+    if (bSave && !SaveMaterialAsset(Material)) {
+      SendAutomationError(Socket, RequestId, TEXT("Landscape layer-blend material package could not be saved."), TEXT("SAVE_FAILED"));
+      return true;
     }
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("assetPath"), AssetPath);
-    Result->SetNumberField(TEXT("layerCount"), CreatedNodeIds.Num());
-
-    TArray<TSharedPtr<FJsonValue>> NodeIdArray;
-    for (const FString &NodeId : CreatedNodeIds) {
-      NodeIdArray.Add(MakeShared<FJsonValueString>(NodeId));
+    Result->SetNumberField(TEXT("layerCount"), LayerBlend->Layers.Num());
+    Result->SetStringField(TEXT("layerBlendNodeId"), MCP_NODE_ID(LayerBlend));
+    Result->SetBoolField(TEXT("connectedToBaseColor"), Material->GetExpressionInputForProperty(MP_BaseColor)->Expression == LayerBlend);
+    TArray<TSharedPtr<FJsonValue>> LayerNameArray;
+    for (const FLayerBlendInput& Layer : LayerBlend->Layers) {
+      LayerNameArray.Add(MakeShared<FJsonValueString>(Layer.LayerName.ToString()));
     }
-    Result->SetArrayField(TEXT("nodeIds"), NodeIdArray);
+    Result->SetArrayField(TEXT("layerNames"), LayerNameArray);
 
     SendAutomationResponse(Socket, RequestId, true,
                            FString::Printf(TEXT("Layer blend configured with %d layers."),
-                                          CreatedNodeIds.Num()),
+                                          LayerBlend->Layers.Num()),
                            Result);
     return true;
   }
