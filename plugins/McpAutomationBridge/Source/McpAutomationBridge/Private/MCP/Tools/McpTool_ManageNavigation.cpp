@@ -25,6 +25,10 @@ public:
 				TEXT("configure_nav_mesh_settings"),
 				TEXT("set_nav_agent_properties"),
 				TEXT("rebuild_navigation"),
+				TEXT("create_nav_mesh_bounds"),
+				TEXT("build_navigation"),
+				TEXT("query_navigation_path"),
+				TEXT("validate_navigation"),
 				TEXT("create_nav_modifier_component"),
 				TEXT("set_nav_area_class"),
 				TEXT("configure_nav_area_cost"),
@@ -36,6 +40,11 @@ public:
 				TEXT("get_navigation_info")
 			}, TEXT("Navigation action to perform"))
 			.String(TEXT("navMeshPath"), TEXT("Path to NavMesh data asset."))
+			.String(TEXT("boundsActorName"), TEXT("Named NavMeshBoundsVolume for scoped authoring/builds."))
+			.String(TEXT("volumeName"), TEXT("Alias for boundsActorName when creating bounds."))
+			.Object(TEXT("extent"), TEXT("NavMeshBoundsVolume half-extents."), [](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
+			.Object(TEXT("start"), TEXT("Navigation query start."), [](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
+			.Object(TEXT("end"), TEXT("Navigation query end."), [](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
 			.String(TEXT("actorName"), TEXT("Name of the actor."))
 			.String(TEXT("actorPath"), TEXT("Path to actor."))
 			.String(TEXT("blueprintPath"), TEXT("Blueprint asset path."))

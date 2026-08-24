@@ -84,6 +84,7 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "ScopedTransaction.h"
 
 // =============================================================================
 // Navigation System Includes
@@ -91,6 +92,8 @@
 #include "NavigationSystem.h"
 #include "NavMesh/RecastNavMesh.h"
 #include "NavMesh/NavMeshBoundsVolume.h"
+#include "NavigationPath.h"
+#include "NavModifierVolume.h"
 #include "NavModifierComponent.h"
 #include "NavLinkCustomComponent.h"
 #include "Navigation/NavLinkProxy.h"
@@ -601,8 +604,12 @@ static bool HandleRebuildNavigation(
     ARecastNavMesh* NavMesh = Cast<ARecastNavMesh>(NavSys->GetDefaultNavDataInstance());
     bool bHasNavMesh = (NavMesh != nullptr);
 
-    // Trigger full navigation rebuild
+    // A full rebuild is retained for backwards compatibility.  New authoring
+    // callers should use build_navigation with boundsActorName so that only a
+    // declared authoring region is dirtied.
+    Self->SendProgressUpdate(RequestId, 0.0f, TEXT("Starting full navigation rebuild"), true);
     NavSys->Build();
+    Self->SendProgressUpdate(RequestId, 100.0f, TEXT("Navigation rebuild request submitted"), false);
 
     // -------------------------------------------------------------------------
     // Build response
@@ -619,6 +626,147 @@ static bool HandleRebuildNavigation(
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         bHasNavMesh ? TEXT("Navigation rebuild initiated") : TEXT("Navigation rebuild initiated (no existing NavMesh - ensure NavMeshBoundsVolume is present)"), Result);
+    return true;
+}
+
+/** Create (or inspect) a named NavMeshBoundsVolume without touching other areas. */
+static bool HandleCreateNavMeshBoundsVolumeForAI(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    const FString VolumeName = GetJsonStringFieldNav(Payload, TEXT("boundsActorName"),
+        GetJsonStringFieldNav(Payload, TEXT("volumeName"), TEXT("NavMeshBoundsVolume")));
+    if (!IsValidActorName(VolumeName) || !Payload->HasField(TEXT("location")) || !Payload->HasField(TEXT("extent")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("boundsActorName, location, and extent are required"), nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("No editor world available"), nullptr, TEXT("NO_WORLD"));
+        return true;
+    }
+    const FVector Location = GetJsonVectorFieldNav(Payload, TEXT("location"));
+    const FVector Extent = GetJsonVectorFieldNav(Payload, TEXT("extent"));
+    if (Extent.X <= 0.0 || Extent.Y <= 0.0 || Extent.Z <= 0.0)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("extent components must be positive"), nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    for (TActorIterator<ANavMeshBoundsVolume> It(World); It; ++It)
+    {
+        if (It->GetActorLabel().Equals(VolumeName) || It->GetName().Equals(VolumeName))
+        {
+            TSharedPtr<FJsonObject> Existing = McpHandlerUtils::CreateResultObject();
+            Existing->SetStringField(TEXT("boundsActorName"), It->GetActorLabel());
+            Existing->SetStringField(TEXT("actorPath"), It->GetPathName());
+            Existing->SetBoolField(TEXT("created"), false);
+            McpHandlerUtils::AddVerification(Existing, *It);
+            Self->SendAutomationResponse(Socket, RequestId, true, TEXT("NavMeshBoundsVolume already exists"), Existing);
+            return true;
+        }
+    }
+    const FScopedTransaction Transaction(NSLOCTEXT("McpAutomation", "CreateNavMeshBounds", "Create NavMesh Bounds Volume"));
+    World->Modify();
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Name = FName(*VolumeName);
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    ANavMeshBoundsVolume* Volume = World->SpawnActor<ANavMeshBoundsVolume>(Location, FRotator::ZeroRotator, SpawnParams);
+    if (!Volume)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Failed to create NavMeshBoundsVolume"), nullptr, TEXT("SPAWN_FAILED"));
+        return true;
+    }
+    Volume->Modify();
+    Volume->SetActorLabel(VolumeName);
+    // The default volume brush is 200 UU wide. Scaling is safe for a newly
+    // created brush and makes the requested extent durable across reload.
+    Volume->SetActorScale3D(Extent / 100.0);
+    World->MarkPackageDirty();
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("boundsActorName"), Volume->GetActorLabel());
+    Result->SetStringField(TEXT("actorPath"), Volume->GetPathName());
+    Result->SetBoolField(TEXT("created"), true);
+    McpHandlerUtils::AddVerification(Result, Volume);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("NavMeshBoundsVolume created"), Result);
+    return true;
+}
+
+/** Queue only the supplied navigation bounds for generation; never rebuild unrelated areas. */
+static bool HandleBuildNavigationRegion(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    const FString BoundsActorName = GetJsonStringFieldNav(Payload, TEXT("boundsActorName"));
+    if (!IsValidActorName(BoundsActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("boundsActorName is required for scoped navigation builds"), nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    UNavigationSystemV1* NavSys = World ? FNavigationSystem::GetCurrent<UNavigationSystemV1>(World) : nullptr;
+    if (!NavSys)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Navigation system not available"), nullptr, TEXT("NO_NAV_SYS"));
+        return true;
+    }
+    ANavMeshBoundsVolume* Bounds = nullptr;
+    for (TActorIterator<ANavMeshBoundsVolume> It(World); It; ++It)
+        if (It->GetActorLabel().Equals(BoundsActorName) || It->GetName().Equals(BoundsActorName)) { Bounds = *It; break; }
+    if (!Bounds)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, FString::Printf(TEXT("NavMeshBoundsVolume not found: %s"), *BoundsActorName), nullptr, TEXT("NOT_FOUND"));
+        return true;
+    }
+    Self->SendProgressUpdate(RequestId, 0.0f, TEXT("Queueing scoped navigation build"), true);
+    NavSys->AddDirtyArea(Bounds->GetComponentsBoundingBox(), ENavigationDirtyFlag::All);
+    Self->SendProgressUpdate(RequestId, 100.0f, TEXT("Scoped navigation build queued"), false);
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("boundsActorName"), BoundsActorName);
+    Result->SetBoolField(TEXT("rebuilding"), NavSys->IsNavigationBuildInProgress());
+    Result->SetBoolField(TEXT("scoped"), true);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Scoped navigation build queued"), Result);
+    return true;
+}
+
+/** Project points and report a synchronous path without mutating navigation data. */
+static bool HandleQueryNavigationPath(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    if (!Payload->HasField(TEXT("start")) || !Payload->HasField(TEXT("end")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("start and end are required"), nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    UNavigationSystemV1* NavSys = World ? FNavigationSystem::GetCurrent<UNavigationSystemV1>(World) : nullptr;
+    if (!NavSys)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Navigation system not available"), nullptr, TEXT("NO_NAV_SYS"));
+        return true;
+    }
+    FNavLocation ProjectedStart, ProjectedEnd;
+    const FVector Start = GetJsonVectorFieldNav(Payload, TEXT("start"));
+    const FVector End = GetJsonVectorFieldNav(Payload, TEXT("end"));
+    const bool bStartNavigable = NavSys->ProjectPointToNavigation(Start, ProjectedStart);
+    const bool bEndNavigable = NavSys->ProjectPointToNavigation(End, ProjectedEnd);
+    UNavigationPath* Path = (bStartNavigable && bEndNavigable)
+        ? UNavigationSystemV1::FindPathToLocationSynchronously(World, ProjectedStart.Location, ProjectedEnd.Location) : nullptr;
+    const bool bValid = Path && Path->IsValid() && !Path->IsPartial();
+    TArray<TSharedPtr<FJsonValue>> Points;
+    if (Path)
+        for (const FVector& Point : Path->PathPoints) { TSharedPtr<FJsonObject> JsonPoint = McpHandlerUtils::CreateResultObject(); JsonPoint->SetNumberField(TEXT("x"), Point.X); JsonPoint->SetNumberField(TEXT("y"), Point.Y); JsonPoint->SetNumberField(TEXT("z"), Point.Z); Points.Add(MakeShared<FJsonValueObject>(JsonPoint)); }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetBoolField(TEXT("startNavigable"), bStartNavigable);
+    Result->SetBoolField(TEXT("endNavigable"), bEndNavigable);
+    Result->SetBoolField(TEXT("pathValid"), bValid);
+    Result->SetBoolField(TEXT("partial"), Path && Path->IsPartial());
+    Result->SetArrayField(TEXT("pathPoints"), Points);
+    Self->SendAutomationResponse(Socket, RequestId, true, bValid ? TEXT("Navigation path is valid") : TEXT("Navigation path is unavailable or partial"), Result);
     return true;
 }
 
@@ -1671,6 +1819,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNavigationAction(
         return HandleSetNavAgentProperties(this, RequestId, Payload, Socket);
     if (SubAction == TEXT("rebuild_navigation"))
         return HandleRebuildNavigation(this, RequestId, Payload, Socket);
+    if (SubAction == TEXT("create_nav_mesh_bounds"))
+        return HandleCreateNavMeshBoundsVolumeForAI(this, RequestId, Payload, Socket);
+    if (SubAction == TEXT("build_navigation"))
+        return HandleBuildNavigationRegion(this, RequestId, Payload, Socket);
+    if (SubAction == TEXT("query_navigation_path"))
+        return HandleQueryNavigationPath(this, RequestId, Payload, Socket);
+    if (SubAction == TEXT("validate_navigation"))
+        return HandleQueryNavigationPath(this, RequestId, Payload, Socket);
 
     // =========================================================================
     // Nav Modifiers

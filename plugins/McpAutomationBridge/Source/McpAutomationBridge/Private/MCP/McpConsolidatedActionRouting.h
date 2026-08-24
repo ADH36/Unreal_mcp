@@ -648,6 +648,8 @@ inline const TArray<FString>& ManageAICore()
 		TEXT("remove_node"), TEXT("break_connections"),
 		TEXT("set_node_properties"), TEXT("configure_nav_mesh_settings"),
 		TEXT("set_nav_agent_properties"), TEXT("rebuild_navigation"),
+		TEXT("create_nav_mesh_bounds"), TEXT("build_navigation"),
+		TEXT("query_navigation_path"), TEXT("validate_navigation"),
 		TEXT("create_nav_modifier_component"), TEXT("set_nav_area_class"),
 		TEXT("configure_nav_area_cost"), TEXT("configure_nav_link"),
 		TEXT("set_nav_link_type"), TEXT("create_smart_link"),
@@ -672,6 +674,8 @@ inline const TArray<FString>& Navigation()
 	static const TArray<FString> Actions = {
 		TEXT("configure_nav_mesh_settings"),
 		TEXT("set_nav_agent_properties"), TEXT("rebuild_navigation"),
+		TEXT("create_nav_mesh_bounds"), TEXT("build_navigation"),
+		TEXT("query_navigation_path"), TEXT("validate_navigation"),
 		TEXT("create_nav_modifier_component"), TEXT("set_nav_area_class"),
 		TEXT("configure_nav_area_cost"), TEXT("create_nav_link_proxy"),
 		TEXT("configure_nav_link"), TEXT("set_nav_link_type"),

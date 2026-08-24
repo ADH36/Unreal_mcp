@@ -901,6 +901,11 @@ export interface NavigationArgs extends HandlerArgs {
     actorName?: string;
     actorPath?: string;
     blueprintPath?: string;
+    boundsActorName?: string;
+    volumeName?: string;
+    extent?: Vector3;
+    start?: Vector3;
+    end?: Vector3;
 
     // Nav agent properties (ARecastNavMesh)
     agentRadius?: number;

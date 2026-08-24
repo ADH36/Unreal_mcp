@@ -77,6 +77,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "Misc/PackageName.h"
+#include "ScopedTransaction.h"
 #include "HAL/FileManager.h"
 
 // AI Controller
@@ -931,6 +932,33 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
             return true;
         }
 
+        if (KeyName.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("keyName is required"), TEXT("INVALID_PARAMS"));
+            return true;
+        }
+        for (int32 Index = 0; Index < Blackboard->Keys.Num(); ++Index)
+        {
+            const FBlackboardEntry& Existing = Blackboard->Keys[Index];
+            if (Existing.EntryName.ToString().Equals(KeyName, ESearchCase::IgnoreCase))
+            {
+                if (Existing.KeyType && Existing.KeyType->GetClass()->GetName().EndsWith(KeyType, ESearchCase::IgnoreCase))
+                {
+                    Result->SetNumberField(TEXT("keyIndex"), Index);
+                    Result->SetStringField(TEXT("keyName"), Existing.EntryName.ToString());
+                    Result->SetStringField(TEXT("keyType"), Existing.KeyType->GetClass()->GetName());
+                    Result->SetBoolField(TEXT("created"), false);
+                    McpHandlerUtils::AddVerification(Result, Blackboard);
+                    SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Blackboard key already exists"), Result);
+                    return true;
+                }
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Blackboard key '%s' already exists with type '%s'"), *KeyName,
+                        Existing.KeyType ? *Existing.KeyType->GetClass()->GetName() : TEXT("None")), TEXT("DUPLICATE_KEY"));
+                return true;
+            }
+        }
+
         // Create appropriate key type
         FBlackboardEntry NewEntry;
         NewEntry.EntryName = FName(*KeyName);
@@ -959,7 +987,19 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
         {
             UBlackboardKeyType_Object* ObjectKey = NewObject<UBlackboardKeyType_Object>(Blackboard);
             FString BaseClass = GetStringFieldAI(Payload, TEXT("baseObjectClass"), TEXT("Actor"));
-            // Could set base class here
+            UClass* ResolvedBaseClass = BaseClass.Equals(TEXT("Actor"), ESearchCase::IgnoreCase)
+                ? AActor::StaticClass() : UClass::TryFindTypeSlow<UClass>(BaseClass);
+            if (!ResolvedBaseClass)
+            {
+                ResolvedBaseClass = LoadObject<UClass>(nullptr, *BaseClass);
+            }
+            if (!ResolvedBaseClass || !ResolvedBaseClass->IsChildOf(UObject::StaticClass()))
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Invalid baseObjectClass for Object key: %s"), *BaseClass), TEXT("INVALID_CLASS"));
+                return true;
+            }
+            ObjectKey->BaseClass = ResolvedBaseClass;
             NewEntry.KeyType = ObjectKey;
         }
         else if (KeyType.Equals(TEXT("Class"), ESearchCase::IgnoreCase))
@@ -980,12 +1020,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
         }
         else
         {
-            // Default to Object
-            NewEntry.KeyType = NewObject<UBlackboardKeyType_Object>(Blackboard);
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Unsupported Blackboard key type: %s"), *KeyType), TEXT("INVALID_KEY_TYPE"));
+            return true;
         }
 
         NewEntry.bInstanceSynced = GetBoolFieldAI(Payload, TEXT("isInstanceSynced"), false);
 
+        const FScopedTransaction Transaction(NSLOCTEXT("McpAutomation", "AddBlackboardKey", "Add Blackboard Key"));
+        Blackboard->Modify();
         Blackboard->Keys.Add(NewEntry);
         Blackboard->MarkPackageDirty();
         McpSafeAssetSave(Blackboard);

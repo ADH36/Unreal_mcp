@@ -13,7 +13,7 @@
 
 import { ITools } from '../../types/tool-interfaces.js';
 import type { HandlerArgs } from '../../types/handler-types.js';
-import { createSubActionDispatcher } from './common-handlers.js';
+import { createSubActionDispatcher, requireNonEmptyString } from './common-handlers.js';
 
 /**
  * Handles all navigation actions for the manage_navigation tool.
@@ -23,7 +23,7 @@ export async function handleNavigationTools(
   args: HandlerArgs,
   tools: ITools
 ): Promise<Record<string, unknown>> {
-  const { sendRequest } = createSubActionDispatcher(tools, args, {
+  const { argsRecord, sendRequest } = createSubActionDispatcher(tools, args, {
     toolName: 'manage_navigation',
     domainName: 'navigation',
     pathFields: [
@@ -44,6 +44,21 @@ export async function handleNavigationTools(
 
     case 'rebuild_navigation':
       return sendRequest('rebuild_navigation');
+
+    case 'create_nav_mesh_bounds':
+      requireNonEmptyString(argsRecord.boundsActorName ?? argsRecord.volumeName, 'boundsActorName', 'Missing required parameter: boundsActorName');
+      return sendRequest('create_nav_mesh_bounds');
+
+    case 'build_navigation':
+      requireNonEmptyString(argsRecord.boundsActorName, 'boundsActorName', 'Missing required parameter: boundsActorName');
+      return sendRequest('build_navigation');
+
+    case 'query_navigation_path':
+    case 'validate_navigation':
+      if (!argsRecord.start || !argsRecord.end) {
+        return { success: false, error: 'MISSING_PARAMETER', message: 'start and end are required' };
+      }
+      return sendRequest(action);
 
     // ========================================================================
     // Nav Modifiers (3 actions)

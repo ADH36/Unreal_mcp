@@ -104,6 +104,7 @@ export const BEHAVIOR_TREE_ACTIONS = [
 
 export const NAVIGATION_ACTIONS = [
   'configure_nav_mesh_settings', 'set_nav_agent_properties', 'rebuild_navigation',
+  'create_nav_mesh_bounds', 'build_navigation', 'query_navigation_path', 'validate_navigation',
   'create_nav_modifier_component', 'set_nav_area_class', 'configure_nav_area_cost',
   'create_nav_link_proxy', 'configure_nav_link', 'set_nav_link_type', 'create_smart_link',
   'configure_smart_link_behavior', 'get_navigation_info'
@@ -2791,6 +2792,11 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         slotIndex: { type: 'number', description: 'Index of slot to configure.' },
         configPath: commonSchemas.configPath,
         actorName: commonSchemas.actorName,
+        boundsActorName: { type: 'string', description: 'Named NavMeshBoundsVolume used for a scoped build.' },
+        volumeName: { type: 'string', description: 'Alias for boundsActorName when creating a NavMeshBoundsVolume.' },
+        extent: { type: 'object', properties: commonSchemas.vector3.properties, description: 'Half-extents of a NavMeshBoundsVolume.' },
+        start: { type: 'object', properties: commonSchemas.vector3.properties, description: 'Navigation query start location.' },
+        end: { type: 'object', properties: commonSchemas.vector3.properties, description: 'Navigation query end location.' },
         agentRadius: { type: 'number', description: 'Navigation agent radius (default: 35).' },
         agentHeight: { type: 'number', description: 'Navigation agent height (default: 144).' },
         agentStepHeight: { type: 'number', description: 'Maximum step height agent can climb (default: 35).' },
