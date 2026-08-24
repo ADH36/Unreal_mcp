@@ -463,6 +463,13 @@ private:
       const FString &RequestId, const FString &Action,
       const TSharedPtr<FJsonObject> &Payload,
       TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
+  // UE 5.8 procedural building actions. Kept behind build_environment so the
+  // canonical MCP surface remains stable while geometry, material and actor
+  // tools can still operate on the generated actor/components.
+  bool HandleProceduralBuildingAction(
+      const FString &RequestId, const FString &Action,
+      const TSharedPtr<FJsonObject> &Payload,
+      TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
   bool HandleControlEnvironmentAction(
       const FString &RequestId, const FString &Action,
       const TSharedPtr<FJsonObject> &Payload,

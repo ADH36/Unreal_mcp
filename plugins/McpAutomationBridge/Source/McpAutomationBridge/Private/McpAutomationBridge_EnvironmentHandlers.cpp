@@ -2368,6 +2368,16 @@ bool UMcpAutomationBridgeSubsystem::HandleBuildEnvironmentAction(
     UE_LOG(LogMcpEnvironmentHandlers, Verbose,
            TEXT("HandleBuildEnvironmentAction: SubAction=%s"), *LowerSub);
 
+    if (LowerSub == TEXT("generate_procedural_building") ||
+        LowerSub == TEXT("generate_city_block") ||
+        LowerSub == TEXT("inspect_procedural_building") ||
+        LowerSub == TEXT("regenerate_procedural_building") ||
+        LowerSub == TEXT("save_procedural_building_blueprint"))
+    {
+        return HandleProceduralBuildingAction(RequestId, LowerSub, Payload,
+                                              RequestingSocket);
+    }
+
     // =========================================================================
     // Foliage Sub-actions (dispatch to dedicated handlers)
     // =========================================================================

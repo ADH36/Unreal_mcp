@@ -155,6 +155,34 @@ describe('handleEnvironmentTools path normalization', () => {
     expect(getBuildEnvironmentProperties()).toHaveProperty('steepness');
   });
 
+  it('exposes and forwards the UE 5.8 procedural building contract unchanged', async () => {
+    const buildingActions = [
+      'generate_procedural_building', 'generate_city_block',
+      'inspect_procedural_building', 'regenerate_procedural_building',
+      'save_procedural_building_blueprint'
+    ];
+    expect(getBuildEnvironmentActionEnum()).toEqual(expect.arrayContaining(buildingActions));
+    expect(getBuildEnvironmentProperties()).toEqual(expect.objectContaining({
+      footprintPoints: expect.any(Object), floors: expect.any(Object), floorHeight: expect.any(Object),
+      wallMaterial: expect.any(Object), windowMaterial: expect.any(Object), roofMaterial: expect.any(Object),
+      interiorMaterial: expect.any(Object), roadSplineActor: expect.any(Object), blueprintPath: expect.any(Object)
+    }));
+
+    await handleEnvironmentTools('generate_procedural_building', {
+      action: 'generate_procedural_building', buildingType: 'shop', buildingName: 'MCP_Shop',
+      footprintPoints: [{ x: 0, y: 0, z: 0 }, { x: 900, y: 0, z: 0 }, { x: 900, y: 600, z: 0 }, { x: 0, y: 600, z: 0 }],
+      floors: 2, floorHeight: 340, wallThickness: 24, roofType: 'flat', seed: 482,
+      wallMaterial: 'Content/MCPTest/M_Wall', windowMaterial: 'Content/MCPTest/M_Window'
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenCalledWith(
+      {}, 'build_environment', expect.objectContaining({
+        action: 'generate_procedural_building', buildingType: 'shop', seed: 482,
+        wallMaterial: 'Content/MCPTest/M_Wall', windowMaterial: 'Content/MCPTest/M_Window'
+      }), 'Automation bridge not available for environment building operations'
+    );
+  });
+
   it('preserves foliageTypePath for targeted remove_foliage_instances', async () => {
     await handleEnvironmentTools('remove_foliage_instances', {
       action: 'remove_foliage_instances',

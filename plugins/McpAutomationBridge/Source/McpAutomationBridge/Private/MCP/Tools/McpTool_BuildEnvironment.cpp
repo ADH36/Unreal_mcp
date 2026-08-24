@@ -12,7 +12,7 @@ public:
 	FString GetDescription() const override
 	{
 		return TEXT("Create/sculpt landscapes, paint foliage, and generate procedural "
-			"terrain/biomes.");
+			"terrain/biomes, modular buildings, and road-aligned city blocks.");
 	}
 
 	FString GetCategory() const override { return TEXT("world"); }
@@ -25,6 +25,31 @@ public:
 			.StringEnum(TEXT("action"), McpConsolidatedActions::BuildEnvironment(),
 				TEXT("Action"))
 			.String(TEXT("name"), TEXT("Name identifier."))
+			.StringEnum(TEXT("buildingType"), { TEXT("house"), TEXT("shop"), TEXT("apartment"), TEXT("office"), TEXT("skyscraper") }, TEXT("Procedural building archetype."))
+			.ArrayOfObjects(TEXT("footprintPoints"), TEXT("World-space footprint polygon."))
+			.Number(TEXT("floors"), TEXT("Number of storeys."))
+			.Number(TEXT("floorHeight"), TEXT("Storey height in Unreal units."))
+			.Number(TEXT("wallThickness"), TEXT("Exterior wall thickness."))
+			.StringEnum(TEXT("roofType"), { TEXT("flat"), TEXT("gable"), TEXT("hip"), TEXT("mansard") }, TEXT("Roof profile."))
+			.String(TEXT("wallMaterial"), TEXT("Wall material asset path."))
+			.String(TEXT("windowMaterial"), TEXT("Window material asset path."))
+			.String(TEXT("roofMaterial"), TEXT("Roof material asset path."))
+			.String(TEXT("trimMaterial"), TEXT("Trim material asset path."))
+			.String(TEXT("interiorMaterial"), TEXT("Interior material asset path."))
+			.Bool(TEXT("generateDoors"), TEXT("Generate clear entrances."))
+			.Bool(TEXT("generateWindows"), TEXT("Generate instanced windows."))
+			.Bool(TEXT("generateBalconies"), TEXT("Generate instanced balconies."))
+			.Bool(TEXT("generateStorefront"), TEXT("Generate ground-floor storefront."))
+			.Bool(TEXT("generateInterior"), TEXT("Generate floors, stairs, rooms and corridors."))
+			.Bool(TEXT("useHISM"), TEXT("Use HISM for repeated facade elements."))
+			.Bool(TEXT("enableNanite"), TEXT("Report/use Nanite-capable reusable meshes."))
+			.Bool(TEXT("generateLODs"), TEXT("Use reusable LOD-ready meshes."))
+			.String(TEXT("roadSplineActor"), TEXT("Road spline actor whose clearance must remain open."))
+			.Number(TEXT("roadClearance"), TEXT("Minimum road clearance."))
+			.String(TEXT("buildingName"), TEXT("Generated building actor label."))
+			.String(TEXT("buildingActor"), TEXT("Building actor to inspect/regenerate/save."))
+			.String(TEXT("blueprintPath"), TEXT("Destination /Game path for the generated Blueprint."))
+			.Number(TEXT("maxBuildings"), TEXT("Maximum buildings for a city block."))
 			.String(TEXT("landscapeName"), TEXT(""))
 			.Array(TEXT("heightData"), TEXT(""), TEXT("number"))
 			.Number(TEXT("minX"), TEXT(""))

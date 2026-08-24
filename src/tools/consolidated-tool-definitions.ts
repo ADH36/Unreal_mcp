@@ -948,7 +948,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'build_environment',
     category: 'world',
-    description: 'Build environments: landscapes, foliage, procedural terrain/biomes, lighting setups, spline roads/rivers/fences, and world decoration.',
+    description: 'Build environments: landscapes, foliage, procedural terrain/biomes, optimized modular buildings/city blocks, lighting setups, spline roads/rivers/fences, and world decoration.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -962,6 +962,9 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'generate_lods', 'bake_lightmap', 'export_snapshot', 'import_snapshot', 'delete',
             'create_sky_sphere', 'set_time_of_day', 'create_fog_volume'
           ,
+            'generate_procedural_building', 'generate_city_block',
+            'inspect_procedural_building', 'regenerate_procedural_building',
+            'save_procedural_building_blueprint',
             ...PHASE_28_ENVIRONMENT_ACTIONS, ...LIGHTING_ACTIONS, ...SPLINE_ACTIONS],
           description: 'Action'
         },
@@ -1053,6 +1056,33 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         azimuth: commonSchemas.numberProp,
         elevation: commonSchemas.numberProp,
         collisionEnabled: commonSchemas.booleanProp,
+        // UE 5.8 procedural building generator
+        buildingType: { type: 'string', enum: ['house', 'shop', 'apartment', 'office', 'skyscraper'], description: 'Building archetype.' },
+        footprintPoints: { type: 'array', items: commonSchemas.location, description: 'Closed or open footprint polygon in world space. Width/depth is used when omitted.' },
+        depth: commonSchemas.depth,
+        floors: { type: 'number', description: 'Number of storeys.' },
+        floorHeight: { type: 'number', description: 'Storey height in Unreal units.' },
+        wallThickness: { type: 'number', description: 'Exterior wall thickness in Unreal units.' },
+        roofType: { type: 'string', enum: ['flat', 'gable', 'hip', 'mansard'], description: 'Roof profile.' },
+        wallMaterial: commonSchemas.materialPath,
+        windowMaterial: commonSchemas.materialPath,
+        roofMaterial: commonSchemas.materialPath,
+        trimMaterial: commonSchemas.materialPath,
+        interiorMaterial: commonSchemas.materialPath,
+        storefrontMaterial: commonSchemas.materialPath,
+        generateDoors: commonSchemas.booleanProp,
+        generateWindows: commonSchemas.booleanProp,
+        generateBalconies: commonSchemas.booleanProp,
+        generateStorefront: commonSchemas.booleanProp,
+        generateInterior: commonSchemas.booleanProp,
+        useHISM: commonSchemas.booleanProp,
+        enableNanite: commonSchemas.booleanProp,
+        generateLODs: commonSchemas.booleanProp,
+        roadSplineActor: commonSchemas.actorName,
+        roadClearance: commonSchemas.numberProp,
+        buildingName: commonSchemas.actorName,
+        buildingActor: commonSchemas.actorName,
+        maxBuildings: commonSchemas.numberProp,
         // Additional params for C++ handler alignment (EnvironmentHandlers.cpp)
         names: commonSchemas.arrayOfStrings,
         time: commonSchemas.numberProp,
