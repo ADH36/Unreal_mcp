@@ -138,6 +138,7 @@
 #include "LandscapeEdit.h"
 #include "LandscapeEditorObject.h"
 #include "LandscapeEditorUtils.h"
+#include "LandscapeEditLayer.h"
 #include "LandscapeGrassType.h"
 #include "LandscapeInfo.h"
 #include "LandscapeLayerInfoObject.h"
@@ -548,6 +549,14 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateLandscape(
         CaptSectionsPerComponent, CaptQuadsPerComponent, ImportHeightData, nullptr,
         ImportLayerInfos, ELandscapeImportAlphamapType::Additive,
         TArrayView<const FLandscapeLayer>());
+    if (Landscape->GetLayersConst().Num() == 0) {
+      Landscape->CreateLayer(FName(TEXT("MCP_Base")));
+    }
+    if (const FLandscapeLayer* BaseEditLayer = Landscape->GetLayerConst(0);
+        BaseEditLayer && BaseEditLayer->EditLayer) {
+      BaseEditLayer->EditLayer->SetName(FName(TEXT("MCP_Base")), true);
+      Landscape->SetEditingLayer(BaseEditLayer->EditLayer->GetGuid());
+    }
 
     ULandscapeInfo* LandscapeInfo = Landscape->CreateLandscapeInfo();
     if (!LandscapeInfo || Landscape->LandscapeComponents.Num() == 0) {
@@ -1563,6 +1572,13 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
       return;
     }
     LandscapeInfo->Layers[LayerInfoIndex].LayerInfoObj = LayerInfo;
+    if (Landscape->GetLayersConst().Num() == 0) {
+      Landscape->CreateLayer(FName(TEXT("MCP_Base")));
+    }
+    if (const FLandscapeLayer* BaseEditLayer = Landscape->GetLayerConst(0);
+        BaseEditLayer && BaseEditLayer->EditLayer) {
+      Landscape->SetEditingLayer(BaseEditLayer->EditLayer->GetGuid());
+    }
 
     // Note: Do NOT call MakeDialog() - it blocks indefinitely in headless environments
     FScopedSlowTask SlowTask(
@@ -1592,8 +1608,6 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
       return;
     }
 
-    // Pass false for bInUploadTextureChangesToGPU to prevent GPU sync hang on Intel GPUs
-    FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo, false);
     const uint8 PaintValue = static_cast<uint8>(Strength * 255.0);
     const int32 RegionSizeX = (PaintMaxX - PaintMinX + 1);
     const int32 RegionSizeY = (PaintMaxY - PaintMinY + 1);
@@ -1612,23 +1626,27 @@ bool UMcpAutomationBridgeSubsystem::HandlePaintLandscapeLayer(
     TArray<uint8> AlphaData;
     AlphaData.Init(PaintValue, RegionSizeX * RegionSizeY);
 
-    LandscapeEdit.SetAlphaData(LayerInfo, PaintMinX, PaintMinY, PaintMaxX,
-                               PaintMaxY, AlphaData.GetData(), RegionSizeX);
-
-    // Flush is expensive - it forces render thread synchronization
-    // Skip if requested for batch operations
-    if (!bSkipFlush) {
-      LandscapeEdit.Flush();
-    }
-
-    TArray<uint8> SavedAlphaData;
-    SavedAlphaData.SetNumUninitialized(RegionSizeX * RegionSizeY);
-    LandscapeEdit.GetWeightData(LayerInfo, PaintMinX, PaintMinY, PaintMaxX, PaintMaxY,
-        SavedAlphaData.GetData(), RegionSizeX);
     int32 NonZeroWeightCount = 0;
-    for (uint8 Weight : SavedAlphaData) {
-      if (Weight > 0) ++NonZeroWeightCount;
+    {
+      // This object holds writable weightmap texture source locks. It must be
+      // destroyed before safe package saving, which may compress those textures.
+      FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo, Landscape->GetEditingLayer(), false);
+      LandscapeEdit.SetAlphaData(LayerInfo, PaintMinX, PaintMinY, PaintMaxX,
+                                 PaintMaxY, AlphaData.GetData(), RegionSizeX);
+      // A successful authoring request is persistence-bound. Do not save an
+      // unflushed edit, even when callers requested batching.
+      LandscapeEdit.Flush();
+
+      TArray<uint8> SavedAlphaData;
+      SavedAlphaData.SetNumUninitialized(RegionSizeX * RegionSizeY);
+      LandscapeEdit.GetWeightData(LayerInfo, PaintMinX, PaintMinY, PaintMaxX, PaintMaxY,
+          SavedAlphaData.GetData(), RegionSizeX);
+      for (uint8 Weight : SavedAlphaData) {
+        if (Weight > 0) ++NonZeroWeightCount;
+      }
     }
+    Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Weightmap_All);
+    LandscapeInfo->ForceLayersFullUpdate();
 
     FString SaveError;
     if (!McpSaveLandscapePersistence(Landscape->GetWorld(), Landscape, SaveError)) {

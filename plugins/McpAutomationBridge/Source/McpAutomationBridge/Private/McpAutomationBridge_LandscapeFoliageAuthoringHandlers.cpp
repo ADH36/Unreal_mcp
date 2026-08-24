@@ -20,6 +20,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Engine/Texture2D.h"
 #include "HAL/PlatformTime.h"
 #include "Landscape.h"
 #include "LandscapeComponent.h"
@@ -149,6 +150,31 @@ static bool McpSaveLandscapeActorAndWorld(AActor* Actor, FString& OutError)
     return true;
 }
 
+static int32 McpCountPersistedWeightSamples(const ALandscape* Landscape, const ULandscapeLayerInfoObject* LayerInfo)
+{
+    if (!Landscape || !LayerInfo) return 0;
+    int32 Count = 0;
+    for (const ULandscapeComponent* Component : Landscape->LandscapeComponents) {
+        if (!Component) continue;
+        const TArray<UTexture2D*>& WeightmapTextures = Component->GetWeightmapTextures();
+        for (const FWeightmapLayerAllocationInfo& Allocation : Component->GetWeightmapLayerAllocations()) {
+            if (Allocation.LayerInfo != LayerInfo ||
+                !WeightmapTextures.IsValidIndex(Allocation.WeightmapTextureIndex)) continue;
+            UTexture2D* Weightmap = WeightmapTextures[Allocation.WeightmapTextureIndex];
+            if (!Weightmap || Allocation.WeightmapTextureChannel >= 4) continue;
+            const int64 PixelCount = static_cast<int64>(Weightmap->Source.GetSizeX()) * Weightmap->Source.GetSizeY();
+            if (PixelCount <= 0 || PixelCount > MAX_int32) continue;
+            const uint8* MipData = Weightmap->Source.LockMipReadOnly(0);
+            if (!MipData) continue;
+            for (int32 Pixel = 0; Pixel < static_cast<int32>(PixelCount); ++Pixel) {
+                if (MipData[Pixel * 4 + Allocation.WeightmapTextureChannel] > 0) ++Count;
+            }
+            Weightmap->Source.UnlockMip(0);
+        }
+    }
+    return Count;
+}
+
 static void McpAddLandscapeInspection(ALandscape* Landscape, TSharedPtr<FJsonObject> Result)
 {
     ULandscapeInfo* LandscapeInfo = Landscape->CreateLandscapeInfo();
@@ -174,16 +200,26 @@ static void McpAddLandscapeInspection(ALandscape* Landscape, TSharedPtr<FJsonObj
     }
     Result->SetArrayField(TEXT("proxyPackagePaths"), ProxyPackagePaths);
 
-    int32 MinX = 0, MinY = 0, MaxX = -1, MaxY = -1;
-    LandscapeInfo->GetLandscapeExtent(MinX, MinY, MaxX, MaxY);
+    // Query the components owned by this actor, not the whole ULandscapeInfo.
+    // A World Partition map may have other landscape actors registered in the
+    // world info, which would otherwise expand the sample rectangle and mask
+    // this actor's real painted weight data.
+    int32 MinX = MAX_int32, MinY = MAX_int32, MaxX = MIN_int32, MaxY = MIN_int32;
+    for (const ULandscapeComponent* Component : Landscape->LandscapeComponents) {
+        if (!Component) continue;
+        MinX = FMath::Min(MinX, Component->SectionBaseX);
+        MinY = FMath::Min(MinY, Component->SectionBaseY);
+        MaxX = FMath::Max(MaxX, Component->SectionBaseX + Component->ComponentSizeQuads);
+        MaxY = FMath::Max(MaxY, Component->SectionBaseY + Component->ComponentSizeQuads);
+    }
     const int64 PixelCount = MaxX >= MinX && MaxY >= MinY
         ? static_cast<int64>(MaxX - MinX + 1) * static_cast<int64>(MaxY - MinY + 1) : 0;
     TArray<TSharedPtr<FJsonValue>> LayerAssignments;
     for (const FLandscapeInfoLayerSettings& Settings : LandscapeInfo->Layers) {
         ULandscapeLayerInfoObject* LayerInfo = Settings.LayerInfoObj;
         if (!LayerInfo) continue;
-        int32 NonZeroWeightCount = 0;
-        if (PixelCount > 0 && PixelCount <= 16777216) {
+        int32 NonZeroWeightCount = McpCountPersistedWeightSamples(Landscape, LayerInfo);
+        if (NonZeroWeightCount == 0 && PixelCount > 0 && PixelCount <= 16777216) {
             TArray<uint8> Weights;
             Weights.SetNumUninitialized(static_cast<int32>(PixelCount));
             FLandscapeEditDataInterface LandscapeEdit(LandscapeInfo, false);
@@ -462,6 +498,10 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
             Subsystem->SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create generated foliage actor."), TEXT("SPAWN_FAILED"));
             return;
         }
+        // Generated foliage is a deterministic support actor, not a streamed
+        // gameplay cell. Keep it non-spatial so World Partition reloads it for
+        // inspection and subsequent regenerate/clear requests.
+        Actor->SetIsSpatiallyLoaded(false);
         Actor->SetActorLabel(FoliageName);
         Actor->Tags.Add(FName(GeneratedFoliageTag));
         const FString NameMetadata = FString(GeneratedFoliageNamePrefix) + FoliageName;
@@ -469,6 +509,7 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
         Actor->Tags.Add(FName(*NameMetadata));
         Actor->Tags.Add(FName(*SeedMetadata));
         USceneComponent* Root = NewObject<USceneComponent>(Actor, TEXT("GeneratedFoliageRoot"), RF_Transactional);
+        Actor->AddInstanceComponent(Root);
         Actor->SetRootComponent(Root);
         Root->RegisterComponent();
         FRandomStream Random(Seed);
@@ -479,6 +520,7 @@ bool UMcpAutomationBridgeSubsystem::HandleLandscapeFoliageAuthoring(
             const FMcpScatterMesh& Config = Meshes[MeshIndex];
             UStaticMesh* StaticMesh = LoadObject<UStaticMesh>(nullptr, *Config.Path);
             UHierarchicalInstancedStaticMeshComponent* Hism = NewObject<UHierarchicalInstancedStaticMeshComponent>(Actor, NAME_None, RF_Transactional);
+            Actor->AddInstanceComponent(Hism);
             Hism->SetStaticMesh(StaticMesh);
             Hism->SetCollisionEnabled(bCollisionEnabled ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
             Hism->SetupAttachment(Root);
