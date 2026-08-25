@@ -66,6 +66,9 @@ describe('handleEditorTools', () => {
       expect(properties).toHaveProperty('pieMode');
       expect(properties).toHaveProperty('sequence');
       expect(properties).toHaveProperty('durationMs');
+      expect(properties).toHaveProperty('playerIndex');
+      expect(properties).toHaveProperty('warmupFrames');
+      expect(properties).toHaveProperty('screenshotDelayMs');
     }
   });
 
@@ -125,6 +128,18 @@ describe('handleEditorTools', () => {
     }, {});
   });
 
+  it('routes capture_pie_screenshot through the consolidated image path', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+
+    await handleEditorTools('capture_pie_screenshot', {
+      action: 'capture_pie_screenshot', filename: 'PIE.png', warmupFrames: 4, screenshotDelayMs: 120
+    }, tools);
+
+    expect(sendAutomationRequest).toHaveBeenCalledWith('system_control', expect.objectContaining({
+      action: 'screenshot', mode: 'game_viewport', filename: 'PIE.png', warmupFrames: 4, screenshotDelayMs: 120
+    }), { timeoutMs: 60000 });
+  });
+
   it('returns string action for invalid screenshot modes', async () => {
     const { tools, sendAutomationRequest } = createConnectedTools();
 
@@ -175,6 +190,31 @@ describe('handleEditorTools', () => {
     await expect(handleEditorTools('simulate_input', { action: 'simulate_input', key: 'K' }, tools))
       .rejects.toThrow('type|inputType|inputAction');
     expect(sendAutomationRequest).not.toHaveBeenCalled();
+  });
+
+  it('rejects obsolete actorName with the playerIndex migration', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+    await expect(handleEditorTools('move', { action: 'move', actorName: 'DefaultPawn_0' }, tools))
+      .rejects.toThrow('actorName is obsolete for PIE input');
+    expect(sendAutomationRequest).not.toHaveBeenCalled();
+  });
+
+  it('forwards explicit playerIndex for input dispatch', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+    await handleEditorTools('send_input', { action: 'send_input', key: 'W', type: 'key_down', playerIndex: 1 }, tools);
+    expect(sendAutomationRequest).toHaveBeenCalledWith('control_editor', expect.objectContaining({
+      action: 'simulate_input', type: 'key_down', key: 'W', playerIndex: 1
+    }), { timeoutMs: 60000 });
+  });
+
+  it('accepts axis send_input without a keyboard key', async () => {
+    const { tools, sendAutomationRequest } = createConnectedTools();
+    await handleEditorTools('send_input', {
+      action: 'send_input', type: 'axis', axisName: 'Gamepad_LeftX', axisValue: 0.5, playerIndex: 0
+    }, tools);
+    expect(sendAutomationRequest).toHaveBeenCalledWith('control_editor', expect.objectContaining({
+      action: 'simulate_input', type: 'axis', axisName: 'Gamepad_LeftX', axisValue: 0.5, playerIndex: 0
+    }), { timeoutMs: 60000 });
   });
 
   it('exposes PIE play-test actions in the public schemas', async () => {

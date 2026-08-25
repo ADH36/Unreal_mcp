@@ -217,6 +217,14 @@ export class MessageHandler {
                     return response;
                 }
 
+                // The native editor screenshot handler intentionally echoes the
+                // concrete sub-action ("screenshot") while the request domain is
+                // control_editor. Treat that response as compatible so a valid
+                // encoded image is never turned into ACTION_PREFIX_MISMATCH.
+                if (expected === 'control_editor' && got === 'screenshot') {
+                    return response;
+                }
+
                 const startsEitherWay = got.startsWith(expected) || expected.startsWith(got);
 
                 if (!startsEitherWay) {

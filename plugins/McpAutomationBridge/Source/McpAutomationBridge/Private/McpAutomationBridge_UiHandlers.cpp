@@ -78,6 +78,7 @@
 #include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "HAL/PlatformProcess.h"
 #include "Modules/ModuleManager.h"
 #include "RenderingThread.h"
 #include "UnrealClient.h"
@@ -99,6 +100,16 @@
 #if WITH_EDITOR
 namespace {
 constexpr int32 MaxScreenshotPngBytesForBase64ForMcp = 3 * 1024 * 1024;
+
+bool HasVisibleScreenshotPixelsForMcp(const TArray<FColor>& Bitmap, int32& OutNonBlackPixels)
+{
+  OutNonBlackPixels = 0;
+  for (const FColor& Pixel : Bitmap)
+  {
+    if (Pixel.R > 8 || Pixel.G > 8 || Pixel.B > 8) ++OutNonBlackPixels;
+  }
+  return OutNonBlackPixels > 0;
+}
 
 FString MakeSafeUiScreenshotFilenameForMcp(
     const TSharedPtr<FJsonObject> &Payload) {
@@ -520,21 +531,50 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           }
         }
 
-        if (bUsingPieViewport) {
+        int32 WarmupFrames = 3;
+        double WarmupFramesValue = 0.0;
+        if (Payload->TryGetNumberField(TEXT("warmupFrames"), WarmupFramesValue))
+          WarmupFrames = FMath::Clamp(FMath::FloorToInt(WarmupFramesValue), 0, 120);
+        int32 ScreenshotDelayMs = 100;
+        double ScreenshotDelayValue = 0.0;
+        if (Payload->TryGetNumberField(TEXT("screenshotDelayMs"), ScreenshotDelayValue))
+          ScreenshotDelayMs = FMath::Clamp(FMath::FloorToInt(ScreenshotDelayValue), 0, 5000);
+
+        for (int32 WarmupIndex = 0; WarmupIndex < WarmupFrames; ++WarmupIndex)
+        {
           Viewport->Draw(false);
           FlushRenderingCommands();
           bForcedViewportDraw = true;
         }
+        if (ScreenshotDelayMs > 0) FPlatformProcess::Sleep(static_cast<float>(ScreenshotDelayMs) / 1000.0f);
 
-        // Capture viewport pixels
+        // Capture after rendering is complete. Retry black frames because the
+        // first PIE frame can be a cleared backbuffer before the player camera.
         TArray<FColor> Bitmap;
         FIntVector Size(Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y, 0);
-
-        bool bReadSuccess = Viewport->ReadPixels(Bitmap);
+        int32 NonBlackPixels = 0;
+        int32 CaptureAttempts = 0;
+        bool bReadSuccess = false;
+        for (CaptureAttempts = 1; CaptureAttempts <= 3; ++CaptureAttempts)
+        {
+          if (CaptureAttempts > 1)
+          {
+            Viewport->Draw(false);
+            FlushRenderingCommands();
+            if (ScreenshotDelayMs > 0) FPlatformProcess::Sleep(static_cast<float>(ScreenshotDelayMs) / 1000.0f);
+          }
+          Bitmap.Reset();
+          bReadSuccess = Viewport->ReadPixels(Bitmap);
+          if (bReadSuccess && Bitmap.Num() > 0 && HasVisibleScreenshotPixelsForMcp(Bitmap, NonBlackPixels)) break;
+        }
 
         if (!bReadSuccess || Bitmap.Num() == 0) {
           Message = TEXT("Failed to read viewport pixels");
           ErrorCode = TEXT("CAPTURE_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        } else if (NonBlackPixels == 0) {
+          Message = TEXT("Screenshot capture produced an all-black frame after retries");
+          ErrorCode = TEXT("BLACK_FRAME");
           Resp->SetStringField(TEXT("error"), Message);
         } else {
           // Ensure we have the right size
@@ -588,6 +628,10 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           Resp->SetStringField(TEXT("mode"), TEXT("game_viewport"));
           Resp->SetBoolField(TEXT("usingPieViewport"), bUsingPieViewport);
           Resp->SetBoolField(TEXT("forcedViewportDraw"), bForcedViewportDraw);
+          Resp->SetNumberField(TEXT("warmupFrames"), WarmupFrames);
+          Resp->SetNumberField(TEXT("screenshotDelayMs"), ScreenshotDelayMs);
+          Resp->SetNumberField(TEXT("captureAttempts"), CaptureAttempts);
+          Resp->SetNumberField(TEXT("nonBlackPixelCount"), NonBlackPixels);
           if (UWorld *ViewportWorld = ViewportClient->GetWorld()) {
             Resp->SetStringField(TEXT("viewportWorld"), ViewportWorld->GetName());
             Resp->SetNumberField(TEXT("viewportWorldType"), static_cast<int32>(ViewportWorld->WorldType));

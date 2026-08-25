@@ -272,8 +272,15 @@ export interface EditorArgs extends HandlerArgs {
     enhancedAction?: string;
     value?: number;
     durationMs?: number;
+    playerIndex?: number;
     axisX?: number;
     axisY?: number;
+    axisName?: string;
+    axisValue?: number;
+    relative?: boolean;
+    warmupFrames?: number;
+    screenshotDelayMs?: number;
+    captureMode?: string;
     minMovementCm?: number;
     expectedMovement?: boolean;
     previousLocation?: Vector3;

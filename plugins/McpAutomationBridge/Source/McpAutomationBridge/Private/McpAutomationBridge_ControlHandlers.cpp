@@ -66,6 +66,7 @@
 #include "Misc/DateTime.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "HAL/PlatformProcess.h"
 
 #if WITH_EDITOR
 
@@ -75,6 +76,7 @@
 #include "EditorAssetLibrary.h"
 #include "EngineUtils.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/GameInstance.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 
@@ -198,6 +200,73 @@
 
 #if WITH_EDITOR
 namespace {
+static APlayerController* ResolvePiePlayerControllerForMcp(UWorld* PlayWorld, int32 PlayerIndex, FString& OutError)
+{
+  OutError.Empty();
+  if (!PlayWorld)
+  {
+    OutError = TEXT("PIE world is unavailable.");
+    return nullptr;
+  }
+  UGameInstance* GameInstance = PlayWorld->GetGameInstance();
+  if (!GameInstance || !GameInstance->GetLocalPlayers().IsValidIndex(PlayerIndex))
+  {
+    OutError = FString::Printf(TEXT("PIE playerIndex %d does not resolve to a local player."), PlayerIndex);
+    return nullptr;
+  }
+  ULocalPlayer* LocalPlayer = GameInstance->GetLocalPlayers()[PlayerIndex];
+  if (!LocalPlayer || !LocalPlayer->PlayerController)
+  {
+    OutError = FString::Printf(TEXT("PIE playerIndex %d has no PlayerController."), PlayerIndex);
+    return nullptr;
+  }
+  return LocalPlayer->PlayerController;
+}
+
+static bool FocusPieViewportForMcp()
+{
+  if (GEditor && GEditor->PlayWorld)
+  {
+    if (UGameViewportClient* GameViewportClient = GEditor->PlayWorld->GetGameViewport())
+    {
+      if (TSharedPtr<SViewport> GameViewportWidget = GameViewportClient->GetGameViewportWidget())
+      {
+        if (FSlateApplication::Get().SetKeyboardFocus(GameViewportWidget.ToSharedRef(), EFocusCause::SetDirectly))
+        {
+          return true;
+        }
+      }
+    }
+  }
+#if MCP_HAS_LEVEL_EDITOR_MODULE
+  if (FModuleManager::Get().IsModuleLoaded(TEXT("LevelEditor")))
+  {
+    if (FLevelEditorModule* LevelEditorModule = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
+    {
+      TSharedPtr<IAssetViewport> Viewport = LevelEditorModule->GetFirstActiveViewport();
+      if (Viewport.IsValid())
+      {
+        return FSlateApplication::Get().SetKeyboardFocus(Viewport->AsWidget(), EFocusCause::SetDirectly);
+      }
+    }
+  }
+#endif
+  return false;
+}
+
+static bool HasVisiblePixelsForMcp(const TArray<FColor>& Bitmap, int32& OutNonBlackPixels)
+{
+  OutNonBlackPixels = 0;
+  for (const FColor& Pixel : Bitmap)
+  {
+    if (Pixel.R > 8 || Pixel.G > 8 || Pixel.B > 8)
+    {
+      ++OutNonBlackPixels;
+    }
+  }
+  return OutNonBlackPixels > 0;
+}
+
 constexpr int32 MaxScreenshotPngBytesForBase64ForMcp = 3 * 1024 * 1024;
 
 bool IsSafeConsoleArgumentToken(const FString &Value) {
@@ -3898,6 +3967,9 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
     Mode = TEXT("editor_viewport");
   }
 
+  if (Mode == TEXT("standalone_window")) {
+    Mode = TEXT("full_editor_window");
+  }
   if (Mode == TEXT("game_viewport")) {
     return HandleUiAction(RequestId, TEXT("system_control"), Payload, Socket);
   }
@@ -4521,6 +4593,20 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
     return true;
   }
 
+  if (Payload->HasField(TEXT("actorName")))
+  {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("OBSOLETE_PARAMETER"),
+                              TEXT("actorName is obsolete for PIE input; use playerIndex to select the local player/controller."), nullptr);
+    return true;
+  }
+  int32 PlayerIndex = 0;
+  double PlayerIndexValue = 0.0;
+  if (Payload->TryGetNumberField(TEXT("playerIndex"), PlayerIndexValue))
+  {
+    PlayerIndex = FMath::Max(0, FMath::FloorToInt(PlayerIndexValue));
+  }
+  const bool bViewportFocused = FocusPieViewportForMcp();
+
   // Accept multiple field names for flexibility
   // - 'type': C++ native field (key_down, key_up, mouse_click, mouse_move)
   // - 'inputType': Alternative name
@@ -4564,7 +4650,7 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
   bool bHandledBySlate = false;
   FString Message;
 
-  auto RouteKeyToPIE = [](const FKey &InputKey, const EInputEvent InputEvent,
+  auto RouteKeyToPIE = [PlayerIndex](const FKey &InputKey, const EInputEvent InputEvent,
                           bool &bOutHandledByPIE) -> bool {
     bOutHandledByPIE = false;
     if (!GEditor || !GEditor->PlayWorld || !GEngine) {
@@ -4576,7 +4662,12 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
       return false;
     }
 
-    APlayerController *PlayerController = PlayWorld->GetFirstPlayerController();
+    FString ResolveError;
+    APlayerController *PlayerController = ResolvePiePlayerControllerForMcp(PlayWorld, PlayerIndex, ResolveError);
+    if (!PlayerController)
+    {
+      return false;
+    }
     if (PlayerController && PlayerController->PlayerInput) {
       PlayerController->PlayerInput->ForceRebuildingKeyMaps(true);
     }
@@ -4623,12 +4714,6 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
     if (UGameViewportClient *GameViewportClient = PlayWorld->GetGameViewport()) {
       FViewport *GameViewport = GameViewportClient->GetGameViewport();
       if (GameViewport) {
-#if MCP_CONTROL_HAS_INPUT_DEVICE_ID
-        ULocalPlayer *TargetPlayer = GEngine->GetLocalPlayerFromInputDevice(GameViewportClient, InputDevice);
-#else
-        ULocalPlayer *TargetPlayer = GEngine->GetLocalPlayerFromControllerId(GameViewportClient, InputControllerId);
-#endif
-        const bool bViewportHadTargetController = TargetPlayer && TargetPlayer->PlayerController;
         FScopedConditionalWorldSwitcher WorldSwitcher(GameViewportClient);
 #if MCP_CONTROL_HAS_SIMULATED_INPUT_EVENT_ARGS
         FInputKeyEventArgs KeyArgs(
@@ -4657,15 +4742,7 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
             false);
 #endif
         bOutHandledByPIE = GameViewportClient->InputKey(KeyArgs);
-        if (bOutHandledByPIE) {
-          return true;
-        }
-
-        if (bViewportHadTargetController) {
-          return true;
-        }
-
-        return RouteKeyToPlayerController();
+        return bOutHandledByPIE ? true : RouteKeyToPlayerController();
       }
     }
 
@@ -4725,53 +4802,128 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
     if (Button.ToLower() == TEXT("right")) MouseButtonKey = EKeys::RightMouseButton;
     else if (Button.ToLower() == TEXT("middle")) MouseButtonKey = EKeys::MiddleMouseButton;
 
-    FSlateApplication& SlateApp = FSlateApplication::Get();
-    FVector2D Position((float)X, (float)Y);
+    // Deliver clicks to the PIE input stack first so gameplay bindings receive
+    // them. Fall back to Slate only when no PIE controller/viewport is active.
+    bool bPressedHandled = false;
+    bool bReleasedHandled = false;
+    const bool bPressedRouted = RouteKeyToPIE(MouseButtonKey, IE_Pressed, bPressedHandled);
+    const bool bReleasedRouted = RouteKeyToPIE(MouseButtonKey, IE_Released, bReleasedHandled);
+    bRoutedToPIE = bPressedRouted || bReleasedRouted;
+    bHandledByPIE = bPressedHandled || bReleasedHandled;
 
-    // UE 5.7: FPointerEvent constructor signature changed
-    // FPointerEvent(uint32 InPointerIndex, ScreenSpacePosition, LastScreenSpacePosition, Delta, PressedButtons, ModifierKeys)
-    TSet<FKey> PressedButtons;
-    PressedButtons.Add(MouseButtonKey);
+    if (!bRoutedToPIE)
+    {
+      FSlateApplication& SlateApp = FSlateApplication::Get();
+      FVector2D Position((float)X, (float)Y);
+      TSet<FKey> PressedButtons;
+      PressedButtons.Add(MouseButtonKey);
+      FPointerEvent MouseDownEvent(
+          0, Position, Position, FVector2D(0.0f, 0.0f), PressedButtons, FModifierKeysState());
+      SlateApp.ProcessMouseButtonDownEvent(nullptr, MouseDownEvent);
+      TSet<FKey> ReleasedButtons;
+      FPointerEvent MouseUpEvent(
+          0, Position, Position, FVector2D(0.0f, 0.0f), ReleasedButtons, FModifierKeysState());
+      SlateApp.ProcessMouseButtonUpEvent(MouseUpEvent);
+      bHandledBySlate = true;
+    }
 
-    // Simulate mouse down then up for a click
-    FPointerEvent MouseDownEvent(
-        0,  // PointerIndex
-        Position,  // ScreenSpacePosition
-        Position,  // LastScreenSpacePosition
-        FVector2D(0.0f, 0.0f),  // Delta
-        PressedButtons,
-        FModifierKeysState()
-    );
-    SlateApp.ProcessMouseButtonDownEvent(nullptr, MouseDownEvent);
-
-    TSet<FKey> ReleasedButtons;  // Empty set for mouse up
-    FPointerEvent MouseUpEvent(
-        0,  // PointerIndex
-        Position,  // ScreenSpacePosition
-        Position,  // LastScreenSpacePosition
-        FVector2D(0.0f, 0.0f),  // Delta
-        ReleasedButtons,
-        FModifierKeysState()
-    );
-    SlateApp.ProcessMouseButtonUpEvent(MouseUpEvent);
-    bHandledBySlate = true;
-
-    bSuccess = true;
+    bSuccess = bRoutedToPIE || bHandledBySlate;
     Message = FString::Printf(TEXT("Mouse click at (%f, %f)"), X, Y);
   } else if (InputType == TEXT("mouse_move") || InputType == TEXT("move")) {
     double X = 0, Y = 0;
     Payload->TryGetNumberField(TEXT("x"), X);
     Payload->TryGetNumberField(TEXT("y"), Y);
 
-    FSlateApplication& SlateApp = FSlateApplication::Get();
-    FVector2D Position((float)X, (float)Y);
-    SlateApp.SetCursorPos(Position);
-    bHandledBySlate = true;
+    bool bRelative = false;
+    Payload->TryGetBoolField(TEXT("relative"), bRelative);
+    if (bRelative && GEditor->PlayWorld)
+    {
+      FString ResolveError;
+      if (APlayerController* PlayerController = ResolvePiePlayerControllerForMcp(GEditor->PlayWorld.Get(), PlayerIndex, ResolveError))
+      {
+        if (UGameViewportClient* GameViewportClient = GEditor->PlayWorld->GetGameViewport())
+        {
+          FViewport* GameViewport = GameViewportClient->GetGameViewport();
+          if (GameViewport)
+          {
+#if MCP_CONTROL_HAS_INPUT_DEVICE_ID
+            const FInputDeviceId InputDevice = IPlatformInputDeviceMapper::Get().GetDefaultInputDevice();
+#else
+            const int32 InputControllerId = PlayerIndex;
+#endif
+            FScopedConditionalWorldSwitcher WorldSwitcher(GameViewportClient);
+            auto DispatchAxis = [&](const FKey& AxisKey, float AxisValue) {
+#if MCP_CONTROL_HAS_SIMULATED_INPUT_EVENT_ARGS
+              FInputKeyEventArgs AxisArgs(GameViewport, InputDevice, AxisKey, IE_Axis, AxisValue, false, FPlatformTime::Cycles64());
+#elif MCP_CONTROL_HAS_INPUT_DEVICE_ID
+              FInputKeyEventArgs AxisArgs(GameViewport, InputDevice, AxisKey, IE_Axis, AxisValue, false);
+#else
+              FInputKeyEventArgs AxisArgs(GameViewport, InputControllerId, AxisKey, IE_Axis, AxisValue, false);
+#endif
+              return GameViewportClient->InputAxis(AxisArgs);
+            };
+            bHandledByPIE = DispatchAxis(EKeys::MouseX, static_cast<float>(X)) || DispatchAxis(EKeys::MouseY, static_cast<float>(Y));
+            bRoutedToPIE = bHandledByPIE;
+          }
+        }
+      }
+      else
+      {
+        Message = ResolveError;
+      }
+    }
+    else
+    {
+      FSlateApplication& SlateApp = FSlateApplication::Get();
+      SlateApp.SetCursorPos(FVector2D((float)X, (float)Y));
+      bHandledBySlate = true;
+    }
 
-    bSuccess = true;
+    bSuccess = bRoutedToPIE || bHandledBySlate;
     Message = FString::Printf(TEXT("Mouse moved to (%f, %f)"), X, Y);
+  } else if (InputType == TEXT("axis") || InputType == TEXT("axis_input")) {
+    FString AxisName;
+    Payload->TryGetStringField(TEXT("axisName"), AxisName);
+    if (AxisName.IsEmpty()) Payload->TryGetStringField(TEXT("key"), AxisName);
+    double AxisValue = 0.0;
+    if (!Payload->TryGetNumberField(TEXT("axisValue"), AxisValue)) Payload->TryGetNumberField(TEXT("value"), AxisValue);
+    if (AxisName.IsEmpty())
+    {
+      Message = TEXT("axisName or key is required for axis input");
+    }
+    else if (GEditor->PlayWorld)
+    {
+      FString ResolveError;
+      if (APlayerController* PlayerController = ResolvePiePlayerControllerForMcp(GEditor->PlayWorld.Get(), PlayerIndex, ResolveError))
+      {
+        if (UGameViewportClient* GameViewportClient = GEditor->PlayWorld->GetGameViewport())
+        {
+          FViewport* GameViewport = GameViewportClient->GetGameViewport();
+          if (GameViewport)
+          {
+#if MCP_CONTROL_HAS_INPUT_DEVICE_ID
+            const FInputDeviceId InputDevice = IPlatformInputDeviceMapper::Get().GetDefaultInputDevice();
+#endif
+#if MCP_CONTROL_HAS_SIMULATED_INPUT_EVENT_ARGS
+            FInputKeyEventArgs AxisArgs(GameViewport, InputDevice, FKey(*AxisName), IE_Axis, static_cast<float>(AxisValue), false, FPlatformTime::Cycles64());
+#elif MCP_CONTROL_HAS_INPUT_DEVICE_ID
+            const FInputDeviceId InputDevice = IPlatformInputDeviceMapper::Get().GetDefaultInputDevice();
+            FInputKeyEventArgs AxisArgs(GameViewport, InputDevice, FKey(*AxisName), IE_Axis, static_cast<float>(AxisValue), false);
+#else
+            FInputKeyEventArgs AxisArgs(GameViewport, PlayerIndex, FKey(*AxisName), IE_Axis, static_cast<float>(AxisValue), false);
+#endif
+            FScopedConditionalWorldSwitcher WorldSwitcher(GameViewportClient);
+            bHandledByPIE = GameViewportClient->InputAxis(AxisArgs);
+            bRoutedToPIE = bHandledByPIE;
+            bSuccess = bHandledByPIE;
+          }
+        }
+        Message = FString::Printf(TEXT("Axis %s=%f delivered to PIE player %d"), *AxisName, AxisValue, PlayerIndex);
+      }
+      else Message = ResolveError;
+    }
   } else {
-    Message = FString::Printf(TEXT("Unknown input type: %s. Supported: key_down, key_up, mouse_click, mouse_move"), *InputType);
+    Message = FString::Printf(TEXT("Unknown input type: %s. Supported: key_down, key_up, mouse_click, mouse_move, axis"), *InputType);
   }
 
   TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
@@ -4781,12 +4933,15 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
   Resp->SetBoolField(TEXT("routedToPIE"), bRoutedToPIE);
   Resp->SetBoolField(TEXT("handledByPIE"), bHandledByPIE);
   Resp->SetBoolField(TEXT("handledBySlate"), bHandledBySlate);
+  Resp->SetNumberField(TEXT("playerIndex"), PlayerIndex);
+  Resp->SetBoolField(TEXT("viewportFocused"), bViewportFocused);
 
   if (!Key.IsEmpty() && GEditor && GEditor->PlayWorld)
   {
     if (UWorld* PlayWorld = GEditor->PlayWorld.Get())
     {
-      if (APlayerController* PlayerController = PlayWorld->GetFirstPlayerController())
+      FString ResolveError;
+      if (APlayerController* PlayerController = ResolvePiePlayerControllerForMcp(PlayWorld, PlayerIndex, ResolveError))
       {
         TSharedPtr<FJsonObject> InputDiagnostics = MakeShared<FJsonObject>();
         InputDiagnostics->SetStringField(TEXT("playerController"), PlayerController->GetName());
@@ -4887,6 +5042,7 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
     if (PlayWorld) {
       if (APlayerController* Controller = PlayWorld->GetFirstPlayerController()) {
         if (APawn* Pawn = Controller->GetPawn()) Result->SetStringField(TEXT("possessedPawn"), Pawn->GetName());
+        AddRotator(Result, TEXT("controllerRotation"), Controller->GetControlRotation());
       }
     }
     SendAutomationResponse(Socket, RequestId, true, TEXT("PIE state queried"), Result, FString());
@@ -4914,6 +5070,12 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
     AddVector(Result, TEXT("location"), Actor->GetActorLocation());
     AddRotator(Result, TEXT("rotation"), Actor->GetActorRotation());
     AddVector(Result, TEXT("velocity"), Actor->GetVelocity());
+    for (FConstPlayerControllerIterator It = PlayWorld->GetPlayerControllerIterator(); It; ++It) {
+      if (APlayerController* Controller = It->Get(); Controller && Controller->GetPawn() == Actor) {
+        AddRotator(Result, TEXT("controllerRotation"), Controller->GetControlRotation());
+        break;
+      }
+    }
 
     TArray<TSharedPtr<FJsonValue>> Tags;
     for (const FName& Tag : Actor->Tags) Tags.Add(MakeShared<FJsonValueString>(Tag.ToString()));

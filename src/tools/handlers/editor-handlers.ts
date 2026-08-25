@@ -63,7 +63,7 @@ const ACTION_REQUIRED_PARAMS: Record<string, string[]> = {
   'execute_command': ['command'],
   'console_command': ['command'],
   'query_pie_actor': ['actorName'],
-  'send_input': ['key', 'type'],
+  'send_input': ['type'],
   'send_enhanced_input': ['key'],
 };
 
@@ -93,7 +93,7 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'set_camera_fov': ['fov'],
   'set_game_speed': ['speed'],
   'set_fixed_delta_time': ['deltaTime'],
-  'screenshot': ['filename', 'path', 'resolution', 'mode', 'returnBase64', 'includeMetadata', 'metadata'],
+  'screenshot': ['filename', 'path', 'resolution', 'mode', 'returnBase64', 'includeMetadata', 'metadata', 'warmupFrames', 'screenshotDelayMs', 'captureMode'],
   'set_preferences': ['category', 'preferences'],
   'execute_command': ['command'],
   'console_command': ['command'],
@@ -111,21 +111,21 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'start_recording': ['filename', 'name', 'frameRate', 'durationSeconds', 'metadata'],
   'stop_recording': [],
   'set_viewport_realtime': ['enabled', 'realtime'],
-  'simulate_input': ['key', 'type', 'inputType', 'inputAction', 'x', 'y', 'button'],
+  'simulate_input': ['key', 'type', 'inputType', 'inputAction', 'x', 'y', 'button', 'playerIndex', 'axisName', 'axisValue', 'relative'],
   'get_pie_state': [],
   'query_pie_actor': ['actorName'],
   'get_pie_metrics': [],
   'detect_pie_issues': ['actorName', 'previousLocation', 'minMovementCm', 'expectedMovement'],
-  'send_input': ['key', 'type', 'x', 'y', 'button', 'durationMs'],
-  'send_enhanced_input': ['key', 'enhancedAction', 'type', 'durationMs', 'value'],
-  'move': ['key', 'axisX', 'axisY', 'durationMs'],
-  'look': ['x', 'y', 'durationMs'],
-  'jump': ['key', 'durationMs'],
-  'sprint': ['key', 'durationMs'],
-  'interact': ['key', 'durationMs'],
-  'capture_pie_screenshot': ['filename', 'resolution', 'returnBase64', 'includeMetadata', 'metadata'],
+  'send_input': ['key', 'type', 'x', 'y', 'button', 'durationMs', 'playerIndex', 'axisName', 'axisValue', 'relative'],
+  'send_enhanced_input': ['key', 'enhancedAction', 'type', 'durationMs', 'value', 'playerIndex'],
+  'move': ['key', 'axisX', 'axisY', 'durationMs', 'playerIndex'],
+  'look': ['x', 'y', 'durationMs', 'playerIndex'],
+  'jump': ['key', 'durationMs', 'playerIndex'],
+  'sprint': ['key', 'durationMs', 'playerIndex'],
+  'interact': ['key', 'durationMs', 'playerIndex'],
+  'capture_pie_screenshot': ['filename', 'resolution', 'returnBase64', 'includeMetadata', 'metadata', 'warmupFrames', 'screenshotDelayMs', 'captureMode'],
   'read_pie_logs': [],
-  'run_playtest_sequence': ['sequence', 'autoStop', 'timeoutMs', 'pieMode', 'actorName'],
+  'run_playtest_sequence': ['sequence', 'autoStop', 'timeoutMs', 'pieMode', 'playerIndex', 'warmupFrames', 'screenshotDelayMs'],
 };
 
 const INPUT_TYPE_ALIASES: Record<string, string> = {
@@ -137,12 +137,13 @@ const INPUT_TYPE_ALIASES: Record<string, string> = {
   up: 'key_up',
   click: 'mouse_click',
   move: 'mouse_move',
+  analog: 'axis',
 };
 
-const SUPPORTED_INPUT_TYPES = new Set(['key_down', 'key_up', 'mouse_click', 'mouse_move']);
+const SUPPORTED_INPUT_TYPES = new Set(['key_down', 'key_up', 'mouse_click', 'mouse_move', 'axis', 'axis_input']);
 const EDITOR_ASSET_PATH_ACTIONS = new Set(['open_asset', 'close_asset', 'open_level']);
 const EDITOR_PATH_FIELDS = ['assetPath', 'levelPath', 'path'] as const;
-const SUPPORTED_SCREENSHOT_MODES = new Set(['editor_viewport', 'game_viewport', 'full_editor_window']);
+const SUPPORTED_SCREENSHOT_MODES = new Set(['editor_viewport', 'game_viewport', 'full_editor_window', 'standalone_window']);
 
 /**
  * Normalize editor action names for test compatibility
@@ -162,6 +163,10 @@ function validateEditorActionArgs(
 ): void {
   // Always validate security patterns first
   validateArgsSecurity({ action, ...args } as Record<string, unknown>);
+
+  if (['simulate_input', 'send_input', 'send_enhanced_input', 'move', 'look', 'jump', 'sprint', 'interact', 'run_playtest_sequence'].includes(action) && args.actorName !== undefined) {
+    throw new Error('actorName is obsolete for PIE input. Use playerIndex (controller/local-player index) instead.');
+  }
 
   // Validate required parameters FIRST (applies to ALL actions including idempotent)
   // This ensures required param validation is not skipped for idempotent actions
@@ -200,7 +205,7 @@ function getInputType(args: EditorArgs): string {
 
   const mappedType = INPUT_TYPE_ALIASES[normalized] ?? normalized;
   if (!SUPPORTED_INPUT_TYPES.has(mappedType)) {
-    throw new Error(`Unknown input type: ${inputTypeValue}. Supported: key_down, key_up, mouse_click, mouse_move`);
+    throw new Error(`Unknown input type: ${inputTypeValue}. Supported: key_down, key_up, mouse_click, mouse_move, axis`);
   }
 
   return mappedType;
@@ -262,31 +267,41 @@ async function stopPieAndVerify(tools: ITools, timeoutMs: number): Promise<Recor
   return { ...stopResult, success: false, pieStopped: false, error: 'PIE_STOP_TIMEOUT', message: 'PIE did not stop before the cleanup deadline.' };
 }
 
-async function sendHeldPieKey(tools: ITools, key: string, durationMs: number, timeoutMs: number): Promise<Record<string, unknown>> {
+async function sendHeldPieKey(tools: ITools, key: string, durationMs: number, timeoutMs: number, playerIndex = 0): Promise<Record<string, unknown>> {
   const options = { timeoutMs };
   let pressed = false;
   try {
     const down = await executeAutomationRequest(tools, 'control_editor', {
-      action: 'simulate_input', type: 'key_down', key
+      action: 'simulate_input', type: 'key_down', key, playerIndex
     }, undefined, options) as Record<string, unknown>;
     pressed = isSuccessful(down);
     if (!pressed) return cleanObject(down);
     await delay(durationMs);
     return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
-      action: 'simulate_input', type: 'key_up', key
+      action: 'simulate_input', type: 'key_up', key, playerIndex
     }, undefined, options) as Record<string, unknown>);
   } finally {
     // A timeout/error after key-down must never leave an input latched in PIE.
     if (pressed) {
       try {
         await executeAutomationRequest(tools, 'control_editor', {
-          action: 'simulate_input', type: 'key_up', key
+          action: 'simulate_input', type: 'key_up', key, playerIndex
         }, undefined, options);
       } catch {
         // The primary request error is more useful; PIE cleanup still runs in the caller.
       }
     }
   }
+}
+
+async function waitForPieReady(tools: ITools, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + Math.min(timeoutMs, 15_000);
+  while (Date.now() < deadline) {
+    const state = await executeAutomationRequest(tools, 'control_editor', { action: 'get_pie_state' }, undefined, { timeoutMs: Math.min(timeoutMs, 5_000) }) as Record<string, unknown>;
+    if (getBooleanField(state, 'isInPIE') === true) return;
+    await delay(50);
+  }
+  throw new Error('PIE did not become ready before the timeout.');
 }
 
 function getMoveKey(args: EditorArgs): string {
@@ -367,6 +382,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       const res = await executeAutomationRequest(tools, 'control_editor', {
         action: 'play', pieMode: editorArgs.pieMode, playerStart: editorArgs.playerStart, pawnName: editorArgs.pawnName
       }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>;
+      if (isSuccessful(res) && editorArgs.pieMode !== 'standalone') {
+        await waitForPieReady(tools, getBoundedTimeoutMs(args.timeoutMs));
+      }
       return cleanObject(res);
     }
     case 'stop':
@@ -437,6 +455,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       if (args.includeMetadata === true && args.metadata !== undefined) {
         payload.metadata = args.metadata;
       }
+      if (typeof args.warmupFrames === 'number') payload.warmupFrames = args.warmupFrames;
+      if (typeof args.screenshotDelayMs === 'number') payload.screenshotDelayMs = args.screenshotDelayMs;
+      if (typeof args.captureMode === 'string') payload.captureMode = args.captureMode;
 
       const targetAction = mode === 'game_viewport' ? 'system_control' : 'control_editor';
       const res = await executeAutomationRequest(tools, targetAction, payload) as Record<string, unknown>;
@@ -627,7 +648,11 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
         key: args.key,
         x: args.x,
         y: args.y,
-        button: args.button
+        button: args.button,
+        ...(args.playerIndex !== undefined ? { playerIndex: args.playerIndex } : {}),
+        ...(args.axisName !== undefined ? { axisName: args.axisName } : {}),
+        ...(args.axisValue !== undefined ? { axisValue: args.axisValue } : {}),
+        ...(args.relative !== undefined ? { relative: args.relative } : {})
       });
       return cleanObject(res);
     }
@@ -641,39 +666,49 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       }) as Record<string, unknown>);
     }
     case 'capture_pie_screenshot': {
-      return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
+      // Screenshot responses are emitted by the system-control capture path. Routing
+      // through it preserves the consolidated action contract while still selecting
+      // the PIE game viewport in the payload.
+      return cleanObject(await executeAutomationRequest(tools, 'system_control', {
         action: 'screenshot', filename: editorArgs.filename, resolution: editorArgs.resolution,
         mode: 'game_viewport', returnBase64: editorArgs.returnBase64 ?? true,
-        includeMetadata: editorArgs.includeMetadata, metadata: editorArgs.metadata
+        includeMetadata: editorArgs.includeMetadata, metadata: editorArgs.metadata,
+        ...(typeof editorArgs.warmupFrames === 'number' ? { warmupFrames: editorArgs.warmupFrames } : {}),
+        ...(typeof editorArgs.screenshotDelayMs === 'number' ? { screenshotDelayMs: editorArgs.screenshotDelayMs } : {}),
+        ...(typeof editorArgs.captureMode === 'string' ? { captureMode: editorArgs.captureMode } : {})
       }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
     }
     case 'send_input': {
       const mappedType = getInputType(editorArgs);
       if (mappedType === 'key_down' && typeof editorArgs.durationMs === 'number') {
-        return sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+        return sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
       }
       return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
-        action: 'simulate_input', type: mappedType, key: editorArgs.key, x: editorArgs.x, y: editorArgs.y, button: editorArgs.button
+        action: 'simulate_input', type: mappedType, key: editorArgs.key, x: editorArgs.x, y: editorArgs.y, button: editorArgs.button,
+        ...(editorArgs.playerIndex !== undefined ? { playerIndex: editorArgs.playerIndex } : {}),
+        ...(editorArgs.axisName !== undefined ? { axisName: editorArgs.axisName } : {}),
+        ...(editorArgs.axisValue !== undefined ? { axisValue: editorArgs.axisValue } : {}),
+        ...(editorArgs.relative !== undefined ? { relative: editorArgs.relative } : {})
       }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
     }
     case 'send_enhanced_input': {
       // Enhanced Input receives simulated keys through the PIE viewport's normal input stack.
       // Callers supply a mapped key; enhancedAction is retained for reporting by the bridge.
-      const result = await sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+      const result = await sendHeldPieKey(tools, requireNonEmptyString(editorArgs.key, 'key'), getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
       return cleanObject({ ...result, enhancedAction: editorArgs.enhancedAction, inputPath: 'pie_viewport' });
     }
     case 'move':
-      return sendHeldPieKey(tools, editorArgs.key ?? getMoveKey(editorArgs), getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs));
+      return sendHeldPieKey(tools, editorArgs.key ?? getMoveKey(editorArgs), getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
     case 'look':
       return cleanObject(await executeAutomationRequest(tools, 'control_editor', {
-        action: 'simulate_input', type: 'mouse_move', x: editorArgs.x ?? 0, y: editorArgs.y ?? 0
+        action: 'simulate_input', type: 'mouse_move', x: editorArgs.x ?? 0, y: editorArgs.y ?? 0, relative: true, playerIndex: editorArgs.playerIndex ?? 0
       }, undefined, { timeoutMs: getBoundedTimeoutMs(args.timeoutMs) }) as Record<string, unknown>);
     case 'jump':
-      return sendHeldPieKey(tools, editorArgs.key ?? 'SpaceBar', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+      return sendHeldPieKey(tools, editorArgs.key ?? 'SpaceBar', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
     case 'sprint':
-      return sendHeldPieKey(tools, editorArgs.key ?? 'LeftShift', getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs));
+      return sendHeldPieKey(tools, editorArgs.key ?? 'LeftShift', getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
     case 'interact':
-      return sendHeldPieKey(tools, editorArgs.key ?? 'E', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs));
+      return sendHeldPieKey(tools, editorArgs.key ?? 'E', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
     case 'run_playtest_sequence':
       return runPlaytestSequence(editorArgs, tools);
     case 'focus':
