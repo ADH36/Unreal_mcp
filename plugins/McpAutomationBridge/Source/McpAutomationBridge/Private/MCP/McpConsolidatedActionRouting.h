@@ -310,6 +310,7 @@ inline const TArray<FString>& PCG()
 		TEXT("create_pcg_graph"), TEXT("create_pcg_subgraph"),
 		TEXT("add_pcg_node"), TEXT("connect_pcg_pins"),
 		TEXT("set_pcg_node_settings"),
+		TEXT("search_static_mesh_assets"), TEXT("validate_static_mesh_assets"),
 		TEXT("find_static_mesh_spawner"), TEXT("configure_static_mesh_spawner"),
 		TEXT("add_static_mesh_entry"), TEXT("update_static_mesh_entry"),
 		TEXT("remove_static_mesh_entry"), TEXT("inspect_static_mesh_spawner"),

@@ -909,6 +909,10 @@ function evaluateAssertions(testCase, response, capturedValues = {}) {
       return { passed: false, reason: `${label}: expected array length ${assertion.length}, got ${Array.isArray(actual) ? actual.length : typeof actual}` };
     }
 
+    if (Object.prototype.hasOwnProperty.call(assertion, 'minLength') && (!Array.isArray(actual) || actual.length < assertion.minLength)) {
+      return { passed: false, reason: `${label}: expected array length at least ${assertion.minLength}, got ${Array.isArray(actual) ? actual.length : typeof actual}` };
+    }
+
     if (Object.prototype.hasOwnProperty.call(assertion, 'greaterThan') && (!(typeof actual === 'number') || actual <= assertion.greaterThan)) {
       return { passed: false, reason: `${label}: expected ${JSON.stringify(actual)} to be greater than ${assertion.greaterThan}` };
     }
@@ -917,6 +921,26 @@ function evaluateAssertions(testCase, response, capturedValues = {}) {
       const expected = capturedValues[assertion.equalsCaptured];
       if (JSON.stringify(actual) !== JSON.stringify(expected)) {
         return { passed: false, reason: `${label}: expected captured ${assertion.equalsCaptured} to equal ${JSON.stringify(actual)}` };
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(assertion, 'notEqualsCaptured')) {
+      const expected = capturedValues[assertion.notEqualsCaptured];
+      if (JSON.stringify(actual) === JSON.stringify(expected)) {
+        return { passed: false, reason: `${label}: expected captured ${assertion.notEqualsCaptured} to differ, got ${JSON.stringify(actual)}` };
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(assertion, 'notIncludes')) {
+      if (Array.isArray(actual) && actual.some((value) => value === assertion.notIncludes)) {
+        return { passed: false, reason: `${label}: did not expect ${JSON.stringify(assertion.notIncludes)} in ${JSON.stringify(actual)}` };
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(assertion, 'includesCaptured')) {
+      const expected = capturedValues[assertion.includesCaptured];
+      if (!Array.isArray(actual) || !actual.includes(expected)) {
+        return { passed: false, reason: `${label}: expected captured ${assertion.includesCaptured} in ${JSON.stringify(actual)}` };
       }
     }
 

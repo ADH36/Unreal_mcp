@@ -86,6 +86,7 @@ function normalizeLevelArgs(args: LevelArgs): LevelArgs {
     levelPaths: normalizeLevelPathArray(raw.level_paths ?? args.levelPaths),
     packagePath: (raw.package_path as string | undefined) ?? args.packagePath,
     exportPath: (raw.export_path as string | undefined) ?? args.exportPath,
+    saveDirtyPackages: (raw.save_dirty_packages as boolean | undefined) ?? args.saveDirtyPackages,
   };
   return normalizePathFields(mapped as Record<string, unknown>, [
     'levelPath',
@@ -130,11 +131,13 @@ export async function handleLevelTools(action: string, args: HandlerArgs, tools:
     case 'load':
     case 'load_level': {
       const levelPath = requireNonEmptyString(argsTyped.levelPath, 'levelPath', 'Missing required parameter: levelPath');
-      const res = await executeAutomationRequest(tools, 'manage_level', {
+      const loadArguments: Record<string, unknown> = {
         action: 'load',
         levelPath,
         streaming: !!argsTyped.streaming
-      }) as Record<string, unknown>;
+      };
+      if (argsTyped.saveDirtyPackages === true) loadArguments.saveDirtyPackages = true;
+      const res = await executeAutomationRequest(tools, 'manage_level', loadArguments) as Record<string, unknown>;
       return cleanObject(res);
     }
     case 'save':

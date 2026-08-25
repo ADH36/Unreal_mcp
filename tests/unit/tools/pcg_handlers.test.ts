@@ -29,6 +29,7 @@ describe('PCG Static Mesh Spawner contract', () => {
     expect(definition).toBeDefined();
     const actionSchema = definition?.inputSchema.properties?.action as { enum?: string[] };
     for (const action of [
+      'search_static_mesh_assets', 'validate_static_mesh_assets',
       'find_static_mesh_spawner', 'configure_static_mesh_spawner', 'add_static_mesh_entry',
       'update_static_mesh_entry', 'remove_static_mesh_entry', 'inspect_static_mesh_spawner',
       'regenerate_pcg_component', 'read_pcg_generated_instances', 'clear_pcg_generated_output'
@@ -36,6 +37,24 @@ describe('PCG Static Mesh Spawner contract', () => {
       expect(PCG_ACTIONS).toContain(action);
       expect(actionSchema.enum).toContain(action);
     }
+  });
+
+  it('dispatches strict real-mesh discovery and validation actions', async () => {
+    await handlePCGTools('search_static_mesh_assets', {
+      action: 'search_static_mesh_assets',
+      searchPaths: ['/Game/Environment'],
+      suitableOnly: true,
+      allowFallbackMesh: false,
+      limit: 3
+    }, tools);
+    await handlePCGTools('validate_static_mesh_assets', {
+      action: 'validate_static_mesh_assets',
+      meshPaths: ['/Game/Environment/Tree_A.Tree_A'],
+      allowFallbackMesh: false
+    }, tools);
+
+    expect(mockSendRequest).toHaveBeenNthCalledWith(1, 'search_static_mesh_assets');
+    expect(mockSendRequest).toHaveBeenNthCalledWith(2, 'validate_static_mesh_assets');
   });
 
   it('dispatches entry authoring while preserving UE asset path normalization', async () => {

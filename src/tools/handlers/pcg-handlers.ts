@@ -29,6 +29,10 @@ export async function handlePCGTools(
     case 'set_pcg_node_settings':
       return sendRequest('set_pcg_node_settings');
 
+    case 'search_static_mesh_assets':
+    case 'validate_static_mesh_assets':
+      return sendRequest(action);
+
     case 'find_static_mesh_spawner':
     case 'configure_static_mesh_spawner':
     case 'add_static_mesh_entry':

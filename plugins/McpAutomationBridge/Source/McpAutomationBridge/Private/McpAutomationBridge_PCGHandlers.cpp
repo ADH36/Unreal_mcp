@@ -17,6 +17,8 @@
 #include "EngineUtils.h"
 #include "EditorAssetLibrary.h"
 #include "GameFramework/Actor.h"
+#include "Containers/Ticker.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
 #include "UObject/UnrealType.h"
@@ -231,6 +233,27 @@ UPCGGraph* CreateOrReusePCGGraph(const FString& GraphPath, bool bOverwrite, bool
             OutError = FString::Printf(TEXT("PCG graph already exists at '%s'."), *GraphPath);
             return nullptr;
         }
+
+        const FScopedTransaction Transaction(FText::FromString(TEXT("Overwrite PCG Graph")));
+        Existing->Modify();
+        TArray<UPCGNode*> NodesToRemove;
+        for (UPCGNode* Node : Existing->GetNodes())
+        {
+            if (Node && Node != Existing->GetInputNode() && Node != Existing->GetOutputNode())
+            {
+                NodesToRemove.Add(Node);
+            }
+        }
+        if (NodesToRemove.Num() > 0)
+        {
+            Existing->RemoveNodes(NodesToRemove);
+            Existing->MarkPackageDirty();
+        }
+        if (bSave && !McpSafeAssetSave(Existing))
+        {
+            OutError = FString::Printf(TEXT("Failed to save overwritten PCG graph '%s'."), *GraphPath);
+            return nullptr;
+        }
         return Existing;
     }
 
@@ -300,6 +323,40 @@ TSharedPtr<FJsonObject> BuildNodeResult(UPCGGraph* Graph, UPCGNode* Node, const 
 {
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("graphPath"), GraphPath);
+    TArray<TSharedPtr<FJsonValue>> ConnectionValues;
+    if (Graph)
+    {
+        for (UPCGNode* SourceNode : Graph->GetNodes())
+        {
+            if (!SourceNode)
+            {
+                continue;
+            }
+            for (const TObjectPtr<UPCGPin>& SourcePin : SourceNode->GetOutputPins())
+            {
+                if (!SourcePin)
+                {
+                    continue;
+                }
+                for (const TObjectPtr<UPCGEdge>& Edge : SourcePin->Edges)
+                {
+                    UPCGPin* TargetPin = Edge ? Edge->GetOtherPin(SourcePin.Get()) : nullptr;
+                    if (!TargetPin || !TargetPin->Node)
+                    {
+                        continue;
+                    }
+                    TSharedPtr<FJsonObject> Connection = MakeShared<FJsonObject>();
+                    Connection->SetStringField(TEXT("sourceNodeId"), SourceNode->GetName());
+                    Connection->SetStringField(TEXT("sourcePin"), SourcePin->Properties.Label.ToString());
+                    Connection->SetStringField(TEXT("targetNodeId"), TargetPin->Node->GetName());
+                    Connection->SetStringField(TEXT("targetPin"), TargetPin->Properties.Label.ToString());
+                    ConnectionValues.Add(MakeShared<FJsonValueObject>(Connection));
+                }
+            }
+        }
+    }
+    Result->SetArrayField(TEXT("connections"), ConnectionValues);
+    Result->SetNumberField(TEXT("connectionCount"), ConnectionValues.Num());
     if (Node)
     {
         Result->SetStringField(TEXT("nodeId"), Node->GetName());
@@ -676,7 +733,131 @@ bool ApplySpawnActorTemplateClass(UPCGSettings* Settings, const FString& ClassNa
     return true;
 }
 
-UStaticMesh* LoadPCGStaticMesh(const FString& RawMeshPath, FString& OutResolvedPath, FString& OutError)
+bool IsPCGFallbackMeshPath(const FString& MeshPath)
+{
+    FString Normalized = MeshPath;
+    Normalized.TrimStartAndEndInline();
+    Normalized.ToLowerInline();
+    if (Normalized.StartsWith(TEXT("/engine/basicshapes/")))
+    {
+        return true;
+    }
+
+    FString AssetName = Normalized;
+    int32 DotIndex = INDEX_NONE;
+    if (AssetName.FindLastChar(TEXT('.'), DotIndex))
+    {
+        AssetName.LeftInline(DotIndex);
+    }
+    int32 SlashIndex = INDEX_NONE;
+    if (AssetName.FindLastChar(TEXT('/'), SlashIndex))
+    {
+        AssetName = AssetName.Mid(SlashIndex + 1);
+    }
+
+    static const TArray<FString> FallbackTokens = {
+        TEXT("cube"), TEXT("sphere"), TEXT("cylinder"), TEXT("cone"), TEXT("plane"),
+        TEXT("roundedcube"), TEXT("box"), TEXT("shape"), TEXT("default"), TEXT("fallback")
+    };
+    for (const FString& Token : FallbackTokens)
+    {
+        if (AssetName.Contains(Token))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsPCGEnvironmentMeshCandidate(const FString& MeshPath)
+{
+    FString SearchText = MeshPath;
+    SearchText.ToLowerInline();
+    static const TArray<FString> EnvironmentTerms = {
+        TEXT("tree"), TEXT("foliage"), TEXT("plant"), TEXT("bush"), TEXT("shrub"),
+        TEXT("forest"), TEXT("nature"), TEXT("grass"), TEXT("rock"), TEXT("stone"),
+        TEXT("environment"), TEXT("branch"), TEXT("trunk"), TEXT("leaf"), TEXT("pine"),
+        TEXT("oak"), TEXT("birch"), TEXT("palm"), TEXT("vegetation"), TEXT("volumetric"),
+        TEXT("fog"), TEXT("sky"), TEXT("floor"), TEXT("landscape"), TEXT("terrain")
+    };
+    for (const FString& Term : EnvironmentTerms)
+    {
+        if (SearchText.Contains(Term))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+UStaticMesh* LoadPCGStaticMesh(const FString& RawMeshPath, FString& OutResolvedPath, FString& OutError, bool bAllowFallbackMesh);
+
+TArray<FString> GetPCGStringArrayField(const TSharedPtr<FJsonObject>& Payload, std::initializer_list<const TCHAR*> Fields)
+{
+    TArray<FString> Values;
+    if (!Payload.IsValid())
+    {
+        return Values;
+    }
+
+    for (const TCHAR* Field : Fields)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* JsonValues = nullptr;
+        if (!Payload->TryGetArrayField(Field, JsonValues) || !JsonValues)
+        {
+            continue;
+        }
+        for (const TSharedPtr<FJsonValue>& JsonValue : *JsonValues)
+        {
+            if (JsonValue && JsonValue->Type == EJson::String && !JsonValue->AsString().IsEmpty())
+            {
+                Values.Add(JsonValue->AsString());
+            }
+        }
+        if (Values.Num() > 0)
+        {
+            break;
+        }
+    }
+    return Values;
+}
+
+bool ValidatePCGStaticMeshPath(const FString& RawMeshPath, bool bAllowFallbackMesh, FString& OutResolvedPath, FString& OutError)
+{
+    if (!LoadPCGStaticMesh(RawMeshPath, OutResolvedPath, OutError, bAllowFallbackMesh))
+    {
+        return false;
+    }
+
+    UStaticMesh* Mesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(OutResolvedPath));
+    if (!Mesh || Mesh->GetBounds().BoxExtent.IsNearlyZero())
+    {
+        OutError = FString::Printf(TEXT("Static Mesh '%s' has no usable geometry bounds."), *OutResolvedPath);
+        return false;
+    }
+    return true;
+}
+
+TSharedPtr<FJsonObject> BuildPCGStaticMeshAssetResult(const FString& ResolvedPath, UStaticMesh* Mesh)
+{
+    TSharedPtr<FJsonObject> AssetObject = MakeShared<FJsonObject>();
+    AssetObject->SetStringField(TEXT("meshPath"), ResolvedPath);
+    AssetObject->SetStringField(TEXT("assetName"), Mesh ? Mesh->GetName() : FString());
+    AssetObject->SetBoolField(TEXT("fallback"), IsPCGFallbackMeshPath(ResolvedPath));
+    AssetObject->SetBoolField(TEXT("environmentCandidate"), IsPCGEnvironmentMeshCandidate(ResolvedPath));
+    if (Mesh)
+    {
+        const FVector Extent = Mesh->GetBounds().BoxExtent;
+        TSharedPtr<FJsonObject> Bounds = MakeShared<FJsonObject>();
+        Bounds->SetNumberField(TEXT("x"), Extent.X * 2.0);
+        Bounds->SetNumberField(TEXT("y"), Extent.Y * 2.0);
+        Bounds->SetNumberField(TEXT("z"), Extent.Z * 2.0);
+        AssetObject->SetObjectField(TEXT("boundsSize"), Bounds);
+    }
+    return AssetObject;
+}
+
+UStaticMesh* LoadPCGStaticMesh(const FString& RawMeshPath, FString& OutResolvedPath, FString& OutError, bool bAllowFallbackMesh = false)
 {
     FNormalizedAssetPath Normalized = NormalizeAssetPath(RawMeshPath);
     if (!Normalized.bIsValid)
@@ -686,6 +867,11 @@ UStaticMesh* LoadPCGStaticMesh(const FString& RawMeshPath, FString& OutResolvedP
     }
 
     OutResolvedPath = Normalized.Path;
+    if (!bAllowFallbackMesh && IsPCGFallbackMeshPath(OutResolvedPath))
+    {
+        OutError = FString::Printf(TEXT("Static Mesh '%s' is a cube/fallback mesh. Pass allowFallbackMesh=true only when that fallback is explicitly requested."), *OutResolvedPath);
+        return nullptr;
+    }
     UObject* Loaded = UEditorAssetLibrary::LoadAsset(OutResolvedPath);
     if (!Loaded)
     {
@@ -702,7 +888,7 @@ UStaticMesh* LoadPCGStaticMesh(const FString& RawMeshPath, FString& OutResolvedP
     return StaticMesh;
 }
 
-bool ApplyStaticMeshSpawnerMeshPath(UPCGSettings* Settings, const FString& MeshPath, FString& OutError)
+bool ApplyStaticMeshSpawnerMeshPath(UPCGSettings* Settings, const FString& MeshPath, FString& OutError, bool bAllowFallbackMesh = false)
 {
     if (MeshPath.IsEmpty())
     {
@@ -717,7 +903,7 @@ bool ApplyStaticMeshSpawnerMeshPath(UPCGSettings* Settings, const FString& MeshP
     }
 
     FString ResolvedMeshPath;
-    UStaticMesh* StaticMesh = LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError);
+    UStaticMesh* StaticMesh = LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError, bAllowFallbackMesh);
     if (!StaticMesh)
     {
         return false;
@@ -921,7 +1107,7 @@ bool ApplyPCGClassProperty(void* Container, FProperty* Property, const FString& 
     return true;
 }
 
-bool ApplyPCGDescriptorSettings(void* DescriptorContainer, UStruct* DescriptorStruct, const TSharedPtr<FJsonObject>& Object, FString& OutError)
+bool ApplyPCGDescriptorSettings(void* DescriptorContainer, UStruct* DescriptorStruct, const TSharedPtr<FJsonObject>& Object, FString& OutError, bool bAllowFallbackMesh = false)
 {
     if (!DescriptorContainer || !DescriptorStruct || !Object.IsValid())
     {
@@ -983,7 +1169,7 @@ bool ApplyPCGDescriptorSettings(void* DescriptorContainer, UStruct* DescriptorSt
                 return false;
             }
             FString ResolvedMeshPath;
-            if (!LoadPCGStaticMesh(Pair.Value->AsString(), ResolvedMeshPath, OutError))
+            if (!LoadPCGStaticMesh(Pair.Value->AsString(), ResolvedMeshPath, OutError, bAllowFallbackMesh))
             {
                 return false;
             }
@@ -1021,6 +1207,8 @@ bool ApplyPCGMeshEntry(void* EntryContainer, FStructProperty* EntryStructPropert
     }
     void* Descriptor = DescriptorProperty->ContainerPtrToValuePtr<void>(EntryContainer);
 
+    const bool bAllowFallbackMesh = GetJsonBoolField(EntryObject, TEXT("allowFallbackMesh"), false) ||
+        GetJsonBoolField(EntryObject, TEXT("allowCube"), false);
     const FString MeshPath = GetFirstStringField(EntryObject, {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
     if (bRequireMesh && MeshPath.IsEmpty())
     {
@@ -1030,7 +1218,7 @@ bool ApplyPCGMeshEntry(void* EntryContainer, FStructProperty* EntryStructPropert
     if (!MeshPath.IsEmpty())
     {
         FString ResolvedMeshPath;
-        if (!LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError))
+        if (!LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError, bAllowFallbackMesh))
         {
             return false;
         }
@@ -1057,7 +1245,7 @@ bool ApplyPCGMeshEntry(void* EntryContainer, FStructProperty* EntryStructPropert
 
     const TSharedPtr<FJsonObject>* DescriptorSettings = nullptr;
     if (EntryObject->TryGetObjectField(TEXT("descriptorSettings"), DescriptorSettings) && DescriptorSettings && DescriptorSettings->IsValid() &&
-        !ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, *DescriptorSettings, OutError))
+        !ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, *DescriptorSettings, OutError, bAllowFallbackMesh))
     {
         return false;
     }
@@ -1066,7 +1254,7 @@ bool ApplyPCGMeshEntry(void* EntryContainer, FStructProperty* EntryStructPropert
     {
         TSharedPtr<FJsonObject> CollisionObject = MakeShared<FJsonObject>();
         CollisionObject->SetField(TEXT("collision"), *CollisionValue);
-        if (!ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, CollisionObject, OutError))
+        if (!ApplyPCGDescriptorSettings(Descriptor, DescriptorProperty->Struct, CollisionObject, OutError, bAllowFallbackMesh))
         {
             return false;
         }
@@ -1190,6 +1378,8 @@ bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Setting
         return true;
     }
 
+    const bool bAllowFallbackMesh = GetJsonBoolField(SettingsObject, TEXT("allowFallbackMesh"), false) ||
+        GetJsonBoolField(SettingsObject, TEXT("allowCube"), false);
     const TArray<TSharedPtr<FJsonValue>>* MeshEntries = nullptr;
     if (SettingsObject->TryGetArrayField(TEXT("meshEntries"), MeshEntries) && MeshEntries)
     {
@@ -1204,7 +1394,7 @@ bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Setting
             }
             const FString MeshPath = GetFirstStringField(EntryValue->AsObject(), {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
             FString ResolvedMeshPath;
-            if (MeshPath.IsEmpty() || !LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError))
+            if (MeshPath.IsEmpty() || !LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError, bAllowFallbackMesh))
             {
                 if (OutError.IsEmpty())
                 {
@@ -1258,7 +1448,7 @@ bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Setting
     const FString MeshPath = GetFirstStringField(SettingsObject, {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
     if (!MeshPath.IsEmpty())
     {
-        if (!ApplyStaticMeshSpawnerMeshPath(Settings, MeshPath, OutError))
+        if (!ApplyStaticMeshSpawnerMeshPath(Settings, MeshPath, OutError, bAllowFallbackMesh))
         {
             return false;
         }
@@ -1271,7 +1461,8 @@ bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Setting
         const FString PairKey(*Pair.Key);
         const bool bSpecial = PairKey.Equals(TEXT("meshSelectorType"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("selectorType"), ESearchCase::IgnoreCase) ||
             PairKey.Equals(TEXT("MeshSelectorType"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("meshEntries"), ESearchCase::IgnoreCase) ||
-            PairKey.Equals(TEXT("meshPath"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("staticMesh"), ESearchCase::IgnoreCase);
+            PairKey.Equals(TEXT("meshPath"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("staticMesh"), ESearchCase::IgnoreCase) ||
+            PairKey.Equals(TEXT("allowFallbackMesh"), ESearchCase::IgnoreCase) || PairKey.Equals(TEXT("allowCube"), ESearchCase::IgnoreCase);
         if (!bSpecial)
         {
             DirectSettings->SetField(Pair.Key, Pair.Value);
@@ -1314,10 +1505,21 @@ bool ApplyPCGConvenienceSettings(const FString& SubAction, UPCGSettings* Setting
         const FString MeshPath = GetJsonStringField(Payload, TEXT("meshPath"));
         if (!MeshPath.IsEmpty())
         {
-            if (!ApplyStringSetting(Settings, TEXT("Mesh"), MeshPath, OutError))
+            const bool bAllowFallbackMesh = GetJsonBoolField(Payload, TEXT("allowFallbackMesh"), false) ||
+                GetJsonBoolField(Payload, TEXT("allowCube"), false);
+            FString ResolvedMeshPath;
+            if (!LoadPCGStaticMesh(MeshPath, ResolvedMeshPath, OutError, bAllowFallbackMesh))
             {
                 return false;
             }
+            FSoftObjectProperty* MeshProperty = CastField<FSoftObjectProperty>(Settings->GetClass()->FindPropertyByName(FName(TEXT("Mesh"))));
+            if (!MeshProperty)
+            {
+                OutError = FString::Printf(TEXT("PCG mesh sampler '%s' has no soft-object Mesh property."), *Settings->GetClass()->GetName());
+                return false;
+            }
+            void* MeshValue = MeshProperty->ContainerPtrToValuePtr<void>(Settings);
+            *static_cast<FSoftObjectPtr*>(MeshValue) = FSoftObjectPath(ResolvedMeshPath.Contains(TEXT(".")) ? ResolvedMeshPath : ToObjectPath(ResolvedMeshPath));
             ++OutAppliedCount;
         }
     }
@@ -1326,7 +1528,9 @@ bool ApplyPCGConvenienceSettings(const FString& SubAction, UPCGSettings* Setting
         const FString MeshPath = GetJsonStringField(Payload, TEXT("meshPath"));
         if (!MeshPath.IsEmpty())
         {
-            if (!ApplyStaticMeshSpawnerMeshPath(Settings, MeshPath, OutError))
+            const bool bAllowFallbackMesh = GetJsonBoolField(Payload, TEXT("allowFallbackMesh"), false) ||
+                GetJsonBoolField(Payload, TEXT("allowCube"), false);
+            if (!ApplyStaticMeshSpawnerMeshPath(Settings, MeshPath, OutError, bAllowFallbackMesh))
             {
                 return false;
             }
@@ -1624,7 +1828,16 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
     int32 TotalInstances = 0;
     int32 ISMInstances = 0;
     int32 HISMInstances = 0;
+    int32 ISMComponents = 0;
+    int32 HISMComponents = 0;
+    uint32 AggregateTransformHash = 0;
+    bool bHasFallbackMesh = false;
+    bool bAllTransformsWithinBounds = true;
     TArray<TSharedPtr<FJsonValue>> InstanceValues;
+    TArray<TSharedPtr<FJsonValue>> ActualMeshPaths;
+    TArray<TSharedPtr<FJsonValue>> ActualMeshPackagePaths;
+    TArray<FString> SeenMeshPaths;
+    TArray<FString> SeenMeshPackagePaths;
     if (Component)
     {
         Component->ForEachConstManagedResource([&](const UPCGManagedResource* Resource)
@@ -1644,34 +1857,107 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
             TotalInstances += Count;
             if (bIsHISM)
             {
+                ++HISMComponents;
                 HISMInstances += Count;
             }
             else
             {
+                ++ISMComponents;
                 ISMInstances += Count;
             }
             TSharedPtr<FJsonObject> InstanceObject = MakeShared<FJsonObject>();
             InstanceObject->SetStringField(TEXT("componentPath"), ISM->GetPathName());
             InstanceObject->SetStringField(TEXT("componentType"), bIsHISM ? TEXT("HISM") : TEXT("ISM"));
-            InstanceObject->SetStringField(TEXT("meshPath"), ISM->GetStaticMesh() ? ISM->GetStaticMesh()->GetPathName() : FString());
+            const FString MeshPath = ISM->GetStaticMesh() ? ISM->GetStaticMesh()->GetPathName() : FString();
+            bHasFallbackMesh |= IsPCGFallbackMeshPath(MeshPath);
+            InstanceObject->SetStringField(TEXT("meshPath"), MeshPath);
             InstanceObject->SetNumberField(TEXT("instanceCount"), Count);
             uint32 InstanceSignature = 0;
+            const FBox ComponentBounds = ISM->GetBounds().GetBox();
+            bool bTransformsWithinBounds = Count > 0;
+            TArray<TSharedPtr<FJsonValue>> TransformValues;
+            TransformValues.Reserve(Count);
             for (int32 InstanceIndex = 0; InstanceIndex < Count; ++InstanceIndex)
             {
                 FTransform InstanceTransform;
-                if (ISM->GetInstanceTransform(InstanceIndex, InstanceTransform, false))
+                if (ISM->GetInstanceTransform(InstanceIndex, InstanceTransform, true))
                 {
-                    InstanceSignature = FCrc::StrCrc32(*InstanceTransform.ToString(), InstanceSignature);
+                    const FString TransformString = InstanceTransform.ToString();
+                    InstanceSignature = FCrc::StrCrc32(*TransformString, InstanceSignature);
+                    AggregateTransformHash = FCrc::StrCrc32(*TransformString, AggregateTransformHash);
+
+                    const FVector Location = InstanceTransform.GetLocation();
+                    bTransformsWithinBounds &= ComponentBounds.IsInsideOrOn(Location);
+                    const FRotator Rotation = InstanceTransform.Rotator();
+                    const FVector Scale = InstanceTransform.GetScale3D();
+                    TSharedPtr<FJsonObject> TransformObject = MakeShared<FJsonObject>();
+                    TSharedPtr<FJsonObject> LocationObject = MakeShared<FJsonObject>();
+                    LocationObject->SetNumberField(TEXT("x"), Location.X);
+                    LocationObject->SetNumberField(TEXT("y"), Location.Y);
+                    LocationObject->SetNumberField(TEXT("z"), Location.Z);
+                    TSharedPtr<FJsonObject> RotationObject = MakeShared<FJsonObject>();
+                    RotationObject->SetNumberField(TEXT("pitch"), Rotation.Pitch);
+                    RotationObject->SetNumberField(TEXT("yaw"), Rotation.Yaw);
+                    RotationObject->SetNumberField(TEXT("roll"), Rotation.Roll);
+                    TSharedPtr<FJsonObject> ScaleObject = MakeShared<FJsonObject>();
+                    ScaleObject->SetNumberField(TEXT("x"), Scale.X);
+                    ScaleObject->SetNumberField(TEXT("y"), Scale.Y);
+                    ScaleObject->SetNumberField(TEXT("z"), Scale.Z);
+                    TransformObject->SetObjectField(TEXT("location"), LocationObject);
+                    TransformObject->SetObjectField(TEXT("rotation"), RotationObject);
+                    TransformObject->SetObjectField(TEXT("scale"), ScaleObject);
+                    TransformValues.Add(MakeShared<FJsonValueObject>(TransformObject));
+                }
+                else
+                {
+                    bTransformsWithinBounds = false;
                 }
             }
             InstanceObject->SetStringField(TEXT("instanceSignature"), FString::Printf(TEXT("%u"), InstanceSignature));
+            InstanceObject->SetArrayField(TEXT("transforms"), TransformValues);
+            InstanceObject->SetBoolField(TEXT("transformsWithinBounds"), bTransformsWithinBounds);
+            bAllTransformsWithinBounds &= bTransformsWithinBounds;
+            TSharedPtr<FJsonObject> BoundsObject = MakeShared<FJsonObject>();
+            TSharedPtr<FJsonObject> BoundsMin = MakeShared<FJsonObject>();
+            BoundsMin->SetNumberField(TEXT("x"), ComponentBounds.Min.X);
+            BoundsMin->SetNumberField(TEXT("y"), ComponentBounds.Min.Y);
+            BoundsMin->SetNumberField(TEXT("z"), ComponentBounds.Min.Z);
+            TSharedPtr<FJsonObject> BoundsMax = MakeShared<FJsonObject>();
+            BoundsMax->SetNumberField(TEXT("x"), ComponentBounds.Max.X);
+            BoundsMax->SetNumberField(TEXT("y"), ComponentBounds.Max.Y);
+            BoundsMax->SetNumberField(TEXT("z"), ComponentBounds.Max.Z);
+            BoundsObject->SetObjectField(TEXT("min"), BoundsMin);
+            BoundsObject->SetObjectField(TEXT("max"), BoundsMax);
+            InstanceObject->SetObjectField(TEXT("bounds"), BoundsObject);
             InstanceValues.Add(MakeShared<FJsonValueObject>(InstanceObject));
+            if (!MeshPath.IsEmpty() && !SeenMeshPaths.Contains(MeshPath))
+            {
+                SeenMeshPaths.Add(MeshPath);
+                ActualMeshPaths.Add(MakeShared<FJsonValueString>(MeshPath));
+            }
+            const FNormalizedAssetPath NormalizedMeshPath = NormalizeAssetPath(MeshPath);
+            const FString MeshPackagePath = NormalizedMeshPath.bIsValid ? NormalizedMeshPath.Path : MeshPath;
+            if (!MeshPackagePath.IsEmpty() && !SeenMeshPackagePaths.Contains(MeshPackagePath))
+            {
+                SeenMeshPackagePaths.Add(MeshPackagePath);
+                ActualMeshPackagePaths.Add(MakeShared<FJsonValueString>(MeshPackagePath));
+            }
         });
     }
     Result->SetNumberField(TEXT("instanceCount"), TotalInstances);
     Result->SetNumberField(TEXT("ismInstanceCount"), ISMInstances);
     Result->SetNumberField(TEXT("hismInstanceCount"), HISMInstances);
+    Result->SetNumberField(TEXT("ismComponentCount"), ISMComponents);
+    Result->SetNumberField(TEXT("hismComponentCount"), HISMComponents);
+    Result->SetNumberField(TEXT("componentCount"), ISMComponents + HISMComponents);
+    Result->SetNumberField(TEXT("materializedInstanceCount"), TotalInstances);
+    Result->SetStringField(TEXT("transformHash"), FString::Printf(TEXT("%u"), AggregateTransformHash));
+    Result->SetArrayField(TEXT("actualMeshPaths"), ActualMeshPaths);
+    Result->SetArrayField(TEXT("actualMeshPackagePaths"), ActualMeshPackagePaths);
+    Result->SetBoolField(TEXT("hasFallbackMesh"), bHasFallbackMesh);
     Result->SetArrayField(TEXT("instances"), InstanceValues);
+    Result->SetBoolField(TEXT("transformsWithinBounds"), bAllTransformsWithinBounds);
+    Result->SetBoolField(TEXT("materialized"), TotalInstances > 0 && (ISMComponents + HISMComponents) > 0);
     Result->SetBoolField(TEXT("generated"), Component ? Component->bGenerated : false);
     Result->SetBoolField(TEXT("generationInProgress"), Component ? Component->IsGenerating() : false);
     if (Component)
@@ -1679,6 +1965,72 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
         McpHandlerUtils::AddVerification(Result, Component);
     }
     return Result;
+}
+
+void SchedulePCGGenerationWait(
+    UMcpAutomationBridgeSubsystem* Subsystem,
+    const TSharedPtr<FMcpBridgeWebSocket>& Socket,
+    const FString& RequestId,
+    UWorld* World,
+    AActor* Actor,
+    UPCGComponent* Component,
+    const FString& GraphPath,
+    FPCGTaskId TaskId,
+    bool bSave,
+    int32 TimeoutMs)
+{
+    const TWeakObjectPtr<UMcpAutomationBridgeSubsystem> WeakSubsystem(Subsystem);
+    const TWeakObjectPtr<UPCGComponent> WeakComponent(Component);
+    const TWeakObjectPtr<AActor> WeakActor(Actor);
+    const double StartSeconds = FPlatformTime::Seconds();
+    const double TimeoutSeconds = FMath::Max(1.0, static_cast<double>(TimeoutMs) / 1000.0);
+    FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+        [WeakSubsystem, Socket, RequestId, World, WeakActor, WeakComponent, GraphPath, TaskId, bSave, StartSeconds, TimeoutSeconds](float)
+        {
+            UMcpAutomationBridgeSubsystem* LiveSubsystem = WeakSubsystem.Get();
+            UPCGComponent* LiveComponent = WeakComponent.Get();
+            if (!LiveSubsystem || !LiveComponent)
+            {
+                if (LiveSubsystem)
+                {
+                    LiveSubsystem->SendAutomationError(Socket, RequestId, TEXT("PCG component was destroyed while waiting for generation."), TEXT("COMPONENT_DESTROYED"));
+                }
+                return false;
+            }
+
+            const double ElapsedSeconds = FPlatformTime::Seconds() - StartSeconds;
+            if (LiveComponent->IsGenerating())
+            {
+                if (ElapsedSeconds >= TimeoutSeconds)
+                {
+                    LiveSubsystem->SendAutomationError(Socket, RequestId, TEXT("Timed out waiting for PCG generation to materialize ISM/HISM output."), TEXT("GENERATION_TIMEOUT"));
+                    return false;
+                }
+                LiveSubsystem->SendProgressUpdate(RequestId, -1.0f, TEXT("Waiting for PCG generation and materialized ISM/HISM components."), true);
+                return true;
+            }
+
+            bool bLevelSaved = false;
+            FString SaveError;
+            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+            {
+                LiveSubsystem->SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
+                return false;
+            }
+
+            TSharedPtr<FJsonObject> Result = BuildGeneratedInstancesResult(LiveComponent);
+            AActor* LiveActor = WeakActor.Get();
+            Result->SetStringField(TEXT("graphPath"), GraphPath);
+            Result->SetStringField(TEXT("actorName"), LiveActor ? LiveActor->GetName() : FString());
+            Result->SetStringField(TEXT("componentName"), LiveComponent->GetName());
+            Result->SetStringField(TEXT("componentPath"), LiveComponent->GetPathName());
+            Result->SetNumberField(TEXT("taskId"), static_cast<double>(TaskId));
+            Result->SetBoolField(TEXT("waited"), true);
+            Result->SetBoolField(TEXT("saved"), bLevelSaved);
+            McpHandlerUtils::AddVerification(Result, LiveComponent);
+            LiveSubsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("PCG generation completed; output was verified from materialized ISM/HISM components."), Result);
+            return false;
+        }));
 }
 }
 #endif
@@ -1721,6 +2073,140 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
     }
 
     const bool bSave = GetJsonBoolField(Payload, TEXT("save"), true);
+
+    if (SubAction == TEXT("search_static_mesh_assets") || SubAction == TEXT("validate_static_mesh_assets"))
+    {
+        const bool bAllowFallbackMesh = GetJsonBoolField(Payload, TEXT("allowFallbackMesh"), false) ||
+            GetJsonBoolField(Payload, TEXT("allowCube"), false);
+        const bool bSuitableOnly = GetJsonBoolField(Payload, TEXT("suitableOnly"), true);
+        TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+        TArray<TSharedPtr<FJsonValue>> ValidValues;
+        TArray<TSharedPtr<FJsonValue>> InvalidValues;
+
+        if (SubAction == TEXT("validate_static_mesh_assets"))
+        {
+            TArray<FString> RequestedPaths = GetPCGStringArrayField(Payload, {TEXT("meshPaths"), TEXT("paths")});
+            const FString SingleMeshPath = GetFirstStringField(Payload, {TEXT("meshPath"), TEXT("staticMesh")});
+            if (!SingleMeshPath.IsEmpty())
+            {
+                RequestedPaths.AddUnique(SingleMeshPath);
+            }
+            const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+            if (Payload->TryGetArrayField(TEXT("meshEntries"), Entries) && Entries)
+            {
+                for (const TSharedPtr<FJsonValue>& Entry : *Entries)
+                {
+                    if (Entry && Entry->Type == EJson::Object)
+                    {
+                        const FString EntryPath = GetFirstStringField(Entry->AsObject(), {TEXT("meshPath"), TEXT("staticMesh"), TEXT("StaticMesh")});
+                        if (!EntryPath.IsEmpty())
+                        {
+                            RequestedPaths.AddUnique(EntryPath);
+                        }
+                    }
+                }
+            }
+            for (const FString& RequestedPath : RequestedPaths)
+            {
+                FString ResolvedPath;
+                FString ValidationError;
+                if (ValidatePCGStaticMeshPath(RequestedPath, bAllowFallbackMesh, ResolvedPath, ValidationError))
+                {
+                    UStaticMesh* Mesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(ResolvedPath));
+                    ValidValues.Add(MakeShared<FJsonValueObject>(BuildPCGStaticMeshAssetResult(ResolvedPath, Mesh)));
+                }
+                else
+                {
+                    TSharedPtr<FJsonObject> Invalid = MakeShared<FJsonObject>();
+                    Invalid->SetStringField(TEXT("requestedPath"), RequestedPath);
+                    Invalid->SetStringField(TEXT("error"), ValidationError);
+                    InvalidValues.Add(MakeShared<FJsonValueObject>(Invalid));
+                }
+            }
+            Result->SetArrayField(TEXT("validAssets"), ValidValues);
+            Result->SetArrayField(TEXT("invalidAssets"), InvalidValues);
+            Result->SetNumberField(TEXT("validCount"), ValidValues.Num());
+            Result->SetNumberField(TEXT("invalidCount"), InvalidValues.Num());
+            Result->SetBoolField(TEXT("valid"), InvalidValues.Num() == 0 && ValidValues.Num() > 0);
+            Result->SetBoolField(TEXT("allowFallbackMesh"), bAllowFallbackMesh);
+            SendAutomationResponse(Socket, RequestId, true, TEXT("Static Mesh assets validated."), Result);
+            return true;
+        }
+
+        FString Query = GetJsonStringField(Payload, TEXT("query"));
+        Query.ToLowerInline();
+        const int32 Limit = FMath::Clamp(GetJsonIntField(Payload, TEXT("limit"), 24), 1, 256);
+        const int32 Offset = FMath::Max(0, GetJsonIntField(Payload, TEXT("offset"), 0));
+        TArray<FString> SearchPaths = GetPCGStringArrayField(Payload, {TEXT("searchPaths"), TEXT("packagePaths")});
+        if (SearchPaths.Num() == 0)
+        {
+            SearchPaths.Add(TEXT("/Game"));
+        }
+
+        FARFilter Filter;
+        Filter.ClassPaths.Add(UStaticMesh::StaticClass()->GetClassPathName());
+        Filter.bRecursiveClasses = true;
+        for (const FString& SearchPath : SearchPaths)
+        {
+            FString NormalizedSearchPath = SearchPath;
+            NormalizedSearchPath.TrimStartAndEndInline();
+            if (!NormalizedSearchPath.StartsWith(TEXT("/")))
+            {
+                NormalizedSearchPath = TEXT("/") + NormalizedSearchPath;
+            }
+            Filter.PackagePaths.Add(FName(*NormalizedSearchPath));
+        }
+        Filter.bRecursivePaths = true;
+
+        TArray<FAssetData> Assets;
+        FAssetRegistryModule::GetRegistry().GetAssets(Filter, Assets);
+        Assets.Sort([](const FAssetData& Left, const FAssetData& Right)
+        {
+            return Left.GetSoftObjectPath().ToString() < Right.GetSoftObjectPath().ToString();
+        });
+        int32 MatchingIndex = 0;
+        for (const FAssetData& Asset : Assets)
+        {
+            if (ValidValues.Num() >= Limit)
+            {
+                break;
+            }
+            const FString CandidatePath = Asset.GetSoftObjectPath().ToString();
+            FString SearchText = CandidatePath;
+            SearchText.ToLowerInline();
+            if (!Query.IsEmpty() && !SearchText.Contains(Query))
+            {
+                continue;
+            }
+            if (IsPCGFallbackMeshPath(CandidatePath) && !bAllowFallbackMesh)
+            {
+                continue;
+            }
+            if (bSuitableOnly && !IsPCGEnvironmentMeshCandidate(CandidatePath))
+            {
+                continue;
+            }
+            if (MatchingIndex++ < Offset)
+            {
+                continue;
+            }
+            FString ResolvedPath;
+            FString ValidationError;
+            if (!ValidatePCGStaticMeshPath(CandidatePath, bAllowFallbackMesh, ResolvedPath, ValidationError))
+            {
+                continue;
+            }
+            UStaticMesh* Mesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(ResolvedPath));
+            ValidValues.Add(MakeShared<FJsonValueObject>(BuildPCGStaticMeshAssetResult(ResolvedPath, Mesh)));
+        }
+        Result->SetArrayField(TEXT("assets"), ValidValues);
+        Result->SetNumberField(TEXT("count"), ValidValues.Num());
+        Result->SetNumberField(TEXT("candidateCount"), Assets.Num());
+        Result->SetBoolField(TEXT("suitableOnly"), bSuitableOnly);
+        Result->SetBoolField(TEXT("allowFallbackMesh"), bAllowFallbackMesh);
+        SendAutomationResponse(Socket, RequestId, true, TEXT("Static Mesh assets searched and validated."), Result);
+        return true;
+    }
 
     if (SubAction == TEXT("create_pcg_graph"))
     {
@@ -1871,6 +2357,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             SendAutomationError(Socket, RequestId, TEXT("PCG regeneration was not scheduled. The component may already be generating, be up to date with force=false, or have no graph."), TEXT("GENERATION_NOT_SCHEDULED"));
             return true;
         }
+        const bool bWaitForGeneration = GetJsonBoolField(Payload, TEXT("wait"), false) ||
+            GetJsonBoolField(Payload, TEXT("waitForGeneration"), false);
+        if (bWaitForGeneration)
+        {
+            SchedulePCGGenerationWait(this, Socket, RequestId, World, Actor, Component, FString(), TaskId, bSave,
+                FMath::Clamp(GetJsonIntField(Payload, TEXT("timeoutMs"), 120000), 1000, 600000));
+            return true;
+        }
         bool bLevelSaved = false;
         FString SaveError;
         if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
@@ -1884,6 +2378,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
         Result->SetNumberField(TEXT("taskId"), static_cast<double>(TaskId));
         Result->SetBoolField(TEXT("force"), bForceGenerate);
+        Result->SetBoolField(TEXT("waited"), false);
         Result->SetBoolField(TEXT("saved"), bLevelSaved);
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG component regeneration started."), Result);
         return true;
@@ -1954,6 +2449,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             return true;
         }
 
+        const bool bWaitForGeneration = GetJsonBoolField(Payload, TEXT("wait"), false) ||
+            GetJsonBoolField(Payload, TEXT("waitForGeneration"), false);
+        if (bWaitForGeneration)
+        {
+            SchedulePCGGenerationWait(this, Socket, RequestId, World, Actor, Component, GraphPath, TaskId, bSave,
+                FMath::Clamp(GetJsonIntField(Payload, TEXT("timeoutMs"), 120000), 1000, 600000));
+            return true;
+        }
+
         bool bLevelSaved = false;
         if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error))
         {
@@ -1968,6 +2472,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
         Result->SetNumberField(TEXT("taskId"), static_cast<double>(TaskId));
         Result->SetBoolField(TEXT("force"), bForceGenerate);
+        Result->SetBoolField(TEXT("waited"), false);
         Result->SetBoolField(TEXT("saved"), bLevelSaved);
         McpHandlerUtils::AddVerification(Result, Component);
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG graph generation started."), Result);
@@ -2153,7 +2658,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         if (SubAction == TEXT("configure_static_mesh_spawner"))
         {
             TSharedPtr<FJsonObject> Configuration = MakeShared<FJsonObject>();
-            for (const TCHAR* Field : {TEXT("meshSelectorType"), TEXT("selectorType"), TEXT("meshEntries"), TEXT("meshPath"), TEXT("staticMesh")})
+            for (const TCHAR* Field : {TEXT("meshSelectorType"), TEXT("selectorType"), TEXT("meshEntries"), TEXT("meshPath"), TEXT("staticMesh"), TEXT("allowFallbackMesh"), TEXT("allowCube")})
             {
                 if (const TSharedPtr<FJsonValue>* Value = Payload->Values.Find(Field))
                 {
