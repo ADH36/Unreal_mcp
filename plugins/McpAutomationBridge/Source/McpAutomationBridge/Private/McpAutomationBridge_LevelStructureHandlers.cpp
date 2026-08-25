@@ -2070,18 +2070,32 @@ static bool EnsureRuntimeHashSetHlodSetup(UWorld* World, UHLODLayer* HLODLayer, 
 
     void* RuntimePartitionsValue = RuntimePartitionsProperty->ContainerPtrToValuePtr<void>(RuntimeHashSet);
     FScriptArrayHelper RuntimePartitions(RuntimePartitionsProperty, RuntimePartitionsValue);
+    const FStructProperty* RuntimePartitionDescProperty = CastField<FStructProperty>(RuntimePartitionsProperty->Inner);
+    const UStruct* RuntimePartitionDescStruct = RuntimePartitionDescProperty ? RuntimePartitionDescProperty->Struct : nullptr;
+    if (!RuntimePartitionDescStruct)
+    {
+        OutReason = TEXT("RuntimeHashSet partition descriptor is not a struct.");
+        return false;
+    }
     for (int32 PartitionIndex = 0; PartitionIndex < RuntimePartitions.Num(); ++PartitionIndex)
     {
         void* PartitionDesc = RuntimePartitions.GetRawPtr(PartitionIndex);
         FArrayProperty* HLODSetupsArray =
-            FindFProperty<FArrayProperty>(RuntimePartitionsProperty->Inner->GetClass(), TEXT("HLODSetups"));
+            FindFProperty<FArrayProperty>(RuntimePartitionDescStruct, TEXT("HLODSetups"));
         FObjectProperty* MainLayerProperty =
-            FindFProperty<FObjectProperty>(RuntimePartitionsProperty->Inner->GetClass(), TEXT("MainLayer"));
+            FindFProperty<FObjectProperty>(RuntimePartitionDescStruct, TEXT("MainLayer"));
         if (!HLODSetupsArray || !HLODSetupsArray->Inner || !MainLayerProperty)
         {
             OutReason = TEXT("RuntimeHashSet partition descriptor has no HLOD setup or main layer property.");
             return false;
         }
+        FStructProperty* HLODSetupStructProperty = CastField<FStructProperty>(HLODSetupsArray->Inner);
+        if (!HLODSetupStructProperty || !HLODSetupStructProperty->Struct)
+        {
+            OutReason = TEXT("RuntimeHashSet HLOD setup element is not a struct.");
+            return false;
+        }
+        const UStruct* HLODSetupStruct = HLODSetupStructProperty->Struct;
 
         URuntimePartition* MainLayer = Cast<URuntimePartition>(
             MainLayerProperty->GetObjectPropertyValue_InContainer(PartitionDesc));
@@ -2096,7 +2110,7 @@ static bool EnsureRuntimeHashSetHlodSetup(UWorld* World, UHLODLayer* HLODLayer, 
         {
             void* Setup = HLODSetups.GetRawPtr(SetupIndex);
             FArrayProperty* LayersProperty =
-                FindFProperty<FArrayProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("HLODLayers"));
+                FindFProperty<FArrayProperty>(HLODSetupStruct, TEXT("HLODLayers"));
             if (!LayersProperty)
             {
                 OutReason = TEXT("RuntimeHashSet HLOD setup has no HLODLayers property.");
@@ -2123,10 +2137,10 @@ static bool EnsureRuntimeHashSetHlodSetup(UWorld* World, UHLODLayer* HLODLayer, 
             return false;
         }
 
-        FNameProperty* NameProperty = FindFProperty<FNameProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("Name"));
-        FBoolProperty* SpatialProperty = FindFProperty<FBoolProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("bIsSpatiallyLoaded"));
-        FObjectProperty* PartitionLayerProperty = FindFProperty<FObjectProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("PartitionLayer"));
-        FArrayProperty* LayersProperty = FindFProperty<FArrayProperty>(HLODSetupsArray->Inner->GetClass(), TEXT("HLODLayers"));
+        FNameProperty* NameProperty = FindFProperty<FNameProperty>(HLODSetupStruct, TEXT("Name"));
+        FBoolProperty* SpatialProperty = FindFProperty<FBoolProperty>(HLODSetupStruct, TEXT("bIsSpatiallyLoaded"));
+        FObjectProperty* PartitionLayerProperty = FindFProperty<FObjectProperty>(HLODSetupStruct, TEXT("PartitionLayer"));
+        FArrayProperty* LayersProperty = FindFProperty<FArrayProperty>(HLODSetupStruct, TEXT("HLODLayers"));
         if (!NameProperty || !SpatialProperty || !PartitionLayerProperty || !LayersProperty)
         {
             OutReason = TEXT("RuntimeHashSet HLOD setup properties are incomplete.");
@@ -2141,6 +2155,13 @@ static bool EnsureRuntimeHashSetHlodSetup(UWorld* World, UHLODLayer* HLODLayer, 
             OutReason = TEXT("Failed to create the HLOD runtime partition.");
             return false;
         }
+        const FName HLODSetupName(*FString::Printf(TEXT("HLOD_%d"), NewSetupIndex));
+        NameProperty->SetPropertyValue_InContainer(NewSetup, HLODSetupName);
+        // CreateHLODRuntimePartition duplicates the parent settings but does not
+        // assign the runtime-grid name.  Without this name generated HLOD actor
+        // descriptors serialize as MainPartition:MainPartition and fail map
+        // validation after restart.
+        HLODPartition->Name = HLODSetupName;
         PartitionLayerProperty->SetObjectPropertyValue_InContainer(NewSetup, HLODPartition);
 
         FScriptArrayHelper Layers(LayersProperty, LayersProperty->ContainerPtrToValuePtr<void>(NewSetup));
@@ -2523,9 +2544,10 @@ static void AddHlodBuildLogFields(TSharedPtr<FJsonObject> Result)
     }
     if (ProgressTotal > 0)
     {
+        const double ProgressPercent = FMath::Clamp(100.0 * (double)ProgressCurrent / (double)ProgressTotal, 0.0, 100.0);
         Result->SetNumberField(TEXT("progressCurrent"), ProgressCurrent);
         Result->SetNumberField(TEXT("progressTotal"), ProgressTotal);
-        Result->SetNumberField(TEXT("progressPercent"), 100.0 * (double)ProgressCurrent / (double)ProgressTotal);
+        Result->SetNumberField(TEXT("progressPercent"), ProgressPercent);
     }
 }
 
