@@ -742,7 +742,16 @@ static bool HandleQueryNavigationPath(
         Self->SendAutomationResponse(Socket, RequestId, false, TEXT("start and end are required"), nullptr, TEXT("INVALID_PARAMS"));
         return true;
     }
-    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    UWorld* World = nullptr;
+    const FString RequestedWorld = GetJsonStringFieldNav(Payload, TEXT("world"), TEXT("Editor"));
+    if (GEditor && RequestedWorld.Equals(TEXT("PIE"), ESearchCase::IgnoreCase))
+    {
+        World = GEditor->PlayWorld;
+    }
+    else if (GEditor)
+    {
+        World = GEditor->GetEditorWorldContext().World();
+    }
     UNavigationSystemV1* NavSys = World ? FNavigationSystem::GetCurrent<UNavigationSystemV1>(World) : nullptr;
     if (!NavSys)
     {
@@ -763,8 +772,23 @@ static bool HandleQueryNavigationPath(
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetBoolField(TEXT("startNavigable"), bStartNavigable);
     Result->SetBoolField(TEXT("endNavigable"), bEndNavigable);
+    TSharedPtr<FJsonObject> ProjectedStartJson = McpHandlerUtils::CreateResultObject();
+    ProjectedStartJson->SetNumberField(TEXT("x"), ProjectedStart.Location.X);
+    ProjectedStartJson->SetNumberField(TEXT("y"), ProjectedStart.Location.Y);
+    ProjectedStartJson->SetNumberField(TEXT("z"), ProjectedStart.Location.Z);
+    TSharedPtr<FJsonObject> ProjectedEndJson = McpHandlerUtils::CreateResultObject();
+    ProjectedEndJson->SetNumberField(TEXT("x"), ProjectedEnd.Location.X);
+    ProjectedEndJson->SetNumberField(TEXT("y"), ProjectedEnd.Location.Y);
+    ProjectedEndJson->SetNumberField(TEXT("z"), ProjectedEnd.Location.Z);
+    Result->SetObjectField(TEXT("projectedStart"), ProjectedStartJson);
+    Result->SetObjectField(TEXT("projectedEnd"), ProjectedEndJson);
     Result->SetBoolField(TEXT("pathValid"), bValid);
     Result->SetBoolField(TEXT("partial"), Path && Path->IsPartial());
+    Result->SetNumberField(TEXT("pathLength"), Path ? Path->GetPathLength() : 0.0);
+    Result->SetNumberField(TEXT("pathCost"), Path ? Path->GetPathCost() : 0.0);
+    Result->SetNumberField(TEXT("pointCount"), Points.Num());
+    Result->SetStringField(TEXT("world"), World->GetPathName());
+    Result->SetStringField(TEXT("queryStatus"), bValid ? TEXT("Success") : (Path && Path->IsPartial() ? TEXT("Partial") : TEXT("Invalid")));
     Result->SetArrayField(TEXT("pathPoints"), Points);
     Self->SendAutomationResponse(Socket, RequestId, true, bValid ? TEXT("Navigation path is valid") : TEXT("Navigation path is unavailable or partial"), Result);
     return true;

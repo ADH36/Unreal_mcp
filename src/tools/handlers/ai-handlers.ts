@@ -339,6 +339,27 @@ export async function handleAITools(
       return sendRequest('stop_behavior_tree');
     }
 
+    case 'inspect_runtime_ai':
+    case 'query_runtime_ai':
+    case 'debug_runtime_ai':
+      return sendRequest(action);
+
+    case 'run_env_query':
+    case 'run_runtime_eqs':
+      requireNonEmptyString(argsRecord.queryPath, 'queryPath', 'Missing required parameter: queryPath');
+      return sendRequest(action);
+
+    case 'spawn_runtime_ai':
+    case 'spawn_ai_runtime':
+      requireNonEmptyString(argsRecord.pawnClassPath ?? argsRecord.pawnBlueprintPath, 'pawnClassPath', 'Missing required parameter: pawnClassPath or pawnBlueprintPath');
+      requireNonEmptyString(argsRecord.controllerClassPath ?? argsRecord.controllerPath, 'controllerClassPath', 'Missing required parameter: controllerClassPath or controllerPath');
+      return sendRequest(action);
+
+    case 'start_runtime_behavior_tree':
+    case 'run_behavior_tree_runtime':
+      requireNonEmptyString(argsRecord.behaviorTreePath, 'behaviorTreePath', 'Missing required parameter: behaviorTreePath');
+      return sendRequest(action);
+
     // =========================================================================
     // Default / Unknown Action
     // =========================================================================

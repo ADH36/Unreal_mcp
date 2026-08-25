@@ -46,6 +46,7 @@ public:
 			.Object(TEXT("start"), TEXT("Navigation query start."), [](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
 			.Object(TEXT("end"), TEXT("Navigation query end."), [](FMcpSchemaBuilder& S) { S.Number(TEXT("x")).Number(TEXT("y")).Number(TEXT("z")); })
 			.String(TEXT("actorName"), TEXT("Name of the actor."))
+			.String(TEXT("world"), TEXT("Navigation query world: PIE or Editor."))
 			.String(TEXT("actorPath"), TEXT("Path to actor."))
 			.String(TEXT("blueprintPath"), TEXT("Blueprint asset path."))
 			.Number(TEXT("agentRadius"), TEXT("Navigation agent radius (default: 35)."))

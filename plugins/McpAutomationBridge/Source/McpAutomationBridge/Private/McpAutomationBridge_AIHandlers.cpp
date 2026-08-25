@@ -82,11 +82,15 @@
 
 // AI Controller
 #include "AIController.h"
+#include "EngineUtils.h"
+#include "GameFramework/Pawn.h"
 
 // Behavior Tree
 #include "BehaviorTree/BehaviorTree.h"
+#include "BehaviorTree/BehaviorTreeComponent.h"
 #include "BehaviorTree/BehaviorTreeTypes.h"
 #include "BehaviorTree/BlackboardData.h"
+#include "BehaviorTree/BlackboardComponent.h"
 #include "McpAutomationBridge_BehaviorTreeSerializers.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Bool.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Int.h"
@@ -154,6 +158,7 @@
 
 // Navigation
 #include "NavModifierComponent.h"
+#include "NavigationSystem.h"
 #include "NavAreas/NavArea.h"
 #include "NavAreas/NavArea_Default.h"
 #include "NavAreas/NavArea_Null.h"
@@ -588,6 +593,472 @@ static UEnvQuery* CreateEQSQueryAsset(const FString& Path, const FString& Name, 
 
     return Query;
 }
+
+// -----------------------------------------------------------------------------
+// Runtime validation helpers.  These intentionally operate on the selected
+// world and never save PIE objects.  Authoring actions above remain editor-only.
+// -----------------------------------------------------------------------------
+static UWorld* ResolveAIValidationWorld(const TSharedPtr<FJsonObject>& Payload, FString& OutError)
+{
+    const FString RequestedWorld = GetStringFieldAI(Payload, TEXT("world"), TEXT("PIE"));
+    if (!GEditor)
+    {
+        OutError = TEXT("Editor is not available");
+        return nullptr;
+    }
+
+    if (RequestedWorld.Equals(TEXT("PIE"), ESearchCase::IgnoreCase) ||
+        RequestedWorld.Equals(TEXT("Play"), ESearchCase::IgnoreCase))
+    {
+        if (!GEditor->PlayWorld)
+        {
+            OutError = TEXT("PIE world is not running; start PIE before runtime AI validation");
+            return nullptr;
+        }
+        return GEditor->PlayWorld;
+    }
+    if (RequestedWorld.Equals(TEXT("Editor"), ESearchCase::IgnoreCase))
+    {
+        UWorld* EditorWorld = GEditor->GetEditorWorldContext().World();
+        if (!EditorWorld)
+        {
+            OutError = TEXT("Editor world is not available");
+        }
+        return EditorWorld;
+    }
+
+    OutError = TEXT("world must be either PIE or Editor");
+    return nullptr;
+}
+
+static UClass* ResolveAIClass(const FString& ClassPath, UClass* RequiredBase)
+{
+    if (ClassPath.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    UClass* Resolved = StaticLoadClass(UObject::StaticClass(), nullptr, *ClassPath);
+    if (!Resolved)
+    {
+        if (UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *ClassPath))
+        {
+            Resolved = Blueprint->GeneratedClass;
+        }
+    }
+    return Resolved && (!RequiredBase || Resolved->IsChildOf(RequiredBase)) ? Resolved : nullptr;
+}
+
+static TSharedPtr<FJsonObject> SerializeRuntimeBlackboard(UBlackboardComponent* Blackboard)
+{
+    TSharedPtr<FJsonObject> Output = McpHandlerUtils::CreateResultObject();
+    if (!Blackboard)
+    {
+        Output->SetBoolField(TEXT("present"), false);
+        return Output;
+    }
+
+    UBlackboardData* Data = Blackboard->GetBlackboardAsset();
+    Output->SetBoolField(TEXT("present"), true);
+    Output->SetStringField(TEXT("assetPath"), Data ? Data->GetPathName() : FString());
+    TArray<TSharedPtr<FJsonValue>> Values;
+    if (Data)
+    {
+        for (int32 KeyId = 0; KeyId < Data->GetNumKeys(); ++KeyId)
+        {
+            const FBlackboard::FKey Key = static_cast<FBlackboard::FKey>(KeyId);
+            const FBlackboardEntry* Entry = Data->GetKey(Key);
+            if (!Entry)
+            {
+                continue;
+            }
+            const FName KeyName = Data->GetKeyName(Key);
+            TSharedPtr<FJsonObject> Value = McpHandlerUtils::CreateResultObject();
+            Value->SetStringField(TEXT("name"), KeyName.ToString());
+            Value->SetStringField(TEXT("type"), Entry->KeyType ? Entry->KeyType->GetClass()->GetName() : TEXT("Unknown"));
+
+            if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Bool::StaticClass()))
+            {
+                Value->SetBoolField(TEXT("value"), Blackboard->GetValueAsBool(KeyName));
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Int::StaticClass()))
+            {
+                Value->SetNumberField(TEXT("value"), Blackboard->GetValueAsInt(KeyName));
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Float::StaticClass()))
+            {
+                Value->SetNumberField(TEXT("value"), Blackboard->GetValueAsFloat(KeyName));
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Vector::StaticClass()))
+            {
+                const FVector VectorValue = Blackboard->GetValueAsVector(KeyName);
+                TSharedPtr<FJsonObject> Vector = McpHandlerUtils::CreateResultObject();
+                Vector->SetNumberField(TEXT("x"), VectorValue.X);
+                Vector->SetNumberField(TEXT("y"), VectorValue.Y);
+                Vector->SetNumberField(TEXT("z"), VectorValue.Z);
+                Value->SetObjectField(TEXT("value"), Vector);
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Rotator::StaticClass()))
+            {
+                Value->SetStringField(TEXT("value"), Blackboard->GetValueAsRotator(KeyName).ToString());
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Name::StaticClass()))
+            {
+                Value->SetStringField(TEXT("value"), Blackboard->GetValueAsName(KeyName).ToString());
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_String::StaticClass()))
+            {
+                Value->SetStringField(TEXT("value"), Blackboard->GetValueAsString(KeyName));
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Object::StaticClass()))
+            {
+                Value->SetStringField(TEXT("value"), GetPathNameSafe(Blackboard->GetValueAsObject(KeyName)));
+            }
+            else if (Entry->KeyType && Entry->KeyType->IsA(UBlackboardKeyType_Class::StaticClass()))
+            {
+                Value->SetStringField(TEXT("value"), GetPathNameSafe(Blackboard->GetValueAsClass(KeyName)));
+            }
+            Values.Add(MakeShared<FJsonValueObject>(Value));
+        }
+    }
+    Output->SetNumberField(TEXT("keyCount"), Values.Num());
+    Output->SetArrayField(TEXT("values"), Values);
+    return Output;
+}
+
+static TSharedPtr<FJsonObject> SerializeRuntimePerception(UAIPerceptionComponent* Perception)
+{
+    TSharedPtr<FJsonObject> Output = McpHandlerUtils::CreateResultObject();
+    if (!Perception)
+    {
+        Output->SetBoolField(TEXT("present"), false);
+        Output->SetNumberField(TEXT("currentlyPerceivedCount"), 0);
+        return Output;
+    }
+    TArray<AActor*> Perceived;
+    Perception->GetCurrentlyPerceivedActors(nullptr, Perceived);
+    TArray<TSharedPtr<FJsonValue>> Actors;
+    for (AActor* Actor : Perceived)
+    {
+        if (!Actor)
+        {
+            continue;
+        }
+        TSharedPtr<FJsonObject> ActorInfo = McpHandlerUtils::CreateResultObject();
+        ActorInfo->SetStringField(TEXT("path"), Actor->GetPathName());
+        ActorInfo->SetStringField(TEXT("name"), Actor->GetActorNameOrLabel());
+        FActorPerceptionBlueprintInfo Info;
+        TArray<TSharedPtr<FJsonValue>> Stimuli;
+        if (Perception->GetActorsPerception(Actor, Info))
+        {
+            for (const FAIStimulus& Stimulus : Info.LastSensedStimuli)
+            {
+                TSharedPtr<FJsonObject> StimulusInfo = McpHandlerUtils::CreateResultObject();
+                StimulusInfo->SetStringField(TEXT("sense"), Stimulus.Type.Name.ToString());
+                StimulusInfo->SetBoolField(TEXT("sensed"), Stimulus.WasSuccessfullySensed());
+                StimulusInfo->SetBoolField(TEXT("active"), Stimulus.IsActive());
+                StimulusInfo->SetNumberField(TEXT("strength"), Stimulus.Strength);
+                StimulusInfo->SetNumberField(TEXT("age"), Stimulus.GetAge());
+                StimulusInfo->SetStringField(TEXT("location"), Stimulus.StimulusLocation.ToString());
+                Stimuli.Add(MakeShared<FJsonValueObject>(StimulusInfo));
+            }
+        }
+        ActorInfo->SetArrayField(TEXT("stimuli"), Stimuli);
+        Actors.Add(MakeShared<FJsonValueObject>(ActorInfo));
+    }
+    Output->SetBoolField(TEXT("present"), true);
+    Output->SetNumberField(TEXT("currentlyPerceivedCount"), Actors.Num());
+    Output->SetArrayField(TEXT("actors"), Actors);
+    return Output;
+}
+
+static FString InferRuntimeAIState(const FString& ActiveNode)
+{
+    const FString Lower = ActiveNode.ToLower();
+    if (Lower.Contains(TEXT("patrol"))) return TEXT("patrol");
+    if (Lower.Contains(TEXT("investigat"))) return TEXT("investigate");
+    if (Lower.Contains(TEXT("chase")) || Lower.Contains(TEXT("pursu"))) return TEXT("chase");
+    if (Lower.Contains(TEXT("attack")) || Lower.Contains(TEXT("combat"))) return TEXT("attack");
+    if (Lower.Contains(TEXT("return"))) return TEXT("return");
+    return ActiveNode.IsEmpty() ? TEXT("idle") : TEXT("unknown");
+}
+
+static bool HandleInspectRuntimeAI(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString WorldError;
+    UWorld* World = ResolveAIValidationWorld(Payload, WorldError);
+    if (!World)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, WorldError, nullptr, TEXT("NO_RUNTIME_WORLD"));
+        return true;
+    }
+    const FString RequestedName = GetStringFieldAI(Payload, TEXT("controllerName"), GetStringFieldAI(Payload, TEXT("actorName")));
+    const float StuckSpeed = GetNumberFieldAI(Payload, TEXT("stuckSpeedThreshold"), 2.0f);
+    UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+    TArray<TSharedPtr<FJsonValue>> Controllers;
+
+    for (TActorIterator<AAIController> It(World); It; ++It)
+    {
+        AAIController* Controller = *It;
+        if (!Controller || (!RequestedName.IsEmpty() &&
+            !Controller->GetName().Equals(RequestedName, ESearchCase::IgnoreCase) &&
+            !Controller->GetActorNameOrLabel().Equals(RequestedName, ESearchCase::IgnoreCase)))
+        {
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> Info = McpHandlerUtils::CreateResultObject();
+        APawn* Pawn = Controller->GetPawn();
+        Info->SetStringField(TEXT("controllerPath"), Controller->GetPathName());
+        Info->SetStringField(TEXT("controllerClass"), Controller->GetClass()->GetPathName());
+        Info->SetBoolField(TEXT("possessed"), Pawn != nullptr);
+        Info->SetStringField(TEXT("pawnPath"), GetPathNameSafe(Pawn));
+        if (Pawn)
+        {
+            Info->SetStringField(TEXT("pawnClass"), Pawn->GetClass()->GetPathName());
+            Info->SetStringField(TEXT("location"), Pawn->GetActorLocation().ToString());
+            Info->SetNumberField(TEXT("speed"), Pawn->GetVelocity().Size());
+            FNavLocation Projected;
+            const bool bOnNavMesh = NavSys && NavSys->ProjectPointToNavigation(Pawn->GetActorLocation(), Projected);
+            Info->SetBoolField(TEXT("offNavMesh"), !bOnNavMesh);
+            Info->SetBoolField(TEXT("stuckCandidate"), Pawn->GetVelocity().Size() <= StuckSpeed);
+            Info->SetStringField(TEXT("stuckReason"), Pawn->GetVelocity().Size() <= StuckSpeed ? TEXT("velocity below threshold") : FString());
+        }
+
+        UBehaviorTreeComponent* BTComponent = Controller->FindComponentByClass<UBehaviorTreeComponent>();
+        const UBTNode* ActiveNode = BTComponent ? BTComponent->GetActiveNode() : nullptr;
+        const FString ActiveNodeName = ActiveNode ? ActiveNode->GetNodeName() : FString();
+        Info->SetBoolField(TEXT("behaviorTreeRunning"), BTComponent && BTComponent->IsRunning());
+        Info->SetBoolField(TEXT("behaviorTreePaused"), BTComponent && BTComponent->IsPaused());
+        Info->SetStringField(TEXT("behaviorTreePath"), BTComponent && BTComponent->GetCurrentTree() ? BTComponent->GetCurrentTree()->GetPathName() : FString());
+        Info->SetStringField(TEXT("activeNode"), ActiveNodeName);
+        Info->SetStringField(TEXT("activeTasks"), BTComponent ? BTComponent->DescribeActiveTasks() : FString());
+        Info->SetStringField(TEXT("activeTrees"), BTComponent ? BTComponent->DescribeActiveTrees() : FString());
+        const FString State = InferRuntimeAIState(ActiveNodeName);
+        Info->SetStringField(TEXT("state"), State);
+        Info->SetStringField(TEXT("stateEvidence"), ActiveNodeName);
+        Info->SetNumberField(TEXT("stateObservedAtSeconds"), World->GetTimeSeconds());
+        Info->SetObjectField(TEXT("blackboard"), SerializeRuntimeBlackboard(Controller->GetBlackboardComponent()));
+        Info->SetObjectField(TEXT("perception"), SerializeRuntimePerception(Controller->FindComponentByClass<UAIPerceptionComponent>()));
+        Controllers.Add(MakeShared<FJsonValueObject>(Info));
+    }
+
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("world"), World->GetPathName());
+    Result->SetNumberField(TEXT("controllerCount"), Controllers.Num());
+    Result->SetArrayField(TEXT("controllers"), Controllers);
+    Result->SetBoolField(TEXT("runtimeObserved"), true);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Runtime AI state inspected"), Result);
+    return true;
+}
+
+static bool HandleRunRuntimeEQS(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString WorldError;
+    UWorld* World = ResolveAIValidationWorld(Payload, WorldError);
+    const FString QueryPath = GetStringFieldAI(Payload, TEXT("queryPath"));
+    if (!World || QueryPath.IsEmpty())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, World ? TEXT("queryPath is required") : WorldError, nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    UEnvQuery* Query = LoadObject<UEnvQuery>(nullptr, *QueryPath);
+    if (!Query)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, FString::Printf(TEXT("EQS query not found: %s"), *QueryPath), nullptr, TEXT("NOT_FOUND"));
+        return true;
+    }
+    AActor* Querier = nullptr;
+    const FString QuerierName = GetStringFieldAI(Payload, TEXT("querierName"), GetStringFieldAI(Payload, TEXT("actorName")));
+    if (!QuerierName.IsEmpty())
+    {
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            if ((*It)->GetName().Equals(QuerierName, ESearchCase::IgnoreCase) || (*It)->GetActorNameOrLabel().Equals(QuerierName, ESearchCase::IgnoreCase))
+            {
+                Querier = *It;
+                break;
+            }
+        }
+    }
+    if (!Querier)
+    {
+        for (TActorIterator<AAIController> It(World); It; ++It)
+        {
+            if (It->GetPawn()) { Querier = It->GetPawn(); break; }
+        }
+    }
+    if (!Querier)
+    {
+        Querier = World->GetWorldSettings();
+    }
+    UEnvQueryManager* Manager = UEnvQueryManager::GetCurrent(World);
+    if (!Manager)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("EQS manager is not available in selected world"), nullptr, TEXT("NO_EQS_MANAGER"));
+        return true;
+    }
+    FEnvQueryRequest Request(Query, Querier);
+    Request.SetWorldOverride(World);
+    const TSharedPtr<FEnvQueryResult> QueryResult = Manager->RunInstantQuery(Request, EEnvQueryRunMode::AllMatching);
+    if (!QueryResult.IsValid())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("EQS query returned no result object"), nullptr, TEXT("EQS_FAILED"));
+        return true;
+    }
+    TArray<TSharedPtr<FJsonValue>> Items;
+    for (int32 Index = 0; Index < QueryResult->Items.Num(); ++Index)
+    {
+        if (!QueryResult->Items[Index].IsValid()) continue;
+        TSharedPtr<FJsonObject> Item = McpHandlerUtils::CreateResultObject();
+        const bool bActorItem = QueryResult->ItemType && QueryResult->ItemType->GetName().Contains(TEXT("Actor"));
+        if (!bActorItem)
+        {
+            const FVector Location = QueryResult->GetItemAsLocation(Index);
+            Item->SetNumberField(TEXT("x"), Location.X);
+            Item->SetNumberField(TEXT("y"), Location.Y);
+            Item->SetNumberField(TEXT("z"), Location.Z);
+        }
+        Item->SetNumberField(TEXT("score"), QueryResult->GetItemScore(Index));
+        if (AActor* Actor = QueryResult->GetItemAsActor(Index)) Item->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+        Items.Add(MakeShared<FJsonValueObject>(Item));
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("queryPath"), QueryPath);
+    FString QueryStatus = TEXT("Processing");
+    switch (QueryResult->GetRawStatus())
+    {
+        case EEnvQueryStatus::Success: QueryStatus = TEXT("Success"); break;
+        case EEnvQueryStatus::Failed: QueryStatus = TEXT("Failed"); break;
+        case EEnvQueryStatus::Aborted: QueryStatus = TEXT("Aborted"); break;
+        case EEnvQueryStatus::OwnerLost: QueryStatus = TEXT("OwnerLost"); break;
+        case EEnvQueryStatus::MissingParam: QueryStatus = TEXT("MissingParam"); break;
+        default: break;
+    }
+    Result->SetStringField(TEXT("status"), QueryStatus);
+    Result->SetBoolField(TEXT("successful"), QueryResult->IsSuccessful());
+    Result->SetNumberField(TEXT("resultCount"), Items.Num());
+    Result->SetArrayField(TEXT("results"), Items);
+    const bool bHasScoredResults = QueryResult->IsSuccessful() && Items.Num() > 0;
+    Self->SendAutomationResponse(
+        Socket, RequestId, bHasScoredResults,
+        bHasScoredResults ? TEXT("EQS query completed with scored results") : (QueryResult->IsSuccessful() ? TEXT("EQS query completed with no matching items") : TEXT("EQS query failed")),
+        Result, bHasScoredResults ? TEXT("") : (QueryResult->IsSuccessful() ? TEXT("EQS_EMPTY_RESULTS") : TEXT("EQS_FAILED")));
+    return true;
+}
+
+static bool HandleSpawnRuntimeAI(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString WorldError;
+    UWorld* World = ResolveAIValidationWorld(Payload, WorldError);
+    const FString PawnClassPath = GetStringFieldAI(Payload, TEXT("pawnClassPath"), GetStringFieldAI(Payload, TEXT("pawnBlueprintPath")));
+    const FString ControllerClassPath = GetStringFieldAI(Payload, TEXT("controllerClassPath"), GetStringFieldAI(Payload, TEXT("controllerPath")));
+    const FString BTPath = GetStringFieldAI(Payload, TEXT("behaviorTreePath"));
+    const FString BBPath = GetStringFieldAI(Payload, TEXT("blackboardPath"));
+    if (!World || PawnClassPath.IsEmpty() || ControllerClassPath.IsEmpty())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, World ? TEXT("pawnClassPath and controllerClassPath are required") : WorldError, nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    UClass* PawnClass = ResolveAIClass(PawnClassPath, APawn::StaticClass());
+    UClass* ControllerClass = ResolveAIClass(ControllerClassPath, AAIController::StaticClass());
+    UBehaviorTree* BT = BTPath.IsEmpty() ? nullptr : LoadObject<UBehaviorTree>(nullptr, *BTPath);
+    UBlackboardData* BB = BBPath.IsEmpty() ? nullptr : LoadObject<UBlackboardData>(nullptr, *BBPath);
+    if (!PawnClass || !ControllerClass || (!BTPath.IsEmpty() && !BT) || (!BBPath.IsEmpty() && !BB))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Invalid pawn/controller/Behavior Tree/Blackboard asset or incompatible class"), nullptr, TEXT("INCOMPATIBLE_ASSETS"));
+        return true;
+    }
+    if (BT && BB && BT->BlackboardAsset && BT->BlackboardAsset != BB)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Behavior Tree Blackboard does not match requested Blackboard"), nullptr, TEXT("BLACKBOARD_MISMATCH"));
+        return true;
+    }
+    FVector Location = FVector::ZeroVector;
+    if (const TSharedPtr<FJsonObject>* LocationObject = nullptr; Payload->TryGetObjectField(TEXT("location"), LocationObject) && LocationObject && LocationObject->IsValid())
+    {
+        Location.X = GetNumberFieldAI(*LocationObject, TEXT("x"), 0.0);
+        Location.Y = GetNumberFieldAI(*LocationObject, TEXT("y"), 0.0);
+        Location.Z = GetNumberFieldAI(*LocationObject, TEXT("z"), 100.0);
+    }
+    FActorSpawnParameters SpawnParameters;
+    SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+    APawn* Pawn = World->SpawnActor<APawn>(PawnClass, Location, FRotator::ZeroRotator, SpawnParameters);
+    if (!Pawn)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Failed to spawn runtime AI pawn"), nullptr, TEXT("SPAWN_FAILED"));
+        return true;
+    }
+    AAIController* Controller = World->SpawnActor<AAIController>(ControllerClass, Location, FRotator::ZeroRotator, SpawnParameters);
+    if (!Controller)
+    {
+        Pawn->Destroy();
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Failed to spawn runtime AI controller"), nullptr, TEXT("SPAWN_FAILED"));
+        return true;
+    }
+    Controller->Possess(Pawn);
+    bool bBlackboardStarted = true;
+    bool bBehaviorTreeStarted = true;
+    if (BT)
+    {
+        UBlackboardComponent* BlackboardComponent = nullptr;
+        if (BB) bBlackboardStarted = Controller->UseBlackboard(BB, BlackboardComponent);
+        bBehaviorTreeStarted = bBlackboardStarted && Controller->RunBehaviorTree(BT);
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetStringField(TEXT("pawnPath"), Pawn->GetPathName());
+    Result->SetStringField(TEXT("controllerPath"), Controller->GetPathName());
+    Result->SetBoolField(TEXT("possessed"), Controller->GetPawn() == Pawn);
+    Result->SetBoolField(TEXT("blackboardStarted"), bBlackboardStarted);
+    Result->SetBoolField(TEXT("behaviorTreeStarted"), bBehaviorTreeStarted);
+    Result->SetBoolField(TEXT("runtimeSpawned"), true);
+    Self->SendAutomationResponse(Socket, RequestId, bBlackboardStarted && bBehaviorTreeStarted, TEXT("Runtime AI spawned and configured"), Result, bBlackboardStarted && bBehaviorTreeStarted ? TEXT("") : TEXT("RUNTIME_START_FAILED"));
+    return true;
+}
+
+static bool HandleStartRuntimeBehaviorTree(
+    UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString WorldError;
+    UWorld* World = ResolveAIValidationWorld(Payload, WorldError);
+    const FString BTPath = GetStringFieldAI(Payload, TEXT("behaviorTreePath"));
+    const FString BBPath = GetStringFieldAI(Payload, TEXT("blackboardPath"));
+    const FString ControllerName = GetStringFieldAI(Payload, TEXT("controllerName"), GetStringFieldAI(Payload, TEXT("actorName")));
+    UBehaviorTree* BT = BTPath.IsEmpty() ? nullptr : LoadObject<UBehaviorTree>(nullptr, *BTPath);
+    UBlackboardData* BB = BBPath.IsEmpty() ? nullptr : LoadObject<UBlackboardData>(nullptr, *BBPath);
+    if (!World || !BT)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, World ? TEXT("behaviorTreePath is required and must resolve") : WorldError, nullptr, TEXT("INVALID_PARAMS"));
+        return true;
+    }
+    if (BB && BT->BlackboardAsset && BT->BlackboardAsset != BB)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Behavior Tree Blackboard does not match requested Blackboard"), nullptr, TEXT("BLACKBOARD_MISMATCH"));
+        return true;
+    }
+    int32 StartedCount = 0;
+    for (TActorIterator<AAIController> It(World); It; ++It)
+    {
+        AAIController* Controller = *It;
+        if (!Controller || (!ControllerName.IsEmpty() && !Controller->GetName().Equals(ControllerName, ESearchCase::IgnoreCase) && !Controller->GetActorNameOrLabel().Equals(ControllerName, ESearchCase::IgnoreCase))) continue;
+        UBlackboardComponent* BlackboardComponent = nullptr;
+        const bool bBB = BB ? Controller->UseBlackboard(BB, BlackboardComponent) : true;
+        if (bBB && Controller->RunBehaviorTree(BT)) ++StartedCount;
+    }
+    TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetNumberField(TEXT("startedCount"), StartedCount);
+    Result->SetStringField(TEXT("behaviorTreePath"), BT->GetPathName());
+    Result->SetBoolField(TEXT("runtimeObserved"), StartedCount > 0);
+    Self->SendAutomationResponse(Socket, RequestId, StartedCount > 0, StartedCount > 0 ? TEXT("Behavior Tree started in runtime world") : TEXT("No compatible AI controller found"), Result, StartedCount > 0 ? TEXT("") : TEXT("NO_CONTROLLER"));
+    return true;
+}
 #endif
 
 bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
@@ -616,6 +1087,23 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
     }
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+
+    if (SubAction == TEXT("inspect_runtime_ai") || SubAction == TEXT("query_runtime_ai") || SubAction == TEXT("debug_runtime_ai"))
+    {
+        return HandleInspectRuntimeAI(this, RequestId, Payload, RequestingSocket);
+    }
+    if (SubAction == TEXT("run_env_query") || SubAction == TEXT("run_runtime_eqs"))
+    {
+        return HandleRunRuntimeEQS(this, RequestId, Payload, RequestingSocket);
+    }
+    if (SubAction == TEXT("spawn_runtime_ai") || SubAction == TEXT("spawn_ai_runtime"))
+    {
+        return HandleSpawnRuntimeAI(this, RequestId, Payload, RequestingSocket);
+    }
+    if (SubAction == TEXT("start_runtime_behavior_tree") || SubAction == TEXT("run_behavior_tree_runtime"))
+    {
+        return HandleStartRuntimeBehaviorTree(this, RequestId, Payload, RequestingSocket);
+    }
 
     if (IsManageAIBehaviorTreeGraphSubAction(SubAction))
     {

@@ -2678,7 +2678,11 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'create_blackboard', 'setup_perception',
             'set_focus', 'clear_focus',
             'set_blackboard_value', 'get_blackboard_value',
-            'run_behavior_tree', 'stop_behavior_tree'
+            'run_behavior_tree', 'stop_behavior_tree',
+            'inspect_runtime_ai', 'query_runtime_ai', 'debug_runtime_ai',
+            'run_env_query', 'run_runtime_eqs',
+            'spawn_runtime_ai', 'spawn_ai_runtime',
+            'start_runtime_behavior_tree', 'run_behavior_tree_runtime'
           ,
             ...BEHAVIOR_TREE_ACTIONS, ...NAVIGATION_ACTIONS],
           description: 'AI action to perform'
@@ -2912,6 +2916,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         enableSight: commonSchemas.booleanProp,
         enabled: commonSchemas.booleanProp,
         focusActorName: commonSchemas.actorName,
+        controllerName: commonSchemas.actorName,
+        querierName: commonSchemas.actorName,
+        world: { type: 'string', enum: ['PIE', 'Editor'], description: 'Runtime world to inspect (PIE is the default).' },
+        pawnClassPath: commonSchemas.stringProp,
+        pawnBlueprintPath: commonSchemas.blueprintPath,
+        controllerClassPath: commonSchemas.stringProp,
+        stuckSpeedThreshold: commonSchemas.numberProp,
         hearingRange: commonSchemas.numberProp,
         loseSightRadius: commonSchemas.numberProp,
         nodeType: commonSchemas.stringProp,
