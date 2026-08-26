@@ -5145,6 +5145,7 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
     Result->SetNumberField(TEXT("memoryBytes"), static_cast<double>(Memory.UsedPhysical));
     Result->SetNumberField(TEXT("actorCount"), ActorCount);
     Result->SetNumberField(TEXT("drawCalls"), GNumDrawCallsRHI[0]);
+    Result->SetNumberField(TEXT("primitiveCount"), GNumPrimitivesDrawnRHI[0]);
     Result->SetBoolField(TEXT("drawCallsAvailable"), true);
     SendAutomationResponse(Socket, RequestId, true, TEXT("PIE metrics queried"), Result, FString());
     return true;

@@ -1846,6 +1846,10 @@ static bool HandleGetNavigationInfo(
             NavInfo->SetNumberField(TEXT("agentHeight"), NavMesh->AgentHeight);
             NavInfo->SetNumberField(TEXT("agentMaxSlope"), NavMesh->AgentMaxSlope);
             NavInfo->SetNumberField(TEXT("tileSizeUU"), NavMesh->TileSizeUU);
+            NavInfo->SetNumberField(TEXT("tileCount"), NavMesh->GetNavMeshTilesCount());
+            NavInfo->SetNumberField(TEXT("activeTileCount"), NavMesh->GetNumActiveTiles());
+            NavInfo->SetBoolField(TEXT("supportsRuntimeGeneration"), NavMesh->SupportsRuntimeGeneration());
+            NavInfo->SetBoolField(TEXT("supportsStreaming"), NavMesh->SupportsStreaming());
 
             // Get resolution params - UE 5.2+ uses NavMeshResolutionParams
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
@@ -1871,6 +1875,7 @@ static bool HandleGetNavigationInfo(
         }
 
         NavInfo->SetBoolField(TEXT("isNavigationBuildInProgress"), NavSys->IsNavigationBuildInProgress());
+        NavInfo->SetNumberField(TEXT("supportedAgentCount"), NavSys->GetSupportedAgents().Num());
     }
 
     // Count NavLinkProxies
