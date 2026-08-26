@@ -100,6 +100,8 @@
 #if WITH_EDITOR
 namespace {
 constexpr int32 MaxScreenshotPngBytesForBase64ForMcp = 3 * 1024 * 1024;
+constexpr int32 MinScreenshotResolutionForMcp = 256;
+constexpr int32 MaxScreenshotResolutionForMcp = 7680;
 
 bool HasVisibleScreenshotPixelsForMcp(const TArray<FColor>& Bitmap, int32& OutNonBlackPixels)
 {
@@ -109,6 +111,128 @@ bool HasVisibleScreenshotPixelsForMcp(const TArray<FColor>& Bitmap, int32& OutNo
     if (Pixel.R > 8 || Pixel.G > 8 || Pixel.B > 8) ++OutNonBlackPixels;
   }
   return OutNonBlackPixels > 0;
+}
+
+// Box-filter resample of an RGBA bitmap; footprint < 1px degenerates to nearest-neighbor on upscale.
+void ResizeScreenshotBitmapForMcp(const TArray<FColor>& Source, int32 SourceWidth,
+                                  int32 SourceHeight, int32 TargetWidth, int32 TargetHeight,
+                                  TArray<FColor>& OutBitmap)
+{
+  OutBitmap.Reset();
+  if (SourceWidth <= 0 || SourceHeight <= 0 || TargetWidth <= 0 || TargetHeight <= 0 ||
+      Source.Num() < SourceWidth * SourceHeight)
+  {
+    return;
+  }
+
+  OutBitmap.SetNumUninitialized(TargetWidth * TargetHeight);
+  const double ScaleX = static_cast<double>(SourceWidth) / static_cast<double>(TargetWidth);
+  const double ScaleY = static_cast<double>(SourceHeight) / static_cast<double>(TargetHeight);
+
+  for (int32 TargetY = 0; TargetY < TargetHeight; ++TargetY)
+  {
+    const double SpanBeginY = TargetY * ScaleY;
+    const double SpanEndY = SpanBeginY + ScaleY;
+    const int32 FirstSourceY = FMath::Clamp(FMath::FloorToInt32(SpanBeginY), 0, SourceHeight - 1);
+    const int32 LastSourceY = FMath::Clamp(FMath::CeilToInt32(SpanEndY) - 1, 0, SourceHeight - 1);
+
+    for (int32 TargetX = 0; TargetX < TargetWidth; ++TargetX)
+    {
+      const double SpanBeginX = TargetX * ScaleX;
+      const double SpanEndX = SpanBeginX + ScaleX;
+      const int32 FirstSourceX = FMath::Clamp(FMath::FloorToInt32(SpanBeginX), 0, SourceWidth - 1);
+      const int32 LastSourceX = FMath::Clamp(FMath::CeilToInt32(SpanEndX) - 1, 0, SourceWidth - 1);
+
+      double SumR = 0.0, SumG = 0.0, SumB = 0.0, SumWeight = 0.0;
+      for (int32 SourceY = FirstSourceY; SourceY <= LastSourceY; ++SourceY)
+      {
+        const double WeightY = FMath::Min(SpanEndY, SourceY + 1.0) -
+                               FMath::Max(SpanBeginY, static_cast<double>(SourceY));
+        if (WeightY <= 0.0) continue;
+        const FColor* Row = Source.GetData() + SourceY * SourceWidth;
+        for (int32 SourceX = FirstSourceX; SourceX <= LastSourceX; ++SourceX)
+        {
+          const double WeightX = FMath::Min(SpanEndX, SourceX + 1.0) -
+                                 FMath::Max(SpanBeginX, static_cast<double>(SourceX));
+          if (WeightX <= 0.0) continue;
+          const double Weight = WeightX * WeightY;
+          SumR += Row[SourceX].R * Weight;
+          SumG += Row[SourceX].G * Weight;
+          SumB += Row[SourceX].B * Weight;
+          SumWeight += Weight;
+        }
+      }
+
+      FColor& OutPixel = OutBitmap[TargetY * TargetWidth + TargetX];
+      if (SumWeight > 0.0)
+      {
+        OutPixel.R = static_cast<uint8>(FMath::Clamp(FMath::FloorToInt32(SumR / SumWeight + 0.5), 0, 255));
+        OutPixel.G = static_cast<uint8>(FMath::Clamp(FMath::FloorToInt32(SumG / SumWeight + 0.5), 0, 255));
+        OutPixel.B = static_cast<uint8>(FMath::Clamp(FMath::FloorToInt32(SumB / SumWeight + 0.5), 0, 255));
+      }
+      else
+      {
+        OutPixel.R = 0;
+        OutPixel.G = 0;
+        OutPixel.B = 0;
+      }
+      OutPixel.A = 255;
+    }
+  }
+}
+
+// Returns true when any resolution request field is present. 0 means unspecified or unparsable.
+bool ParseUiScreenshotResolutionForMcp(const TSharedPtr<FJsonObject>& Payload,
+                                       int32& OutWidth, int32& OutHeight)
+{
+  OutWidth = 0;
+  OutHeight = 0;
+  if (!Payload.IsValid())
+  {
+    return false;
+  }
+
+  FString ResolutionText;
+  if (Payload->TryGetStringField(TEXT("resolution"), ResolutionText))
+  {
+    ResolutionText.ReplaceInline(TEXT("X"), TEXT("x"));
+    ResolutionText.ReplaceInline(TEXT("*"), TEXT("x"));
+    TArray<FString> Parts;
+    ResolutionText.ParseIntoArray(Parts, TEXT("x"), true);
+    if (Parts.Num() == 2)
+    {
+      OutWidth = FCString::Atoi(*Parts[0]);
+      OutHeight = FCString::Atoi(*Parts[1]);
+    }
+    else if (Parts.Num() == 1)
+    {
+      OutWidth = FCString::Atoi(*Parts[0]);
+      OutHeight = OutWidth;
+    }
+  }
+  else
+  {
+    double ResolutionValue = 0.0;
+    if (Payload->TryGetNumberField(TEXT("resolution"), ResolutionValue))
+    {
+      OutWidth = FMath::FloorToInt32(FMath::Clamp(ResolutionValue, 0.0, static_cast<double>(MAX_int32)) + 0.5);
+      OutHeight = OutWidth;
+    }
+  }
+
+  double WidthValue = 0.0;
+  if (Payload->TryGetNumberField(TEXT("width"), WidthValue))
+  {
+    OutWidth = FMath::FloorToInt32(FMath::Clamp(WidthValue, 0.0, static_cast<double>(MAX_int32)) + 0.5);
+  }
+  double HeightValue = 0.0;
+  if (Payload->TryGetNumberField(TEXT("height"), HeightValue))
+  {
+    OutHeight = FMath::FloorToInt32(FMath::Clamp(HeightValue, 0.0, static_cast<double>(MAX_int32)) + 0.5);
+  }
+
+  return Payload->HasField(TEXT("resolution")) || Payload->HasField(TEXT("width")) ||
+         Payload->HasField(TEXT("height"));
 }
 
 FString MakeSafeUiScreenshotFilenameForMcp(
@@ -433,6 +557,7 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
       SendAutomationResponse(RequestingSocket, RequestId, false, Message, Resp, ErrorCode);
       return true;
     }
+    Resp->SetStringField(TEXT("captureSource"), TEXT("game_viewport"));
 
     // Take a screenshot of the viewport and return as base64
     FString RawScreenshotPath;
@@ -475,6 +600,11 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
 
     bool bReturnBase64 = true;
     Payload->TryGetBoolField(TEXT("returnBase64"), bReturnBase64);
+
+    int32 RequestedWidth = 0;
+    int32 RequestedHeight = 0;
+    const bool bResolutionRequested =
+        ParseUiScreenshotResolutionForMcp(Payload, RequestedWidth, RequestedHeight);
 
     // Get viewport. During PIE, prefer the viewport owned by the PIE world rather
     // than GEngine->GameViewport, which can point at the editor viewport surface
@@ -581,6 +711,51 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           const int32 Width = Size.X;
           const int32 Height = Size.Y;
 
+          TArray<FColor> ResizedBitmap;
+          bool bResized = false;
+          int32 EncodeWidth = Width;
+          int32 EncodeHeight = Height;
+          TArray<TSharedPtr<FJsonValue>> Warnings;
+          if (bResolutionRequested) {
+            if (RequestedWidth > 0 && RequestedHeight <= 0) {
+              RequestedHeight = FMath::Clamp(
+                  FMath::FloorToInt32(static_cast<double>(RequestedWidth) * Height / Width + 0.5),
+                  1, MaxScreenshotResolutionForMcp);
+            } else if (RequestedHeight > 0 && RequestedWidth <= 0) {
+              RequestedWidth = FMath::Clamp(
+                  FMath::FloorToInt32(static_cast<double>(RequestedHeight) * Width / Height + 0.5),
+                  1, MaxScreenshotResolutionForMcp);
+            }
+
+            if (RequestedWidth <= 0 || RequestedHeight <= 0) {
+              Warnings.Add(MakeShared<FJsonValueString>(
+                  TEXT("Could not parse requested resolution; request ignored.")));
+            } else if (RequestedWidth < MinScreenshotResolutionForMcp ||
+                       RequestedWidth > MaxScreenshotResolutionForMcp ||
+                       RequestedHeight < MinScreenshotResolutionForMcp ||
+                       RequestedHeight > MaxScreenshotResolutionForMcp) {
+              Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+                  TEXT("Requested resolution %dx%d outside supported range %d-%d; request ignored."),
+                  RequestedWidth, RequestedHeight, MinScreenshotResolutionForMcp,
+                  MaxScreenshotResolutionForMcp)));
+            } else if (Bitmap.Num() != Width * Height) {
+              Warnings.Add(MakeShared<FJsonValueString>(
+                  TEXT("Captured bitmap size does not match viewport dimensions; resize skipped.")));
+            } else if (RequestedWidth != Width || RequestedHeight != Height) {
+              ResizeScreenshotBitmapForMcp(Bitmap, Width, Height, RequestedWidth,
+                                           RequestedHeight, ResizedBitmap);
+              if (ResizedBitmap.Num() == RequestedWidth * RequestedHeight) {
+                bResized = true;
+                EncodeWidth = RequestedWidth;
+                EncodeHeight = RequestedHeight;
+              } else {
+                Warnings.Add(MakeShared<FJsonValueString>(
+                    TEXT("Screenshot resize failed; using captured dimensions.")));
+              }
+            }
+          }
+          const TArray<FColor>& SourceBitmap = bResized ? ResizedBitmap : Bitmap;
+
           TArray<uint8> PngData;
           IImageWrapperModule &ImageWrapperModule =
               FModuleManager::LoadModuleChecked<IImageWrapperModule>(
@@ -590,16 +765,16 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
 
           if (ImageWrapper.IsValid()) {
             TArray<uint8> RawData;
-            RawData.SetNumUninitialized(Width * Height * 4);
-            for (int32 i = 0; i < Bitmap.Num(); ++i) {
-              RawData[i * 4 + 0] = Bitmap[i].R;
-              RawData[i * 4 + 1] = Bitmap[i].G;
-              RawData[i * 4 + 2] = Bitmap[i].B;
+            RawData.SetNumUninitialized(EncodeWidth * EncodeHeight * 4);
+            for (int32 i = 0; i < SourceBitmap.Num(); ++i) {
+              RawData[i * 4 + 0] = SourceBitmap[i].R;
+              RawData[i * 4 + 1] = SourceBitmap[i].G;
+              RawData[i * 4 + 2] = SourceBitmap[i].B;
               RawData[i * 4 + 3] = 255;
             }
 
-            if (ImageWrapper->SetRaw(RawData.GetData(), RawData.Num(), Width,
-                                     Height, ERGBFormat::RGBA, 8)) {
+            if (ImageWrapper->SetRaw(RawData.GetData(), RawData.Num(), EncodeWidth,
+                                     EncodeHeight, ERGBFormat::RGBA, 8)) {
               PngData = ImageWrapper->GetCompressed(100);
             }
           }
@@ -623,6 +798,10 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           bSuccess = true;
           Message = FString::Printf(TEXT("Screenshot captured (%dx%d)"), Width,
                                     Height);
+          if (bResized) {
+            Message += FString::Printf(TEXT(", resized to %dx%d"), EncodeWidth,
+                                       EncodeHeight);
+          }
           Resp->SetStringField(TEXT("screenshotPath"), FullPath);
           Resp->SetStringField(TEXT("filename"), Filename);
           Resp->SetStringField(TEXT("mode"), TEXT("game_viewport"));
@@ -656,6 +835,34 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           Resp->SetBoolField(TEXT("saved"), bSaved);
           Resp->SetNumberField(TEXT("width"), Width);
           Resp->SetNumberField(TEXT("height"), Height);
+          Resp->SetBoolField(TEXT("resized"), bResized);
+          if (bResized) {
+            Resp->SetNumberField(TEXT("resizedWidth"), EncodeWidth);
+            Resp->SetNumberField(TEXT("resizedHeight"), EncodeHeight);
+          }
+          if (bResolutionRequested) {
+            Resp->SetNumberField(TEXT("requestedWidth"), RequestedWidth);
+            Resp->SetNumberField(TEXT("requestedHeight"), RequestedHeight);
+            const bool bResolutionVerified =
+                bResized
+                    ? (EncodeWidth == RequestedWidth && EncodeHeight == RequestedHeight)
+                    : (Width == RequestedWidth && Height == RequestedHeight);
+            Resp->SetBoolField(TEXT("resolutionVerified"), bResolutionVerified);
+            if (!bResolutionVerified) {
+              FString VerificationNote;
+              if (Warnings.Num() > 0) {
+                VerificationNote = Warnings[0]->AsString();
+              } else {
+                VerificationNote = FString::Printf(
+                    TEXT("Output dimensions %dx%d do not match requested %dx%d."),
+                    EncodeWidth, EncodeHeight, RequestedWidth, RequestedHeight);
+              }
+              Resp->SetStringField(TEXT("verificationNote"), VerificationNote);
+            }
+          }
+          if (Warnings.Num() > 0) {
+            Resp->SetArrayField(TEXT("warnings"), Warnings);
+          }
           Resp->SetNumberField(TEXT("sizeBytes"), PngData.Num());
           Resp->SetStringField(TEXT("mimeType"), TEXT("image/png"));
           AddScreenshotMetadataForUiMcp(Resp, Payload);

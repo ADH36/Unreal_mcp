@@ -21,6 +21,9 @@
 
 // Forward declarations
 class FMcpBridgeWebSocket;
+class UMcpAutomationBridgeSubsystem;
+class UWorld;
+class UWorldPartition;
 
 // =============================================================================
 // Handler Signature Type
@@ -835,6 +838,45 @@ namespace McpHandlers
             const TSharedPtr<FJsonObject>& Payload,
             TSharedPtr<FMcpBridgeWebSocket> Socket
         ));
+    }
+
+    // =========================================================================
+    // World Partition Handlers - manage_world_partition cell subactions
+    // =========================================================================
+    namespace WorldPartition
+    {
+        bool HandleWorldPartitionGetCellStatus(
+            UMcpAutomationBridgeSubsystem* Subsystem,
+            UWorld* World,
+            UWorldPartition* WorldPartition,
+            const FString& RequestId,
+            const TSharedPtr<FJsonObject>& Payload,
+            TSharedPtr<FMcpBridgeWebSocket> Socket
+        );
+        bool HandleWorldPartitionPinCells(
+            UMcpAutomationBridgeSubsystem* Subsystem,
+            UWorld* World,
+            UWorldPartition* WorldPartition,
+            const FString& RequestId,
+            const TSharedPtr<FJsonObject>& Payload,
+            TSharedPtr<FMcpBridgeWebSocket> Socket
+        );
+        bool HandleWorldPartitionUnpinCells(
+            UMcpAutomationBridgeSubsystem* Subsystem,
+            UWorld* World,
+            UWorldPartition* WorldPartition,
+            const FString& RequestId,
+            const TSharedPtr<FJsonObject>& Payload,
+            TSharedPtr<FMcpBridgeWebSocket> Socket
+        );
+        bool HandleWorldPartitionUnloadCells(
+            UMcpAutomationBridgeSubsystem* Subsystem,
+            UWorld* World,
+            UWorldPartition* WorldPartition,
+            const FString& RequestId,
+            const TSharedPtr<FJsonObject>& Payload,
+            TSharedPtr<FMcpBridgeWebSocket> Socket
+        );
     }
 
 } // namespace McpHandlers

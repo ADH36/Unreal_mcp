@@ -2596,6 +2596,26 @@ static bool HandleInspectHlodLayer(UMcpAutomationBridgeSubsystem* Subsystem, con
     Result->SetNumberField(TEXT("cellSize"), Layer->GetCellSize());
     Result->SetNumberField(TEXT("loadingDistance"), Layer->GetLoadingRange());
     Result->SetStringField(TEXT("parentLayer"), Layer->GetParentLayer() ? Layer->GetParentLayer()->GetPathName() : TEXT(""));
+    // Current-world only: count actors actually assigned to this resolved layer.
+    int32 AssignedActorCount = 0;
+    TArray<TSharedPtr<FJsonValue>> SampleAssignedActors;
+    if (UWorld* CurrentWorld = GetEditorWorld())
+    {
+        for (TActorIterator<AActor> It(CurrentWorld); It; ++It)
+        {
+            AActor* Actor = *It;
+            if (Actor && Actor->GetHLODLayer() == Layer)
+            {
+                ++AssignedActorCount;
+                if (SampleAssignedActors.Num() < 10)
+                {
+                    SampleAssignedActors.Add(MakeShared<FJsonValueString>(Actor->GetActorLabel()));
+                }
+            }
+        }
+    }
+    Result->SetNumberField(TEXT("assignedActorCount"), AssignedActorCount);
+    Result->SetArrayField(TEXT("sampleAssignedActors"), SampleAssignedActors);
     Subsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("Inspected HLOD Layer."), Result);
     return true;
 }
@@ -2920,15 +2940,69 @@ static bool HandleInspectGeneratedHlods(UMcpAutomationBridgeSubsystem* Subsystem
                 return true;
             }, Params);
     }
+    // Reuse the report_missing_hlod_assignments predicate: relevant actors that
+    // already have an HLOD Layer assigned are eligible HLOD generation sources.
+    int32 EligibleSourceActorCount = 0;
+    TSet<FString> AssignedLayerNameSet;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (Actor && !Actor->IsA<AWorldPartitionHLOD>() && Actor->IsHLODRelevant() && Actor->GetHLODLayer())
+        {
+            ++EligibleSourceActorCount;
+            AssignedLayerNameSet.Add(Actor->GetHLODLayer()->GetPathName());
+        }
+    }
+    TArray<FString> AssignedLayerNames = AssignedLayerNameSet.Array();
+    AssignedLayerNames.Sort();
+
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("mapPath"), World->GetOutermost()->GetName());
     Result->SetArrayField(TEXT("generatedHlodActors"), Actors);
     Result->SetNumberField(TEXT("generatedActorCount"), Actors.Num());
     Result->SetNumberField(TEXT("invalidActorCount"), InvalidCount);
-    const bool bSuccess = !bValidate || (Actors.Num() > 0 && InvalidCount == 0);
-    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess,
-        bValidate ? (bSuccess ? TEXT("HLOD validation passed after reload.") : TEXT("HLOD validation failed: generated actors are missing or have no source actors.")) : TEXT("Inspected generated HLOD actors."),
-        Result, bSuccess ? TEXT("") : TEXT("HLOD_VALIDATION_FAILED"));
+    Result->SetNumberField(TEXT("eligibleSourceActorCount"), EligibleSourceActorCount);
+    TArray<TSharedPtr<FJsonValue>> AssignedLayerValues;
+    for (int32 LayerIndex = 0; LayerIndex < AssignedLayerNames.Num() && LayerIndex < 20; ++LayerIndex)
+    {
+        AssignedLayerValues.Add(MakeShared<FJsonValueString>(AssignedLayerNames[LayerIndex]));
+    }
+    Result->SetArrayField(TEXT("assignedLayerNames"), AssignedLayerValues);
+
+    bool bSuccess = true;
+    FString FailureCode;
+    FString Message;
+    if (bValidate)
+    {
+        if (EligibleSourceActorCount > 0 && Actors.Num() == 0)
+        {
+            bSuccess = false;
+            FailureCode = TEXT("HLOD_ZERO_PROXIES_WITH_SOURCES");
+            Message = TEXT("HLOD validation failed: eligible HLOD source actors are assigned but no generated HLOD proxies exist. Run build_hlods, then reload the map and revalidate.");
+        }
+        else if (EligibleSourceActorCount == 0 && Actors.Num() == 0)
+        {
+            bSuccess = true;
+            Result->SetStringField(TEXT("validationNote"), TEXT("no eligible sources"));
+            Message = TEXT("HLOD validation passed: no eligible HLOD source actors are assigned, so no generated proxies are expected.");
+        }
+        else if (Actors.Num() == 0 || InvalidCount > 0)
+        {
+            bSuccess = false;
+            FailureCode = TEXT("HLOD_VALIDATION_FAILED");
+            Message = TEXT("HLOD validation failed: generated actors are missing or have no source actors.");
+        }
+        else
+        {
+            Message = TEXT("HLOD validation passed after reload.");
+        }
+    }
+    else
+    {
+        Message = TEXT("Inspected generated HLOD actors.");
+    }
+    Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess, Message, Result,
+        bSuccess ? TEXT("") : FailureCode);
     return true;
 }
 
@@ -3100,8 +3174,14 @@ static bool HandleHlodBuildStatus(UMcpAutomationBridgeSubsystem* Subsystem, cons
     if (bRunning)
     {
         Result->SetStringField(TEXT("status"), TEXT("running"));
-        const float Progress = Result->HasField(TEXT("progressPercent")) ? (float)Result->GetNumberField(TEXT("progressPercent")) : 50.0f;
-        Subsystem->SendProgressUpdate(RequestId, Progress, TEXT("HLOD commandlet is running; structured log progress is included in this response."), true);
+        if (Result->HasField(TEXT("progressPercent")))
+        {
+            Subsystem->SendProgressUpdate(RequestId, (float)Result->GetNumberField(TEXT("progressPercent")), TEXT("HLOD commandlet is running; structured log progress is included in this response."), true);
+        }
+        else
+        {
+            Subsystem->SendProgressUpdate(RequestId, -1.0f, TEXT("HLOD commandlet is running; progress is indeterminate until the commandlet log reports it."), true);
+        }
         Subsystem->SendAutomationResponse(Socket, RequestId, true, bCancel ? TEXT("HLOD commandlet cancellation requested.") : TEXT("HLOD commandlet is running."), Result);
         return true;
     }
@@ -3115,6 +3195,12 @@ static bool HandleHlodBuildStatus(UMcpAutomationBridgeSubsystem* Subsystem, cons
     const bool bSuccess = ExitCode == 0 && !GMcpHlodBuildProcess.bCancellationRequested && !bTimedOut;
     Result->SetStringField(TEXT("status"), bSuccess ? TEXT("completed") : (bTimedOut ? TEXT("timed_out") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("cancelled") : TEXT("failed"))));
     Result->SetBoolField(TEXT("reloadRequired"), bSuccess);
+    Result->SetBoolField(TEXT("verifiedFromDisk"), false);
+    if (bSuccess)
+    {
+        Result->SetStringField(TEXT("nextStep"), TEXT("reload map then validate_hlods"));
+        Result->SetStringField(TEXT("warning"), TEXT("Generated HLOD output exists only on disk; the loaded editor world is not reloaded, so validate_hlods requires a map reload first."));
+    }
     Subsystem->SendProgressUpdate(RequestId, 100.0f, bSuccess ? TEXT("HLOD commandlet completed; reload the map before validation.") : (bTimedOut ? TEXT("HLOD commandlet timed out.") : TEXT("HLOD commandlet ended; inspect exit code and structured log records.")), false);
     Subsystem->SendAutomationResponse(Socket, RequestId, bSuccess, bSuccess ? TEXT("HLOD commandlet completed. Reload the map, then call validate_hlods.") : (bTimedOut ? TEXT("HLOD commandlet timed out.") : FString::Printf(TEXT("HLOD commandlet exited with code %d."), ExitCode)), Result,
         bSuccess ? TEXT("") : (bTimedOut ? TEXT("HLOD_BUILD_TIMEOUT") : (GMcpHlodBuildProcess.bCancellationRequested ? TEXT("HLOD_BUILD_CANCELLED") : TEXT("HLOD_BUILD_FAILED"))));

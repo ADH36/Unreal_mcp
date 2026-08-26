@@ -446,6 +446,51 @@ void DeleteDirectoryBackup(const FString& BackupDirectory) {
   }
 }
 
+bool IsExternalActorGuidFilename(const FString& BaseName) {
+  // World Partition external actors are stored as 8-4-4-4-12 GUID .uasset files.
+  static const int32 SegmentSizes[5] = {8, 4, 4, 4, 12};
+  if (BaseName.Len() != 36) {
+    return false;
+  }
+  int32 SegmentIndex = 0;
+  int32 SegmentLength = 0;
+  for (int32 Index = 0; Index < BaseName.Len(); ++Index) {
+    const TCHAR Char = BaseName[Index];
+    if (Char == TEXT('-')) {
+      if (SegmentIndex >= 4 || SegmentLength != SegmentSizes[SegmentIndex]) {
+        return false;
+      }
+      ++SegmentIndex;
+      SegmentLength = 0;
+    } else {
+      if (!FChar::IsHexDigit(Char)) {
+        return false;
+      }
+      ++SegmentLength;
+    }
+  }
+  return SegmentIndex == 4 && SegmentLength == SegmentSizes[4];
+}
+
+void CollectExternalActorGuidsRecursive(const FString& Directory,
+                                        TSet<FString>& OutGuids,
+                                        int32& OutActorFileCount) {
+  TArray<FString> FoundFiles;
+  IFileManager::Get().FindFiles(FoundFiles, *(Directory / TEXT("*.uasset")), true, false);
+  for (const FString& Filename : FoundFiles) {
+    const FString BaseName = FPaths::GetBaseFilename(Filename);
+    if (IsExternalActorGuidFilename(BaseName)) {
+      OutGuids.Add(BaseName.ToLower());
+      ++OutActorFileCount;
+    }
+  }
+  TArray<FString> FoundDirs;
+  IFileManager::Get().FindFiles(FoundDirs, *(Directory / TEXT("*")), false, true);
+  for (const FString& DirectoryName : FoundDirs) {
+    CollectExternalActorGuidsRecursive(Directory / DirectoryName, OutGuids, OutActorFileCount);
+  }
+}
+
 bool IsBlockingDirtyPackageForLevelLoad(UPackage* Package) {
   if (!Package || Package->HasAnyFlags(RF_Transient)) {
     return false;

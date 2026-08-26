@@ -95,11 +95,120 @@
 #include "InputMappingContext.h"
 #include "EnhancedInputSubsystems.h"
 #include "Subsystems/SubsystemBlueprintLibrary.h"
-
 // Blueprint Editor
+
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "ScopedTransaction.h"
+
+#endif
+
+#if WITH_EDITOR
+
+// Append a warning to the response "warnings" array (additive; the array is
+// created on first use).
+static void McpGraphAddWarning(const TSharedPtr<FJsonObject> &Result,
+                               const FString &Message) {
+  if (!Result.IsValid()) {
+    return;
+  }
+  TArray<TSharedPtr<FJsonValue>> Warnings =
+      Result->HasField(TEXT("warnings"))
+          ? Result->GetArrayField(TEXT("warnings"))
+          : TArray<TSharedPtr<FJsonValue>>();
+  Warnings.Add(MakeShared<FJsonValueString>(Message));
+  Result->SetArrayField(TEXT("warnings"), Warnings);
+}
+
+// Record a SaveLoadedAssetThrottled outcome; false means the asset was not
+// written to disk.
+static void McpGraphRecordSave(const TSharedPtr<FJsonObject> &Result,
+                               bool bSaved) {
+  if (!Result.IsValid()) {
+    return;
+  }
+  Result->SetBoolField(TEXT("saved"), bSaved);
+  if (!bSaved) {
+    McpGraphAddWarning(Result,
+                       TEXT("save throttled; asset not written to disk"));
+  }
+}
+
+static FString McpGraphBlueprintStatusString(EBlueprintStatus Status) {
+  switch (Status) {
+  case BS_Dirty:
+    return TEXT("Dirty");
+  case BS_Error:
+    return TEXT("Error");
+  case BS_UpToDate:
+    return TEXT("UpToDate");
+  case BS_BeingCreated:
+    return TEXT("BeingCreated");
+  case BS_UpToDateWithWarnings:
+    return TEXT("UpToDateWithWarnings");
+  default:
+    return TEXT("Unknown");
+  }
+}
+
+// Directed link count across a graph (one per output-pin link).
+static int32 McpGraphCountLinks(const UEdGraph *Graph) {
+  int32 LinkCount = 0;
+  if (!Graph) {
+    return 0;
+  }
+  for (const UEdGraphNode *Node : Graph->Nodes) {
+    if (!Node) {
+      continue;
+    }
+    for (const UEdGraphPin *Pin : Node->Pins) {
+      if (Pin && Pin->Direction == EGPD_Output) {
+        LinkCount += Pin->LinkedTo.Num();
+      }
+    }
+  }
+  return LinkCount;
+}
+
+// Report the blueprint compile status on Result. Returns false only when the
+// caller requested a compile (payload "compile": true) and the blueprint is
+// not in a compiled state.
+static bool McpGraphReportCompile(const TSharedPtr<FJsonObject> &Payload,
+                                  const UBlueprint *Blueprint,
+                                  const TSharedPtr<FJsonObject> &Result,
+                                  bool bCompileRan) {
+  if (!Payload.IsValid() || !Result.IsValid() || !Blueprint) {
+    return true;
+  }
+  bool bCompileRequested = false;
+  Payload->TryGetBoolField(TEXT("compile"), bCompileRequested);
+  if (!bCompileRequested && !bCompileRan) {
+    return true;
+  }
+  const EBlueprintStatus Status = Blueprint->Status;
+  const bool bCompiled =
+      Status == BS_UpToDate || Status == BS_UpToDateWithWarnings;
+  Result->SetBoolField(TEXT("compiled"), bCompiled);
+  Result->SetStringField(TEXT("compileStatus"),
+                         McpGraphBlueprintStatusString(Status));
+  return bCompiled || !bCompileRequested;
+}
+
+// Apply the optional payload "compile" flag after a mutation. The safe helper
+// wraps FKismetEditorUtilities::CompileBlueprint with render-thread flushes.
+static bool McpGraphApplyOptionalCompile(
+    const TSharedPtr<FJsonObject> &Payload, UBlueprint *Blueprint,
+    const TSharedPtr<FJsonObject> &Result) {
+  bool bCompile = false;
+  if (Payload.IsValid()) {
+    Payload->TryGetBoolField(TEXT("compile"), bCompile);
+  }
+  if (!bCompile) {
+    return true;
+  }
+  McpSafeCompileBlueprint(Blueprint);
+  return McpGraphReportCompile(Payload, Blueprint, Result, true);
+}
 
 #endif
 
@@ -307,7 +416,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     Result->SetStringField(TEXT("graphName"), NewGraph->GetName());
     Result->SetStringField(TEXT("graphType"), bEventGraph ? TEXT("event") : TEXT("function"));
     Result->SetBoolField(TEXT("created"), true);
-    Result->SetBoolField(TEXT("saved"), bSaved);
+    McpGraphRecordSave(Result, bSaved);
     SendAutomationResponse(RequestingSocket, RequestId, bSaved,
                            bSaved ? TEXT("Blueprint graph created.") : TEXT("Blueprint graph created but could not be saved."),
                            Result, bSaved ? FString() : TEXT("SAVE_FAILED"));
@@ -650,7 +759,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       }
     }
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
-    SaveLoadedAssetThrottled(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("mappingContextPath"), CleanContextPath);
     Result->SetStringField(TEXT("beginPlayNodeId"), BeginPlayNode->NodeGuid.ToString());
@@ -658,6 +767,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     Result->SetStringField(TEXT("getSubsystemNodeId"), GetSubsystemNode->NodeGuid.ToString());
     Result->SetStringField(TEXT("addMappingContextNodeId"), AddMappingNode->NodeGuid.ToString());
     Result->SetBoolField(TEXT("created"), bCreatedRegistration);
+    McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            bCreatedRegistration ? TEXT("Enhanced Input Mapping Context registered during BeginPlay.") : TEXT("BeginPlay Mapping Context registration already exists."), Result);
@@ -718,14 +828,21 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         // CRITICAL: Save the blueprint to persist the new node.
         // Without this, the node exists only in memory and can be lost
         // between requests when the blueprint is reloaded.
-        SaveLoadedAssetThrottled(Blueprint);
+        const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("nodeId"), NewNode->NodeGuid.ToString());
         Result->SetStringField(TEXT("nodeName"), NewNode->GetName());
+        Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+        McpGraphRecordSave(Result, bSaved);
         McpHandlerUtils::AddVerification(Result, Blueprint);
-        SendAutomationResponse(RequestingSocket, RequestId, true,
-                               TEXT("Node created."), Result);
+        const bool bCompileOk =
+            McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+        SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                               bCompileOk ? TEXT("Node created.")
+                                          : TEXT("Node created but compilation failed."),
+                               Result,
+                               bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
       } else {
         SendAutomationError(
             RequestingSocket, RequestId,
@@ -1511,15 +1628,21 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       // Mark blueprint as structurally modified, compile, and save
       FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
       FKismetEditorUtilities::CompileBlueprint(Blueprint);
-      SaveLoadedAssetThrottled(Blueprint);
+      const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
       // Report success
       TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
       Result->SetStringField(TEXT("nodeId"), EventNode->NodeGuid.ToString());
       Result->SetStringField(TEXT("nodeName"), EventNode->GetName());
+      Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+      McpGraphRecordSave(Result, bSaved);
       McpHandlerUtils::AddVerification(Result, Blueprint);
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-          TEXT("Custom event with parameters created using engine API."), Result);
+      const bool bCompileOk =
+          McpGraphReportCompile(Payload, Blueprint, Result, true);
+      SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+          bCompileOk ? TEXT("Custom event with parameters created using engine API.")
+                     : TEXT("Custom event created but compilation failed."),
+          Result, bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
       return true;
     }
 
@@ -1572,40 +1695,77 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         if (InputActionPath.IsEmpty()) {
           Payload->TryGetStringField(TEXT("actionPath"), InputActionPath);
         }
-        if (InputActionPath.IsEmpty()) {
+        FString InputActionName;
+        Payload->TryGetStringField(TEXT("inputActionName"), InputActionName);
+        if (InputActionName.IsEmpty()) {
+          Payload->TryGetStringField(TEXT("actionName"), InputActionName);
+        }
+        if (InputActionPath.IsEmpty() && InputActionName.IsEmpty()) {
           SendAutomationError(RequestingSocket, RequestId,
-                              TEXT("actionPath or inputActionPath required"),
+                              TEXT("actionPath, inputActionPath, or inputActionName required"),
                               TEXT("INVALID_ARGUMENT"));
           return true;
         }
 
         FString CleanActionPath = InputActionPath;
-        int32 DotIndex = INDEX_NONE;
-        FString PackagePath = CleanActionPath;
-        if (CleanActionPath.FindChar(TEXT('.'), DotIndex)) {
-          PackagePath = CleanActionPath.Left(DotIndex);
-        }
-        FString SanitizedPackagePath = SanitizeProjectRelativePath(PackagePath);
-        if (SanitizedPackagePath.IsEmpty()) {
-          SendAutomationError(RequestingSocket, RequestId,
-                              TEXT("Invalid input action path"),
-                              TEXT("INVALID_PATH"));
-          return true;
-        }
-        CleanActionPath = DotIndex == INDEX_NONE ? SanitizedPackagePath : SanitizedPackagePath + CleanActionPath.Mid(DotIndex);
+        UInputAction* InputAction = nullptr;
+        if (!InputActionPath.IsEmpty()) {
+          int32 DotIndex = INDEX_NONE;
+          FString PackagePath = CleanActionPath;
+          if (CleanActionPath.FindChar(TEXT('.'), DotIndex)) {
+            PackagePath = CleanActionPath.Left(DotIndex);
+          }
+          FString SanitizedPackagePath = SanitizeProjectRelativePath(PackagePath);
+          if (SanitizedPackagePath.IsEmpty()) {
+            SendAutomationError(RequestingSocket, RequestId,
+                                TEXT("Invalid input action path"),
+                                TEXT("INVALID_PATH"));
+            return true;
+          }
+          CleanActionPath = DotIndex == INDEX_NONE ? SanitizedPackagePath : SanitizedPackagePath + CleanActionPath.Mid(DotIndex);
 
-        UInputAction* InputAction = LoadObject<UInputAction>(nullptr, *CleanActionPath);
-        if (!InputAction && !CleanActionPath.Contains(TEXT("."))) {
-          const FString AssetName = FPackageName::GetShortName(CleanActionPath);
-          const FString ObjectPath = FString::Printf(TEXT("%s.%s"), *CleanActionPath, *AssetName);
-          InputAction = LoadObject<UInputAction>(nullptr, *ObjectPath);
-          if (InputAction) {
-            CleanActionPath = ObjectPath;
+          InputAction = LoadObject<UInputAction>(nullptr, *CleanActionPath);
+          if (!InputAction && !CleanActionPath.Contains(TEXT("."))) {
+            const FString AssetName = FPackageName::GetShortName(CleanActionPath);
+            const FString ObjectPath = FString::Printf(TEXT("%s.%s"), *CleanActionPath, *AssetName);
+            InputAction = LoadObject<UInputAction>(nullptr, *ObjectPath);
+            if (InputAction) {
+              CleanActionPath = ObjectPath;
+            }
           }
         }
+
+        if (!InputAction && !InputActionName.IsEmpty()) {
+          // AssetRegistry fallback: match UInputAction assets by object name.
+          FAssetRegistryModule &AssetRegistryModule =
+              FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+          IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
+          FARFilter Filter;
+          Filter.bRecursiveClasses = true;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+          Filter.ClassPaths.Add(UInputAction::StaticClass()->GetClassPathName());
+#else
+          Filter.ClassNames.Add(UInputAction::StaticClass()->GetFName());
+#endif
+          TArray<FAssetData> ActionAssets;
+          AssetRegistry.GetAssets(Filter, ActionAssets);
+          for (const FAssetData &ActionAsset : ActionAssets) {
+            if (!ActionAsset.AssetName.ToString().Equals(InputActionName, ESearchCase::IgnoreCase)) {
+              continue;
+            }
+            UInputAction *Candidate = Cast<UInputAction>(ActionAsset.GetAsset());
+            if (Candidate) {
+              InputAction = Candidate;
+              CleanActionPath = MCP_ASSET_DATA_GET_SOFT_PATH(ActionAsset);
+              break;
+            }
+          }
+        }
+
         if (!InputAction) {
           SendAutomationError(RequestingSocket, RequestId,
-                              FString::Printf(TEXT("Input action not found: %s"), *InputActionPath),
+                              FString::Printf(TEXT("Input action not found by path ('%s') or AssetRegistry name lookup for inputActionName ('%s')."),
+                                              *InputActionPath, *InputActionName),
                               TEXT("ASSET_NOT_FOUND"));
           return true;
         }
@@ -1624,6 +1784,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
               Result->SetStringField(TEXT("nodeName"), ExistingNode->GetName());
               Result->SetStringField(TEXT("nodeClass"), NodeClass->GetName());
               Result->SetStringField(TEXT("inputActionPath"), CleanActionPath);
+              Result->SetStringField(TEXT("inputActionName"), InputAction->GetName());
               Result->SetBoolField(TEXT("alreadyExists"), true);
               McpHandlerUtils::AddVerification(Result, Blueprint);
               SendAutomationResponse(RequestingSocket, RequestId, true,
@@ -1661,21 +1822,60 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         }
         NewNode->NodePosX = X;
         NewNode->NodePosY = Y;
+
+        // Locate the exec output pin for the requested trigger event. UE names
+        // these pins exactly after the ETriggerEvent entries: Started,
+        // Triggered, Ongoing, Completed, Canceled.
+        FString TriggerEventName;
+        Payload->TryGetStringField(TEXT("inputTriggerEvent"), TriggerEventName);
+        UEdGraphPin* TriggerEventPin = nullptr;
+        if (!TriggerEventName.IsEmpty()) {
+          for (UEdGraphPin* Pin : NewNode->Pins) {
+            if (Pin && Pin->Direction == EGPD_Output &&
+                Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
+                Pin->PinName.ToString().Equals(TriggerEventName, ESearchCase::IgnoreCase)) {
+              TriggerEventPin = Pin;
+              break;
+            }
+          }
+        }
+
         if (const UEdGraphSchema* Schema = TargetGraph->GetSchema()) {
           Schema->ForceVisualizationCacheClear();
         }
         TargetGraph->NotifyGraphChanged();
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
-        SaveLoadedAssetThrottled(Blueprint);
+        const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("nodeId"), NewNode->NodeGuid.ToString());
         Result->SetStringField(TEXT("nodeName"), NewNode->GetName());
         Result->SetStringField(TEXT("nodeClass"), NodeClass->GetName());
         Result->SetStringField(TEXT("inputActionPath"), CleanActionPath);
+        Result->SetStringField(TEXT("inputActionName"), InputAction->GetName());
+        Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+        if (TriggerEventPin) {
+          Result->SetStringField(TEXT("triggerEventPinId"), TriggerEventPin->PinId.ToString());
+          Result->SetStringField(TEXT("triggerEventPinName"), TriggerEventPin->PinName.ToString());
+          Result->SetBoolField(TEXT("verified"), true);
+          TSharedPtr<FJsonObject> Evidence = McpHandlerUtils::CreateResultObject();
+          Evidence->SetStringField(TEXT("triggerEventPinId"), TriggerEventPin->PinId.ToString());
+          Evidence->SetStringField(TEXT("triggerEventPinName"), TriggerEventPin->PinName.ToString());
+          Result->SetObjectField(TEXT("evidence"), Evidence);
+        } else if (!TriggerEventName.IsEmpty()) {
+          McpGraphAddWarning(Result, FString::Printf(
+              TEXT("Trigger event pin '%s' not found; expected one of Started, Triggered, Ongoing, Completed, Canceled."),
+              *TriggerEventName));
+        }
+        McpGraphRecordSave(Result, bSaved);
         McpHandlerUtils::AddVerification(Result, Blueprint);
-        SendAutomationResponse(RequestingSocket, RequestId, true,
-                               TEXT("Enhanced Input node created."), Result);
+        const bool bCompileOk =
+            McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+        SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                               bCompileOk ? TEXT("Enhanced Input node created.")
+                                          : TEXT("Enhanced Input node created but compilation failed."),
+                               Result,
+                               bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
         return true;
       }
 
@@ -1692,14 +1892,21 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         // CRITICAL: Save the blueprint to persist the new node.
         // Without this, the node exists only in memory and can be lost
         // between requests when the blueprint is reloaded.
-        SaveLoadedAssetThrottled(Blueprint);
+        const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("nodeId"), NewNode->NodeGuid.ToString());
         Result->SetStringField(TEXT("nodeName"), NewNode->GetName());
         Result->SetStringField(TEXT("nodeClass"), NodeClass->GetName());
-        SendAutomationResponse(RequestingSocket, RequestId, true,
-                               TEXT("Node created."), Result);
+        Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+        McpGraphRecordSave(Result, bSaved);
+        const bool bCompileOk =
+            McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+        SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                               bCompileOk ? TEXT("Node created.")
+                                          : TEXT("Node created but compilation failed."),
+                               Result,
+                               bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
       } else {
         SendAutomationError(RequestingSocket, RequestId,
                             TEXT("Failed to instantiate node."),
@@ -1746,7 +1953,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetBoolField(TEXT("disconnected"), true);
-    Result->SetBoolField(TEXT("saved"), bSaved);
+    McpGraphRecordSave(Result, bSaved);
     SendAutomationResponse(RequestingSocket, RequestId, bSaved,
                            bSaved ? TEXT("Pins disconnected.") : TEXT("Pins disconnected but could not be saved."),
                            Result, bSaved ? FString() : TEXT("SAVE_FAILED"));
@@ -1840,19 +2047,44 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     }
 
     if (TargetGraph->GetSchema()->TryCreateConnection(FromPin, ToPin)) {
+      // Verify the link actually exists; TryCreateConnection can report
+      // success while the schema redirected or replaced the connection.
+      if (!FromPin->LinkedTo.Contains(ToPin)) {
+        SendAutomationError(RequestingSocket, RequestId,
+                            FString::Printf(TEXT("Connection reported success but link was not verified from '%s' to '%s'."),
+                                            *FromPin->PinName.ToString(), *ToPin->PinName.ToString()),
+                            TEXT("LINK_NOT_VERIFIED"));
+        return true;
+      }
+
       FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
       // CRITICAL: Save the blueprint to persist changes.
-      SaveLoadedAssetThrottled(Blueprint);
+      const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
       TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
       Result->SetStringField(TEXT("fromNodeId"), FromNode->NodeGuid.ToString());
       Result->SetStringField(TEXT("fromPinName"), FromPin->PinName.ToString());
       Result->SetStringField(TEXT("toNodeId"), ToNode->NodeGuid.ToString());
       Result->SetStringField(TEXT("toPinName"), ToPin->PinName.ToString());
+      const int32 LinkedToCount = FromPin->LinkedTo.Num();
+      Result->SetNumberField(TEXT("linkedToCount"), LinkedToCount);
+      Result->SetBoolField(TEXT("verified"), true);
+      TSharedPtr<FJsonObject> Evidence = McpHandlerUtils::CreateResultObject();
+      Evidence->SetStringField(TEXT("fromPinId"), FromPin->PinId.ToString());
+      Evidence->SetStringField(TEXT("toPinId"), ToPin->PinId.ToString());
+      Evidence->SetNumberField(TEXT("linkedToCount"), LinkedToCount);
+      Result->SetObjectField(TEXT("evidence"), Evidence);
+      Result->SetNumberField(TEXT("graphLinkCount"), McpGraphCountLinks(TargetGraph));
+      McpGraphRecordSave(Result, bSaved);
       McpHandlerUtils::AddVerification(Result, Blueprint);
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Pins connected."), Result);
+      const bool bCompileOk =
+          McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+      SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                             bCompileOk ? TEXT("Pins connected.")
+                                        : TEXT("Pins connected but compilation failed."),
+                             Result,
+                             bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
     } else {
       SendAutomationError(RequestingSocket, RequestId,
                           TEXT("Failed to connect pins (schema rejection)."),
@@ -1959,12 +2191,18 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
     // CRITICAL: Save the blueprint to persist changes.
-    SaveLoadedAssetThrottled(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Pin links broken."), Result);
+    const bool bCompileOk =
+        McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+    SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                           bCompileOk ? TEXT("Pin links broken.")
+                                      : TEXT("Pin links broken but compilation failed."),
+                           Result,
+                           bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
     return true;
   }
 
@@ -1983,12 +2221,19 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       FBlueprintEditorUtils::RemoveNode(Blueprint, TargetNode, true);
 
       // CRITICAL: Save the blueprint to persist changes.
-      SaveLoadedAssetThrottled(Blueprint);
+      const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
       TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+      Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+      McpGraphRecordSave(Result, bSaved);
       McpHandlerUtils::AddVerification(Result, Blueprint);
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Node deleted."), Result);
+      const bool bCompileOk =
+          McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+      SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                             bCompileOk ? TEXT("Node deleted.")
+                                        : TEXT("Node deleted but compilation failed."),
+                             Result,
+                             bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
     } else {
       SendAutomationError(RequestingSocket, RequestId, TEXT("Node not found."),
                           TEXT("NODE_NOT_FOUND"));
@@ -2018,11 +2263,13 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     // CRITICAL: Save the blueprint to persist the new node.
     // Without this, the node exists only in memory and can be lost
     // between requests when the blueprint is reloaded.
-    SaveLoadedAssetThrottled(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("nodeId"), RerouteNode->NodeGuid.ToString());
     Result->SetStringField(TEXT("nodeName"), RerouteNode->GetName());
+    Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
+    McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Reroute node created."), Result);
@@ -2084,11 +2331,12 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
         // CRITICAL: Save the blueprint to persist changes.
-        SaveLoadedAssetThrottled(Blueprint);
+        const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("nodeId"), TargetNode->NodeGuid.ToString());
         Result->SetStringField(TEXT("nodeName"), TargetNode->GetName());
+        McpGraphRecordSave(Result, bSaved);
         McpHandlerUtils::AddVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true,
                                TEXT("Node property updated."), Result);
@@ -2184,20 +2432,56 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     }
     return true;
   } else if (SubAction == TEXT("get_graph_details")) {
+    int32 LinkCount = 0;
+    int32 DisconnectedNodeCount = 0;
+    int32 NodesWithCompilerMessages = 0;
+
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("graphName"), TargetGraph->GetName());
     Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
 
     TArray<TSharedPtr<FJsonValue>> Nodes;
     for (UEdGraphNode *Node : TargetGraph->Nodes) {
+      if (!Node) {
+        continue;
+      }
+
+      bool bHasExecPin = false;
+      bool bHasLinkedExecPin = false;
+      for (UEdGraphPin *Pin : Node->Pins) {
+        if (!Pin) {
+          continue;
+        }
+        if (Pin->Direction == EGPD_Output) {
+          LinkCount += Pin->LinkedTo.Num();
+        }
+        if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) {
+          bHasExecPin = true;
+          if (Pin->LinkedTo.Num() > 0) {
+            bHasLinkedExecPin = true;
+          }
+        }
+      }
+      if (bHasExecPin && !bHasLinkedExecPin) {
+        DisconnectedNodeCount++;
+      }
+      if (Node->bHasCompilerMessage) {
+        NodesWithCompilerMessages++;
+      }
+
       TSharedPtr<FJsonObject> NodeObj = McpHandlerUtils::CreateResultObject();
       NodeObj->SetStringField(TEXT("nodeId"), Node->NodeGuid.ToString());
       NodeObj->SetStringField(TEXT("nodeName"), Node->GetName());
       NodeObj->SetStringField(
           TEXT("nodeTitle"),
           Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+      NodeObj->SetBoolField(TEXT("bHasCompilerMessage"),
+                            Node->bHasCompilerMessage != 0);
       Nodes.Add(MakeShared<FJsonValueObject>(NodeObj));
     }
+    Result->SetNumberField(TEXT("linkCount"), LinkCount);
+    Result->SetNumberField(TEXT("disconnectedNodeCount"), DisconnectedNodeCount);
+    Result->SetNumberField(TEXT("nodesWithCompilerMessages"), NodesWithCompilerMessages);
     Result->SetArrayField(TEXT("nodes"), Nodes);
     McpHandlerUtils::AddVerification(Result, Blueprint);
 
@@ -2384,16 +2668,22 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
     // CRITICAL: Save the blueprint to persist changes.
-    SaveLoadedAssetThrottled(Blueprint);
+    const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("nodeId"), NodeId);
     Result->SetStringField(TEXT("nodeName"), TargetNode->GetName());
     Result->SetStringField(TEXT("pinName"), PinName);
     Result->SetStringField(TEXT("value"), Value);
+    McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Pin default value set."), Result);
+    const bool bCompileOk =
+        McpGraphApplyOptionalCompile(Payload, Blueprint, Result);
+    SendAutomationResponse(RequestingSocket, RequestId, bCompileOk,
+                           bCompileOk ? TEXT("Pin default value set.")
+                                      : TEXT("Pin default value set but compilation failed."),
+                           Result,
+                           bCompileOk ? FString() : TEXT("COMPILE_FAILED"));
     return true;
   }
 

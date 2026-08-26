@@ -5,6 +5,7 @@ import { Logger } from '../utils/logger.js';
 import {
     DEFAULT_AUTOMATION_HOST,
     DEFAULT_AUTOMATION_PORT,
+    DEFAULT_AUTOMATION_PORTS,
     DEFAULT_NEGOTIATED_PROTOCOLS,
     DEFAULT_HEARTBEAT_INTERVAL_MS,
     DEFAULT_MAX_PENDING_REQUESTS,
@@ -13,6 +14,7 @@ import {
     DEFAULT_MAX_INBOUND_AUTOMATION_REQUESTS_PER_MINUTE,
     MAX_WS_MESSAGE_SIZE_BYTES
 } from '../constants.js';
+import { discoverAutomationPorts, describePortDiscoveryReport, PortDiscoveryReport } from './port-discovery.js';
 import { createRequire } from 'node:module';
 import {
     AutomationBridgeOptions,
@@ -55,6 +57,8 @@ export class AutomationBridge extends EventEmitter {
     private readonly host: string;
     private readonly port: number;
     private readonly ports: number[];
+    /** Port currently used for outbound dialing; updated by transport discovery. */
+    private activeClientPort: number;
     private readonly negotiatedProtocols: string[];
     private readonly capabilityToken?: string;
     private readonly enabled: boolean;
@@ -80,6 +84,7 @@ export class AutomationBridge extends EventEmitter {
     private lastHandshakeFailure?: { reason: string; at: Date };
     private lastDisconnect?: { code: number; reason: string; at: Date };
     private lastError?: { message: string; at: Date };
+    private lastPortDiscovery?: PortDiscoveryReport;
 
     private queuedRequestItems: QueuedRequestItem[] = [];
     private connectionPromise?: Promise<void>;
@@ -304,6 +309,26 @@ export class AutomationBridge extends EventEmitter {
             ?? this.host;
         this.clientHost = normalizeHost(rawClientHost, 'Automation bridge client host');
         this.clientPort = options.clientPort ?? sanitizePort(process.env.MCP_AUTOMATION_CLIENT_PORT) ?? defaultPort;
+        // An explicitly configured client port is authoritative: probe only that
+        // port so configured deployments never dial an unrelated service.
+        const hasExplicitClientPort = options.clientPort !== undefined
+            || (typeof process.env.MCP_AUTOMATION_CLIENT_PORT === 'string'
+                && process.env.MCP_AUTOMATION_CLIENT_PORT.trim().length > 0);
+        if (hasExplicitClientPort) {
+            this.ports = [this.clientPort];
+        } else {
+            // Defaulted configuration: consider common bridge fallback ports so
+            // the client can discover deployments where the plugin ListenPorts
+            // differ from the defaults (e.g. 8092/8093 when 8090/8091 are taken).
+            // Probing keeps this safe: closed ports are rejected and HTTP MCP
+            // endpoints are never dialed.
+            for (const fallbackPort of DEFAULT_AUTOMATION_PORTS) {
+                if (!this.ports.includes(fallbackPort)) {
+                    this.ports.push(fallbackPort);
+                }
+            }
+        }
+        this.activeClientPort = this.clientPort;
         this.maxConcurrentConnections = maxConcurrentConnections;
 
         // Initialize components
@@ -353,40 +378,121 @@ export class AutomationBridge extends EventEmitter {
         this.startClient();
     }
 
+    /**
+     * Build a protocol-mismatch style connection error with actionable guidance.
+     */
+    private buildTransportError(report: PortDiscoveryReport | undefined, fallbackMessage: string): Error {
+        if (report && report.httpEndpoints.length > 0) {
+            const endpoint = report.httpEndpoints[0];
+            const error = new Error(
+                `PROTOCOL_MISMATCH: ${endpoint.detail ?? `Port ${endpoint.port} speaks HTTP, not WebSocket.`} ` +
+                'Configure the WebSocket bridge ports via MCP_AUTOMATION_WS_PORTS/MCP_AUTOMATION_WS_PORT ' +
+                '(plugin side: ListenPorts in McpAutomationBridgeSettings). ' +
+                `Discovery result: ${describePortDiscoveryReport(report)}`
+            );
+            (error as Error & { code?: string }).code = 'PROTOCOL_MISMATCH';
+            return error;
+        }
+        if (report && report.results.length > 0 && report.selectedPort === undefined && report.httpEndpoints.length === 0) {
+            const error = new Error(
+                `BRIDGE_UNREACHABLE: no WebSocket automation bridge is listening on ${this.clientHost} ` +
+                `(probed: ${describePortDiscoveryReport(report)}). ` +
+                'Start the Unreal Editor with the McpAutomationBridge plugin or verify ports via ' +
+                'MCP_AUTOMATION_WS_PORTS (plugin side: ListenPorts in McpAutomationBridgeSettings).'
+            );
+            (error as Error & { code?: string }).code = 'BRIDGE_UNREACHABLE';
+            return error;
+        }
+        return new Error(fallbackMessage);
+    }
+
     private startClient(): void {
+        void this.connectWithDiscovery();
+    }
+
+    private async connectWithDiscovery(): Promise<void> {
         try {
-            const url = this.getClientUrl();
-            this.log.info(`Connecting to Unreal Engine automation server at ${url}`);
+            const discoveryHost = this.clientHost;
+            const report = await discoverAutomationPorts(discoveryHost, this.ports, this.log);
+            this.lastPortDiscovery = report;
 
-            this.log.debug(`Negotiated protocols: ${JSON.stringify(this.negotiatedProtocols)}`);
+            if (report.selectedPort === undefined) {
+                const error = this.buildTransportError(report, 'No WebSocket automation bridge port available');
+                this.lastError = { message: error.message, at: new Date() };
+                this.log.error(error.message);
+                this.emitAutomation('error', error);
+                return;
+            }
 
-            const protocols = this.negotiatedProtocols.length === 1
-                ? this.negotiatedProtocols[0]
-                : this.negotiatedProtocols;
+            if (report.selectedPort !== this.activeClientPort) {
+                this.log.info(
+                    `Transport discovery selected WebSocket bridge port ${report.selectedPort}` +
+                    ` (configured default ${this.activeClientPort}); ` +
+                    `probed: ${describePortDiscoveryReport(report)}`
+                );
+                this.activeClientPort = report.selectedPort;
+            }
 
-            this.log.debug(`Using WebSocket protocols arg: ${JSON.stringify(protocols)}`);
-
-            const headers: Record<string, string> | undefined = this.capabilityToken
-                ? {
-                    'X-MCP-Capability': this.capabilityToken,
-                    'X-MCP-Capability-Token': this.capabilityToken
-                  }
-                : undefined;
-
-            const socket = new WebSocket(url, protocols, {
-                headers,
-                perMessageDeflate: false
-            });
-            this.pendingConnectionSocket = socket;
-
-            this.handleClientConnection(socket);
+            await this.dialSelectedPort();
         } catch (error) {
             const errorObj = error instanceof Error ? error : new Error(String(error));
             this.lastError = { message: errorObj.message, at: new Date() };
-            this.log.error('Failed to create WebSocket client connection', errorObj);
-            const errorWithPort = Object.assign(errorObj, { port: this.clientPort });
+            this.log.error('Transport discovery failed', errorObj);
+            const errorWithPort = Object.assign(errorObj, { port: this.activeClientPort });
             this.emitAutomation('error', errorWithPort);
         }
+    }
+
+    private dialSelectedPort(): Promise<void> {
+        return new Promise<void>((resolve) => {
+            let settled = false;
+            const finish = (): void => {
+                if (settled) return;
+                settled = true;
+                resolve();
+            };
+
+            try {
+                const url = this.getClientUrl();
+                this.log.info(`Connecting to Unreal Engine automation server at ${url}`);
+
+                this.log.debug(`Negotiated protocols: ${JSON.stringify(this.negotiatedProtocols)}`);
+
+                const protocols = this.negotiatedProtocols.length === 1
+                    ? this.negotiatedProtocols[0]
+                    : this.negotiatedProtocols;
+
+                this.log.debug(`Using WebSocket protocols arg: ${JSON.stringify(protocols)}`);
+
+                const headers: Record<string, string> | undefined = this.capabilityToken
+                    ? {
+                        'X-MCP-Capability': this.capabilityToken,
+                        'X-MCP-Capability-Token': this.capabilityToken
+                      }
+                    : undefined;
+
+                const socket = new WebSocket(url, protocols, {
+                    headers,
+                    perMessageDeflate: false
+                });
+                this.pendingConnectionSocket = socket;
+
+                // Resolve once the socket either opens (handshake continues
+                // asynchronously) or fails before opening.
+                socket.once('open', () => finish());
+                socket.once('error', () => finish());
+                socket.once('close', () => finish());
+
+                this.handleClientConnection(socket).finally(() => finish());
+            } catch (error) {
+                const errorObj = error instanceof Error ? error : new Error(String(error));
+                this.lastError = { message: errorObj.message, at: new Date() };
+                this.log.error('Failed to create WebSocket client connection', errorObj);
+                const errorWithPort = Object.assign(errorObj, { port: this.activeClientPort });
+                this.emitAutomation('error', errorWithPort);
+                finish();
+            }
+        });
     }
 
     private async handleClientConnection(socket: WebSocket): Promise<void> {
@@ -408,13 +514,13 @@ export class AutomationBridge extends EventEmitter {
                 const remoteAddr = underlying?.remoteAddress ?? undefined;
                 const remotePort = underlying?.remotePort ?? undefined;
 
-                this.connectionManager.registerSocket(socket, this.clientPort, metadata, remoteAddr, remotePort);
+                this.connectionManager.registerSocket(socket, this.activeClientPort, metadata, remoteAddr, remotePort);
                 this.connectionManager.startHeartbeat();
 
                 this.emitAutomation('connected', {
                     socket,
                     metadata,
-                    port: this.clientPort,
+                    port: this.activeClientPort,
                     protocol: socket.protocol || null
                 });
 
@@ -521,8 +627,19 @@ export class AutomationBridge extends EventEmitter {
             }
             this.log.error('Automation bridge client socket error', error);
             const errObj = error instanceof Error ? error : new Error(String(error));
+            // An HTTP server rejecting the WebSocket upgrade is a protocol
+            // mismatch: surface actionable guidance instead of a raw engine error.
+            if (/unexpected server response/i.test(errObj.message)) {
+                errObj.message =
+                    `PROTOCOL_MISMATCH: the endpoint at ${this.clientHost}:${this.activeClientPort} answered HTTP ` +
+                    `("${errObj.message}") instead of completing the WebSocket upgrade. ` +
+                    'This endpoint is likely the native MCP HTTP/SSE transport, not the WebSocket automation bridge. ' +
+                    'Point MCP_AUTOMATION_WS_PORT/MCP_AUTOMATION_WS_PORTS at the plugin ListenPorts ' +
+                    '(McpAutomationBridgeSettings, default 8090,8091).';
+                (errObj as Error & { code?: string }).code = 'PROTOCOL_MISMATCH';
+            }
             this.lastError = { message: errObj.message, at: new Date() };
-            const errWithPort = Object.assign(errObj, { port: this.clientPort });
+            const errWithPort = Object.assign(errObj, { port: this.activeClientPort });
             this.emitAutomation('error', errWithPort);
         });
 
@@ -564,7 +681,7 @@ export class AutomationBridge extends EventEmitter {
 
     private getClientUrl(): string {
         const scheme = this.useTls ? 'wss' : 'ws';
-        return `${scheme}://${this.formatHostForUrl(this.clientHost)}:${this.clientPort}`;
+        return `${scheme}://${this.formatHostForUrl(this.clientHost)}:${this.activeClientPort}`;
     }
 
     private clearPendingConnection(socket: WebSocket): void {
@@ -639,6 +756,10 @@ export class AutomationBridge extends EventEmitter {
             host: this.clientHost,
             port: this.port,
             configuredPorts: [...this.ports],
+            transportDiscovery: this.lastPortDiscovery
+                ? describePortDiscoveryReport(this.lastPortDiscovery)
+                : null,
+            httpMcpEndpointsDetected: this.lastPortDiscovery?.httpEndpoints.map((entry) => entry.port) ?? [],
             listeningPorts: [], // We are client-only now
             connected: this.isConnected(),
             connectedAt: connectionInfos.length > 0 ? connectionInfos[0].connectedAt : null,

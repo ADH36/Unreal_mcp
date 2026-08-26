@@ -72,6 +72,10 @@ export interface AutomationBridgeStatus {
     host: string;
     port: number;
     configuredPorts: number[];
+    /** Human-readable transport classification per probed port (e.g. "8092:ws, 3000:http-mcp-endpoint"). */
+    transportDiscovery: string | null;
+    /** Ports probed and classified as HTTP MCP endpoints; must never be dialed with WebSocket. */
+    httpMcpEndpointsDetected: number[];
     listeningPorts: number[];
     connected: boolean;
     connectedAt: string | null;

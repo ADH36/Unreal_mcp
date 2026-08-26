@@ -1480,6 +1480,149 @@ bool ApplyStaticMeshSpawnerSettingsObject(UPCGStaticMeshSpawnerSettings* Setting
     return true;
 }
 
+void CollectPCGJsonNumbers(const TSharedPtr<FJsonValue>& Value, TArray<double>& OutNumbers)
+{
+    if (!Value)
+    {
+        return;
+    }
+    if (Value->Type == EJson::Number)
+    {
+        OutNumbers.Add(Value->AsNumber());
+    }
+    else if (Value->Type == EJson::Array)
+    {
+        for (const TSharedPtr<FJsonValue>& Element : Value->AsArray())
+        {
+            CollectPCGJsonNumbers(Element, OutNumbers);
+        }
+    }
+    else if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> Object = Value->AsObject();
+        if (Object.IsValid())
+        {
+            for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Object->Values)
+            {
+                CollectPCGJsonNumbers(Pair.Value, OutNumbers);
+            }
+        }
+    }
+}
+
+bool TryGetPCGVectorComponents(const TSharedPtr<FJsonValue>& Value, double (&OutComponents)[3])
+{
+    if (!Value)
+    {
+        return false;
+    }
+    if (Value->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& Array = Value->AsArray();
+        if (Array.Num() < 3)
+        {
+            return false;
+        }
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            if (!Array[Index].IsValid() || Array[Index]->Type != EJson::Number)
+            {
+                return false;
+            }
+            OutComponents[Index] = Array[Index]->AsNumber();
+        }
+        return true;
+    }
+    if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> Object = Value->AsObject();
+        if (!Object.IsValid())
+        {
+            return false;
+        }
+        static const TCHAR* const AxisKeys[3][2] = {
+            {TEXT("X"), TEXT("x")}, {TEXT("Y"), TEXT("y")}, {TEXT("Z"), TEXT("z")}
+        };
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            double Component = 0.0;
+            const bool bFound = Object->TryGetNumberField(AxisKeys[Index][0], Component) ||
+                Object->TryGetNumberField(AxisKeys[Index][1], Component);
+            if (!bFound)
+            {
+                return false;
+            }
+            OutComponents[Index] = Component;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool ValidatePCGNumericRanges(const TSharedPtr<FJsonObject>& Object, FString& OutError)
+{
+    if (!Object.IsValid())
+    {
+        return true;
+    }
+
+    static const TCHAR* const NumericKeys[] = {
+        TEXT("scaleMin"), TEXT("scaleMax"), TEXT("ScaleMin"), TEXT("ScaleMax"),
+        TEXT("rotationMin"), TEXT("rotationMax"), TEXT("RotationMin"), TEXT("RotationMax"),
+        TEXT("offsetMin"), TEXT("offsetMax"), TEXT("OffsetMin"), TEXT("OffsetMax")
+    };
+    for (const TCHAR* Key : NumericKeys)
+    {
+        const TSharedPtr<FJsonValue>* Value = Object->Values.Find(Key);
+        if (!Value || !(*Value))
+        {
+            continue;
+        }
+        TArray<double> Numbers;
+        CollectPCGJsonNumbers(*Value, Numbers);
+        for (const double Number : Numbers)
+        {
+            if (!FMath::IsFinite(Number))
+            {
+                OutError = FString::Printf(TEXT("PCG settings field '%s' contains a non-finite (NaN or infinite) value."), Key);
+                return false;
+            }
+        }
+    }
+
+    static const TPair<const TCHAR*, const TCHAR*> MinMaxPairs[] = {
+        {TEXT("scaleMin"), TEXT("scaleMax")}, {TEXT("ScaleMin"), TEXT("ScaleMax")},
+        {TEXT("rotationMin"), TEXT("rotationMax")}, {TEXT("RotationMin"), TEXT("RotationMax")},
+        {TEXT("offsetMin"), TEXT("offsetMax")}, {TEXT("OffsetMin"), TEXT("OffsetMax")}
+    };
+    for (const TPair<const TCHAR*, const TCHAR*>& Pair : MinMaxPairs)
+    {
+        const TSharedPtr<FJsonValue>* MinValue = Object->Values.Find(Pair.Key);
+        const TSharedPtr<FJsonValue>* MaxValue = Object->Values.Find(Pair.Value);
+        if (!MinValue || !(*MinValue) || !MaxValue || !(*MaxValue))
+        {
+            continue;
+        }
+        double MinComponents[3] = {0.0, 0.0, 0.0};
+        double MaxComponents[3] = {0.0, 0.0, 0.0};
+        if (!TryGetPCGVectorComponents(*MinValue, MinComponents) || !TryGetPCGVectorComponents(*MaxValue, MaxComponents))
+        {
+            continue;
+        }
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            if (MinComponents[Index] > MaxComponents[Index])
+            {
+                OutError = FString::Printf(
+                    TEXT("PCG settings range '%s/%s' is invalid: component %d has min (%g) greater than max (%g)."),
+                    Pair.Key, Pair.Value, Index, MinComponents[Index], MaxComponents[Index]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ApplyPCGConvenienceSettings(const FString& SubAction, UPCGSettings* Settings, const TSharedPtr<FJsonObject>& Payload, FString& OutError, int32& OutAppliedCount)
 {
     OutAppliedCount = 0;
@@ -1704,9 +1847,12 @@ UPCGComponent* CreatePCGComponent(AActor* Actor, const FString& ComponentName)
     return Component;
 }
 
-bool SaveEditorWorldIfRequested(UWorld* World, bool bSave, bool& bOutSaved, FString& OutError)
+bool SaveEditorWorldIfRequested(UWorld* World, bool bSave, bool& bOutSaved, FString& OutError,
+    int32& OutSavedExternalActorPackages, TArray<FString>& OutSavedExternalActorPackageNames)
 {
     bOutSaved = false;
+    OutSavedExternalActorPackages = 0;
+    OutSavedExternalActorPackageNames.Reset();
     if (!World)
     {
         OutError = TEXT("Could not resolve the editor world for level save.");
@@ -1744,7 +1890,51 @@ bool SaveEditorWorldIfRequested(UWorld* World, bool bSave, bool& bOutSaved, FStr
         return false;
     }
 
+    // World Partition OFPA actors live in their own external packages, which the
+    // persistent level save above never writes. Persist dirty external actor
+    // packages through the safe editor save path.
+    if (World->GetWorldPartition() != nullptr)
+    {
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            AActor* Actor = *It;
+            if (!Actor)
+            {
+                continue;
+            }
+            UPackage* ExternalActorPackage = Actor->GetExternalPackage();
+            if (!ExternalActorPackage || !ExternalActorPackage->IsDirty())
+            {
+                continue;
+            }
+            if (McpSafeAssetSave(Actor))
+            {
+                ++OutSavedExternalActorPackages;
+                if (OutSavedExternalActorPackageNames.Num() < 50)
+                {
+                    OutSavedExternalActorPackageNames.Add(ExternalActorPackage->GetName());
+                }
+            }
+        }
+    }
+
     return true;
+}
+
+void AddExternalActorSaveFields(const TSharedPtr<FJsonObject>& Result, int32 SavedExternalActorPackages,
+    const TArray<FString>& SavedExternalActorPackageNames)
+{
+    if (!Result.IsValid())
+    {
+        return;
+    }
+    Result->SetNumberField(TEXT("savedExternalActorPackages"), SavedExternalActorPackages);
+    TArray<TSharedPtr<FJsonValue>> PackageNameValues;
+    for (const FString& PackageName : SavedExternalActorPackageNames)
+    {
+        PackageNameValues.Add(MakeShared<FJsonValueString>(PackageName));
+    }
+    Result->SetArrayField(TEXT("savedExternalActorPackageNames"), PackageNameValues);
 }
 
 void ApplyNodeMetadata(UPCGNode* Node, const TSharedPtr<FJsonObject>& Payload)
@@ -1833,6 +2023,7 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
     uint32 AggregateTransformHash = 0;
     bool bHasFallbackMesh = false;
     bool bAllTransformsWithinBounds = true;
+    int32 InvalidTransformCount = 0;
     TArray<TSharedPtr<FJsonValue>> InstanceValues;
     TArray<TSharedPtr<FJsonValue>> ActualMeshPaths;
     TArray<TSharedPtr<FJsonValue>> ActualMeshPackagePaths;
@@ -1890,6 +2081,12 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
                     bTransformsWithinBounds &= ComponentBounds.IsInsideOrOn(Location);
                     const FRotator Rotation = InstanceTransform.Rotator();
                     const FVector Scale = InstanceTransform.GetScale3D();
+                    if (InstanceTransform.ContainsNaN() || !InstanceTransform.IsValid() ||
+                        FMath::Abs(Scale.X) < 0.0001f || FMath::Abs(Scale.Y) < 0.0001f || FMath::Abs(Scale.Z) < 0.0001f)
+                    {
+                        ++InvalidTransformCount;
+                        bTransformsWithinBounds = false;
+                    }
                     TSharedPtr<FJsonObject> TransformObject = MakeShared<FJsonObject>();
                     TSharedPtr<FJsonObject> LocationObject = MakeShared<FJsonObject>();
                     LocationObject->SetNumberField(TEXT("x"), Location.X);
@@ -1960,6 +2157,20 @@ TSharedPtr<FJsonObject> BuildGeneratedInstancesResult(UPCGComponent* Component)
     Result->SetBoolField(TEXT("materialized"), TotalInstances > 0 && (ISMComponents + HISMComponents) > 0);
     Result->SetBoolField(TEXT("generated"), Component ? Component->bGenerated : false);
     Result->SetBoolField(TEXT("generationInProgress"), Component ? Component->IsGenerating() : false);
+    Result->SetNumberField(TEXT("invalidTransformCount"), InvalidTransformCount);
+    Result->SetNumberField(TEXT("rejectedInstanceCount"), InvalidTransformCount);
+    // Point data is only proven persisted after a reload; never claim it here.
+    Result->SetNumberField(TEXT("persistedInstanceCount"), -1);
+    Result->SetBoolField(TEXT("persisted"), false);
+    TArray<TSharedPtr<FJsonValue>> Warnings;
+    if (InvalidTransformCount > 0)
+    {
+        Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+            TEXT("%d transforms are NaN/infinite/degenerate and were flagged"), InvalidTransformCount)));
+    }
+    Warnings.Add(MakeShared<FJsonValueString>(
+        TEXT("persistence not verified; reload map and call read_pcg_generated_instances to verify")));
+    Result->SetArrayField(TEXT("warnings"), Warnings);
     if (Component)
     {
         McpHandlerUtils::AddVerification(Result, Component);
@@ -2011,8 +2222,10 @@ void SchedulePCGGenerationWait(
             }
 
             bool bLevelSaved = false;
+            int32 SavedExternalActorPackages = 0;
+            TArray<FString> SavedExternalActorPackageNames;
             FString SaveError;
-            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError, SavedExternalActorPackages, SavedExternalActorPackageNames))
             {
                 LiveSubsystem->SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
                 return false;
@@ -2027,7 +2240,41 @@ void SchedulePCGGenerationWait(
             Result->SetNumberField(TEXT("taskId"), static_cast<double>(TaskId));
             Result->SetBoolField(TEXT("waited"), true);
             Result->SetBoolField(TEXT("saved"), bLevelSaved);
+            AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
             McpHandlerUtils::AddVerification(Result, LiveComponent);
+
+            double ReportedInstanceCount = 0.0;
+            double ReportedISMComponents = 0.0;
+            double ReportedHISMComponents = 0.0;
+            Result->TryGetNumberField(TEXT("instanceCount"), ReportedInstanceCount);
+            Result->TryGetNumberField(TEXT("ismComponentCount"), ReportedISMComponents);
+            Result->TryGetNumberField(TEXT("hismComponentCount"), ReportedHISMComponents);
+            if (LiveComponent->bGenerated && ReportedInstanceCount <= 0.0)
+            {
+                const bool bHasSpawnerComponents = (ReportedISMComponents + ReportedHISMComponents) > 0.0;
+                if (bHasSpawnerComponents)
+                {
+                    TArray<TSharedPtr<FJsonValue>> Warnings;
+                    const TArray<TSharedPtr<FJsonValue>>* ExistingWarnings = nullptr;
+                    if (Result->TryGetArrayField(TEXT("warnings"), ExistingWarnings) && ExistingWarnings)
+                    {
+                        Warnings = *ExistingWarnings;
+                    }
+                    Warnings.Add(MakeShared<FJsonValueString>(TEXT("spawlers present but zero instances")));
+                    Result->SetArrayField(TEXT("warnings"), Warnings);
+                    LiveSubsystem->SendAutomationResponse(Socket, RequestId, false,
+                        TEXT("PCG generation completed with zero instances; spawner components exist but produced no output."),
+                        Result, TEXT("NO_INSTANCES_MATERIALIZED"));
+                }
+                else
+                {
+                    LiveSubsystem->SendAutomationResponse(Socket, RequestId, false,
+                        TEXT("PCG generation completed with zero instances; no ISM/HISM components were materialized."),
+                        Result, TEXT("NO_INSTANCES_MATERIALIZED"));
+                }
+                return false;
+            }
+
             LiveSubsystem->SendAutomationResponse(Socket, RequestId, true, TEXT("PCG generation completed; output was verified from materialized ISM/HISM components."), Result);
             return false;
         }));
@@ -2333,8 +2580,10 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             Component->CleanupLocal(true);
 #endif
             bool bLevelSaved = false;
+            int32 SavedExternalActorPackages = 0;
+            TArray<FString> SavedExternalActorPackageNames;
             FString SaveError;
-            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError, SavedExternalActorPackages, SavedExternalActorPackageNames))
             {
                 SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
                 return true;
@@ -2344,6 +2593,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             Result->SetStringField(TEXT("componentName"), Component->GetName());
             Result->SetStringField(TEXT("componentPath"), Component->GetPathName());
             Result->SetBoolField(TEXT("saved"), bLevelSaved);
+            AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
             SendAutomationResponse(Socket, RequestId, true, TEXT("PCG generated output cleared safely."), Result);
             return true;
         }
@@ -2366,8 +2616,10 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             return true;
         }
         bool bLevelSaved = false;
+        int32 SavedExternalActorPackages = 0;
+        TArray<FString> SavedExternalActorPackageNames;
         FString SaveError;
-        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError))
+        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, SaveError, SavedExternalActorPackages, SavedExternalActorPackageNames))
         {
             SendAutomationError(Socket, RequestId, SaveError, TEXT("SAVE_FAILED"));
             return true;
@@ -2380,6 +2632,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         Result->SetBoolField(TEXT("force"), bForceGenerate);
         Result->SetBoolField(TEXT("waited"), false);
         Result->SetBoolField(TEXT("saved"), bLevelSaved);
+        AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG component regeneration started."), Result);
         return true;
     }
@@ -2459,7 +2712,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         }
 
         bool bLevelSaved = false;
-        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error))
+        int32 SavedExternalActorPackages = 0;
+        TArray<FString> SavedExternalActorPackageNames;
+        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error, SavedExternalActorPackages, SavedExternalActorPackageNames))
         {
             SendAutomationError(Socket, RequestId, Error, TEXT("SAVE_FAILED"));
             return true;
@@ -2474,6 +2729,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         Result->SetBoolField(TEXT("force"), bForceGenerate);
         Result->SetBoolField(TEXT("waited"), false);
         Result->SetBoolField(TEXT("saved"), bLevelSaved);
+        AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
         McpHandlerUtils::AddVerification(Result, Component);
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG graph generation started."), Result);
         return true;
@@ -2533,7 +2789,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
 
             FString Error;
             bool bLevelSaved = false;
-            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error))
+            int32 SavedExternalActorPackages = 0;
+            TArray<FString> SavedExternalActorPackageNames;
+            if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error, SavedExternalActorPackages, SavedExternalActorPackageNames))
             {
                 SendAutomationError(Socket, RequestId, Error, TEXT("SAVE_FAILED"));
                 return true;
@@ -2547,6 +2805,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             Result->SetNumberField(TEXT("previousGridSize"), PreviousGridSize);
             Result->SetNumberField(TEXT("gridSize"), GridSize);
             Result->SetBoolField(TEXT("saved"), bLevelSaved);
+            AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
             McpHandlerUtils::AddVerification(Result, Component);
             SendAutomationResponse(Socket, RequestId, true, TEXT("PCG component generation grid size updated."), Result);
             return true;
@@ -2579,7 +2838,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
 
         FString Error;
         bool bLevelSaved = false;
-        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error))
+        int32 SavedExternalActorPackages = 0;
+        TArray<FString> SavedExternalActorPackageNames;
+        if (!SaveEditorWorldIfRequested(World, bSave, bLevelSaved, Error, SavedExternalActorPackages, SavedExternalActorPackageNames))
         {
             SendAutomationError(Socket, RequestId, Error, TEXT("SAVE_FAILED"));
             return true;
@@ -2590,6 +2851,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
         Result->SetNumberField(TEXT("previousGridSize"), PreviousGridSize);
         Result->SetNumberField(TEXT("gridSize"), PCGWorldActor->PartitionGridSize);
         Result->SetBoolField(TEXT("saved"), bLevelSaved);
+        AddExternalActorSaveFields(Result, SavedExternalActorPackages, SavedExternalActorPackageNames);
         McpHandlerUtils::AddVerification(Result, PCGWorldActor);
         SendAutomationResponse(Socket, RequestId, true, TEXT("PCG partition grid size updated."), Result);
         return true;
@@ -2771,10 +3033,22 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             return true;
         }
 
+        FString RangeError;
+        if (!ValidatePCGNumericRanges(Payload, RangeError))
+        {
+            SendAutomationError(Socket, RequestId, RangeError, TEXT("INVALID_RANGE"));
+            return true;
+        }
+
         const TSharedPtr<FJsonObject>* SettingsObject = nullptr;
         int32 AppliedSettings = 0;
         if (Payload->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
         {
+            if (!ValidatePCGNumericRanges(*SettingsObject, RangeError))
+            {
+                SendAutomationError(Socket, RequestId, RangeError, TEXT("INVALID_RANGE"));
+                return true;
+            }
             const bool bStaticMeshSpawnerSettings = DefaultSettings->IsA<UPCGStaticMeshSpawnerSettings>();
             if ((bStaticMeshSpawnerSettings && !ApplyStaticMeshSpawnerSettingsObject(Cast<UPCGStaticMeshSpawnerSettings>(DefaultSettings), *SettingsObject, Error, AppliedSettings)) ||
                 (!bStaticMeshSpawnerSettings && !ApplySettingsObject(DefaultSettings, *SettingsObject, Error, AppliedSettings)))
@@ -2889,10 +3163,22 @@ bool UMcpAutomationBridgeSubsystem::HandleManagePCGAction(
             return true;
         }
 
+        FString RangeError;
+        if (!ValidatePCGNumericRanges(Payload, RangeError))
+        {
+            SendAutomationError(Socket, RequestId, RangeError, TEXT("INVALID_RANGE"));
+            return true;
+        }
+
         int32 AppliedSettings = 0;
         const TSharedPtr<FJsonObject>* SettingsObject = nullptr;
         if (Payload->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
         {
+            if (!ValidatePCGNumericRanges(*SettingsObject, RangeError))
+            {
+                SendAutomationError(Socket, RequestId, RangeError, TEXT("INVALID_RANGE"));
+                return true;
+            }
             const bool bStaticMeshSpawnerSettings = Settings->IsA<UPCGStaticMeshSpawnerSettings>();
             if ((bStaticMeshSpawnerSettings && !ApplyStaticMeshSpawnerSettingsObject(Cast<UPCGStaticMeshSpawnerSettings>(Settings), *SettingsObject, Error, AppliedSettings)) ||
                 (!bStaticMeshSpawnerSettings && !ApplySettingsObject(Settings, *SettingsObject, Error, AppliedSettings)))

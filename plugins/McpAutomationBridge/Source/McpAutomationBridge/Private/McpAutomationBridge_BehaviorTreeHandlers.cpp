@@ -54,8 +54,10 @@
 
 // Behavior Tree Core
 #include "BehaviorTree/BehaviorTree.h"
+#include "BehaviorTree/BTCompositeNode.h"
 #include "BehaviorTree/BTDecorator.h"
 #include "BehaviorTree/BTService.h"
+#include "BehaviorTree/BTTaskNode.h"
 #include "BehaviorTree/Composites/BTComposite_Selector.h"
 #include "BehaviorTree/Composites/BTComposite_Sequence.h"
 #include "BehaviorTree/Composites/BTComposite_SimpleParallel.h"
@@ -92,6 +94,37 @@
 // Graph Support
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphSchema.h"
+
+// True when any UBTTaskNode exists below RootNode in the compiled runtime tree.
+// UE 5.8 note: FBTCompositeChild has no ChildInstance; GetChildNode() returns the
+// child UBTNode* (ChildComposite or ChildTask) which we test with IsA<UBTTaskNode>().
+static bool TreeHasExecutableTaskBelow(UBTCompositeNode *Composite,
+                                       TSet<UBTCompositeNode *> &Visited) {
+  if (!Composite || Visited.Contains(Composite)) {
+    return false;
+  }
+  Visited.Add(Composite);
+  for (int32 ChildIdx = 0; ChildIdx < Composite->GetChildrenNum(); ++ChildIdx) {
+    UBTNode *Child = Composite->GetChildNode(ChildIdx);
+    if (Child && Child->IsA<UBTTaskNode>()) {
+      return true;
+    }
+    if (UBTCompositeNode *ChildComposite = Cast<UBTCompositeNode>(Child)) {
+      if (TreeHasExecutableTaskBelow(ChildComposite, Visited)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool TreeHasExecutableTaskBelowRoot(UBehaviorTree *BT) {
+  if (!BT || !BT->RootNode) {
+    return false;
+  }
+  TSet<UBTCompositeNode *> Visited;
+  return TreeHasExecutableTaskBelow(BT->RootNode, Visited);
+}
 
 #endif // WITH_EDITOR
 
@@ -301,6 +334,8 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
     McpBehaviorTreeSerializers::SerializeBehaviorTree(GetTreeBT, GetTreeData);
     TSharedRef<FJsonObject> GetTreeResult = MakeShared<FJsonObject>();
     GetTreeResult->SetObjectField(TEXT("tree"), GetTreeData);
+    GetTreeResult->SetBoolField(TEXT("hasExecutableTask"),
+                                TreeHasExecutableTaskBelowRoot(GetTreeBT));
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Behavior tree retrieved."), GetTreeResult);
     return true;
@@ -555,10 +590,36 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
           return true;
         }
 
+        // Fix C1: "Fail"/"Succeed" alias to UBTTask_FinishWithResult must set the
+        // result value (protected FValueOrBBKey_Enum::Result -> set via reflection).
+        if ((NodeType == TEXT("Fail") || NodeType == TEXT("Succeed")) &&
+            NodeInstanceClass == UBTTask_FinishWithResult::StaticClass() &&
+            IsValid(NewNode->NodeInstance)) {
+          if (UBTTask_FinishWithResult *FinishTask =
+                  Cast<UBTTask_FinishWithResult>(NewNode->NodeInstance)) {
+            const uint8 DesiredResult =
+                static_cast<uint8>(NodeType == TEXT("Fail")
+                                       ? EBTNodeResult::Failed
+                                       : EBTNodeResult::Succeeded);
+            if (FStructProperty *ResultProp = FindField<FStructProperty>(
+                    FinishTask->GetClass(), TEXT("Result"))) {
+              void *ResultStructPtr =
+                  ResultProp->ContainerPtrToValuePtr<void>(FinishTask);
+              if (UInt8Property *DefaultValueProp = FindField<UInt8Property>(
+                      ResultProp->Struct, TEXT("DefaultValue"))) {
+                DefaultValueProp->SetPropertyValue_InContainer(ResultStructPtr,
+                                                               DesiredResult);
+              }
+            }
+          }
+        }
+
         UpdateBehaviorTreeAsset();
+        const bool bSaved = McpSafeAssetSave(BT);
 
         TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
         Result->SetStringField(TEXT("nodeId"), NewNode->NodeGuid.ToString());
+        Result->SetBoolField(TEXT("saved"), bSaved);
         McpHandlerUtils::AddVerification(Result, BT);
 
         SendAutomationResponse(RequestingSocket, RequestId, true,
@@ -602,13 +663,40 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       return true;
     }
 
-    // In BT, output pin of parent connects to input pin of child
+    // In BT, output pin of parent connects to input pin of child.
+    // Optional `pinName` selects the parent output pin by case-insensitive
+    // PinName match; without it the first output pin is used (legacy behavior).
+    FString RequestedPinName;
+    Payload->TryGetStringField(TEXT("pinName"), RequestedPinName);
+    RequestedPinName.TrimStartAndEndInline();
+
     UEdGraphPin *OutputPin = nullptr;
+    TArray<FString> OutputPinNames;
     for (UEdGraphPin *Pin : Parent->Pins) {
       if (Pin->Direction == EGPD_Output) {
-        OutputPin = Pin;
-        break;
+        if (RequestedPinName.IsEmpty()) {
+          OutputPin = Pin;
+          break;
+        }
+        OutputPinNames.Add(Pin->PinName.ToString());
+        if (Pin->PinName.ToString().Equals(RequestedPinName,
+                                           ESearchCase::IgnoreCase)) {
+          OutputPin = Pin;
+          break;
+        }
       }
+    }
+
+    if (!RequestedPinName.IsEmpty() && !OutputPin) {
+      SendAutomationError(
+          RequestingSocket, RequestId,
+          FString::Printf(
+              TEXT("Output pin '%s' not found on parent node. Available output "
+                   "pins: %s"),
+              *RequestedPinName,
+              *FString::Join(OutputPinNames, TEXT(", "))),
+          TEXT("PIN_NOT_FOUND"));
+      return true;
     }
 
     UEdGraphPin *InputPin = nullptr;
@@ -626,7 +714,17 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
         Parent->Modify();
         Child->Modify();
         UpdateBehaviorTreeAsset();
+        const bool bSaved = McpSafeAssetSave(BT);
+        const bool bHasExecutableTask = TreeHasExecutableTaskBelowRoot(BT);
         TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+        Resp->SetBoolField(TEXT("saved"), bSaved);
+        Resp->SetBoolField(TEXT("hasExecutableTask"), bHasExecutableTask);
+        if (!bHasExecutableTask) {
+          TArray<TSharedPtr<FJsonValue>> Warnings;
+          Warnings.Add(MakeShared<FJsonValueString>(
+              TEXT("Tree has no executable task below Root")));
+          Resp->SetArrayField(TEXT("warnings"), Warnings);
+        }
         McpHandlerUtils::AddVerification(Resp, BT);
         SendAutomationResponse(RequestingSocket, RequestId, true,
                                TEXT("Nodes connected."), Resp);
@@ -664,7 +762,9 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       BTGraph->GetSchema()->BreakNodeLinks(*TargetNode);
       BTGraph->RemoveNode(TargetNode);
       UpdateBehaviorTreeAsset();
+      const bool bSaved = McpSafeAssetSave(BT);
       TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+      Resp->SetBoolField(TEXT("saved"), bSaved);
       McpHandlerUtils::AddVerification(Resp, BT);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Node removed."), Resp);
@@ -695,7 +795,9 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       TargetNode->Modify();
       BTGraph->GetSchema()->BreakNodeLinks(*TargetNode);
       UpdateBehaviorTreeAsset();
+      const bool bSaved = McpSafeAssetSave(BT);
       TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+      Resp->SetBoolField(TEXT("saved"), bSaved);
       McpHandlerUtils::AddVerification(Resp, BT);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Connections broken."), Resp);
@@ -831,8 +933,18 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
         TargetNode->Modify();
         UpdateBehaviorTreeAsset();
       }
+      const bool bSaved = bModified && McpSafeAssetSave(BT);
+      const bool bHasExecutableTask = TreeHasExecutableTaskBelowRoot(BT);
 
       TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+      Resp->SetBoolField(TEXT("saved"), bSaved);
+      Resp->SetBoolField(TEXT("hasExecutableTask"), bHasExecutableTask);
+      if (!bHasExecutableTask) {
+        TArray<TSharedPtr<FJsonValue>> Warnings;
+        Warnings.Add(MakeShared<FJsonValueString>(
+            TEXT("Tree has no executable task below Root")));
+        Resp->SetArrayField(TEXT("warnings"), Warnings);
+      }
       McpHandlerUtils::AddVerification(Resp, BT);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Node properties updated."), Resp);
@@ -1022,12 +1134,14 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
 
     ParentNode->AddSubNode(NewSubnode, BTGraph);
     UpdateBehaviorTreeAsset();
+    const bool bSaved = McpSafeAssetSave(BT);
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("nodeId"), NewSubnode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
     Result->SetStringField(TEXT("nodeClass"), NodeInstanceClass->GetName());
     Result->SetStringField(TEXT("parentNodeId"), ParentNodeIdStr);
     Result->SetStringField(TEXT("subnodeType"), SubnodeType);
+    Result->SetBoolField(TEXT("saved"), bSaved);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Subnode added."), Result);
     return true;

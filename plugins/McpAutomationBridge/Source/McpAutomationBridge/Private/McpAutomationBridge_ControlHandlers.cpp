@@ -68,6 +68,13 @@
 #include "Misc/ScopeExit.h"
 #include "HAL/PlatformProcess.h"
 
+#if WITH_EDITOR && PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <Windows.h>
+#include <tlhelp32.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
+
 #if WITH_EDITOR
 
 // -----------------------------------------------------------------------------
@@ -269,6 +276,125 @@ static bool HasVisiblePixelsForMcp(const TArray<FColor>& Bitmap, int32& OutNonBl
 
 constexpr int32 MaxScreenshotPngBytesForBase64ForMcp = 3 * 1024 * 1024;
 
+bool TryParseScreenshotResolutionForMcp(const FString &ResolutionRaw,
+                                       int32 SrcWidth, int32 SrcHeight,
+                                       FIntPoint &OutResolution) {
+  FString Value = ResolutionRaw.TrimStartAndEnd();
+  if (Value.IsEmpty()) {
+    return false;
+  }
+
+  int32 Width = 0;
+  int32 Height = 0;
+  int32 SeparatorIndex = INDEX_NONE;
+  if (Value.FindChar(TEXT('x'), SeparatorIndex)) {
+    Width = FCString::Atoi(*Value.Left(SeparatorIndex));
+    Height = FCString::Atoi(*Value.Right(Value.Len() - SeparatorIndex - 1));
+  } else if (Value.FindChar(TEXT('X'), SeparatorIndex)) {
+    Width = FCString::Atoi(*Value.Left(SeparatorIndex));
+    Height = FCString::Atoi(*Value.Right(Value.Len() - SeparatorIndex - 1));
+  } else if (Value.IsNumeric()) {
+    Width = FCString::Atoi(*Value);
+    if (SrcWidth > 0) {
+      Height = FMath::Max(1, FMath::RoundToInt(
+          static_cast<float>(Width) * static_cast<float>(SrcHeight) /
+          static_cast<float>(SrcWidth)));
+    }
+  }
+
+  if (Width <= 0 || Height <= 0 || Width > 8192 || Height > 8192) {
+    return false;
+  }
+
+  OutResolution = FIntPoint(Width, Height);
+  return true;
+}
+
+void ResizeColorBitmapNearestForMcp(const TArray<FColor> &Source,
+                                    int32 SrcWidth, int32 SrcHeight,
+                                    int32 DstWidth, int32 DstHeight,
+                                    TArray<FColor> &OutBitmap) {
+  if (SrcWidth <= 0 || SrcHeight <= 0 || DstWidth <= 0 || DstHeight <= 0 ||
+      Source.Num() < SrcWidth * SrcHeight) {
+    return;
+  }
+
+  OutBitmap.SetNumUninitialized(DstWidth * DstHeight);
+  for (int32 Y = 0; Y < DstHeight; ++Y) {
+    const int32 SrcY = FMath::Clamp(
+        (Y * SrcHeight) / DstHeight, 0, SrcHeight - 1);
+    for (int32 X = 0; X < DstWidth; ++X) {
+      const int32 SrcX = FMath::Clamp(
+          (X * SrcWidth) / DstWidth, 0, SrcWidth - 1);
+      OutBitmap[Y * DstWidth + X] = Source[SrcY * SrcWidth + SrcX];
+    }
+  }
+}
+
+bool TryResolveScreenshotOutputPathForMcp(const FString &RawPath,
+                                          FString &OutFullPath) {
+  FString Normalized = RawPath.TrimStartAndEnd();
+  if (Normalized.IsEmpty()) {
+    return false;
+  }
+  if (Normalized.StartsWith(TEXT("/")) || Normalized.StartsWith(TEXT("\\")) ||
+      Normalized.Contains(TEXT(":")) || Normalized.Contains(TEXT(".."))) {
+    return false;
+  }
+
+  Normalized.ReplaceInline(TEXT("\\"), TEXT("/"));
+  TArray<FString> Segments;
+  Normalized.ParseIntoArray(Segments, TEXT("/"), true);
+  if (Segments.Num() == 0) {
+    return false;
+  }
+
+  for (const FString &Segment : Segments) {
+    if (Segment.IsEmpty() || Segment == TEXT(".")) {
+      return false;
+    }
+    if (Segment.Contains(TEXT("<")) || Segment.Contains(TEXT(">")) ||
+        Segment.Contains(TEXT("\"")) || Segment.Contains(TEXT("|")) ||
+        Segment.Contains(TEXT("?")) || Segment.Contains(TEXT("*"))) {
+      return false;
+    }
+  }
+
+  OutFullPath = FPaths::ProjectSavedDir() / FString::Join(Segments, TEXT("/"));
+  return true;
+}
+
+void AddStringArrayFieldForMcp(const TSharedPtr<FJsonObject> &Object,
+                               const TCHAR *FieldName,
+                               const TArray<FString> &Values) {
+  if (!Object.IsValid() || Values.Num() == 0) {
+    return;
+  }
+  TArray<TSharedPtr<FJsonValue>> JsonValues;
+  for (const FString &Value : Values) {
+    JsonValues.Add(MakeShared<FJsonValueString>(Value));
+  }
+  Object->SetArrayField(FieldName, JsonValues);
+}
+
+bool SaveScreenshotCopyForMcp(const TArray<uint8> &PngData,
+                              const FString &OutputPath) {
+  const FString ParentDirectory = FPaths::GetPath(OutputPath);
+  if (!ParentDirectory.IsEmpty()) {
+    IFileManager::Get().MakeDirectory(*ParentDirectory, true);
+  }
+  return FFileHelper::SaveArrayToFile(PngData, *OutputPath);
+}
+
+bool SaveScreenshotCopyForMcp(const TArray64<uint8> &PngData,
+                              const FString &OutputPath) {
+  const FString ParentDirectory = FPaths::GetPath(OutputPath);
+  if (!ParentDirectory.IsEmpty()) {
+    IFileManager::Get().MakeDirectory(*ParentDirectory, true);
+  }
+  return FFileHelper::SaveArrayToFile(PngData, *OutputPath);
+}
+
 bool IsSafeConsoleArgumentToken(const FString &Value) {
   const FString Trimmed = Value.TrimStartAndEnd();
   return !Trimmed.IsEmpty() && !Trimmed.Contains(TEXT("\n")) &&
@@ -380,24 +506,30 @@ TSharedPtr<SWindow> GetFullEditorSlateWindowForMcp() {
   return nullptr;
 }
 
-bool CaptureSlateWindowPngForMcp(const TSharedRef<SWindow> &Window,
-                                 TArray<uint8> &OutPngData,
-                                 FIntVector &OutSize,
-                                 FString &OutError) {
+bool CaptureSlateWindowBitmapForMcp(const TSharedRef<SWindow> &Window,
+                                    TArray<FColor> &OutBitmap,
+                                    FIntVector &OutSize,
+                                    FString &OutError) {
   TSharedRef<SWidget> WindowWidget = Window;
-  TArray<FColor> Bitmap;
 
   FSlateApplication::Get().ForceRedrawWindow(Window);
-  if (!FSlateApplication::Get().TakeScreenshot(WindowWidget, Bitmap, OutSize) ||
-      Bitmap.Num() == 0 || OutSize.X <= 0 || OutSize.Y <= 0) {
+  if (!FSlateApplication::Get().TakeScreenshot(WindowWidget, OutBitmap, OutSize) ||
+      OutBitmap.Num() == 0 || OutSize.X <= 0 || OutSize.Y <= 0) {
     OutError = TEXT("Failed to capture Slate window pixels");
     return false;
   }
 
-  for (FColor &Pixel : Bitmap) {
+  for (FColor &Pixel : OutBitmap) {
     Pixel.A = 255;
   }
 
+  return true;
+}
+
+bool EncodeBitmapPngForMcp(const TArray<FColor> &Bitmap,
+                           const FIntVector &Size,
+                           TArray<uint8> &OutPngData,
+                           FString &OutError) {
   IImageWrapperModule &ImageWrapperModule =
       FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
   TSharedPtr<IImageWrapper> ImageWrapper =
@@ -417,8 +549,8 @@ bool CaptureSlateWindowPngForMcp(const TSharedRef<SWindow> &Window,
     RawData[PixelIndex * 4 + 3] = Pixel.A;
   }
 
-  if (!ImageWrapper->SetRaw(RawData.GetData(), RawData.Num(), OutSize.X,
-                            OutSize.Y, ERGBFormat::RGBA, 8)) {
+  if (!ImageWrapper->SetRaw(RawData.GetData(), RawData.Num(), Size.X,
+                            Size.Y, ERGBFormat::RGBA, 8)) {
     OutError = TEXT("Failed to prepare Slate window screenshot pixels for PNG encoding");
     return false;
   }
@@ -529,6 +661,219 @@ AActor *FindActorByNameInWorldForMcp(UWorld *World, const FString &Target,
   return FuzzyMatches.Num() == 1 ? FuzzyMatches[0] : nullptr;
 }
 } // namespace
+
+namespace McpStandaloneSession
+{
+struct FTrackedGameProcess
+{
+    uint32 ProcessId = 0;
+    FProcHandle Handle;
+    FString PieMode;
+    FDateTime StartedUtc = FDateTime::MinValue();
+    FDateTime StartedLocal = FDateTime::MinValue();
+    FString MapName;
+    bool bExited = false;
+    int32 ExitCode = 0;
+    FString ExitReason;
+    bool bPidResolved = false;
+    bool bPidResolutionFailed = false;
+    bool bTerminateRequested = false;
+    FDateTime TerminateRequestedUtc = FDateTime::MinValue();
+    TArray<uint32> BaselineUnrealEditorPids;
+};
+
+namespace
+{
+struct FMcpPlaySessionState
+{
+    FTrackedGameProcess Standalone;
+    FDateTime PieStartedUtc = FDateTime::MinValue();
+    FDateTime PendingPieStartUtc = FDateTime::MinValue();
+    bool bPieSessionActive = false;
+};
+
+FMcpPlaySessionState &State()
+{
+    static FMcpPlaySessionState SessionState;
+    return SessionState;
+}
+} // namespace
+
+bool HasSession()
+{
+    return State().Standalone.StartedUtc != FDateTime::MinValue();
+}
+
+void SnapshotUnrealEditorProcessIds(TArray<uint32> &OutProcessIds)
+{
+    OutProcessIds.Reset();
+#if PLATFORM_WINDOWS
+    HANDLE Snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (Snapshot == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+    PROCESSENTRY32W Entry;
+    FMemory::Memzero(&Entry, sizeof(Entry));
+    Entry.dwSize = sizeof(Entry);
+    if (::Process32FirstW(Snapshot, &Entry))
+    {
+        do
+        {
+            if (FCString::Stricmp(Entry.szExeFile, TEXT("UnrealEditor.exe")) == 0)
+            {
+                OutProcessIds.Add(Entry.th32ProcessID);
+            }
+        } while (::Process32NextW(Snapshot, &Entry));
+    }
+    ::CloseHandle(Snapshot);
+#endif
+}
+
+void BeginTracking(const FString &PieMode, const FString &MapName)
+{
+    FTrackedGameProcess &Tracked = State().Standalone;
+    Tracked = FTrackedGameProcess();
+    Tracked.PieMode = PieMode;
+    Tracked.MapName = MapName;
+    Tracked.StartedUtc = FDateTime::UtcNow();
+    Tracked.StartedLocal = FDateTime::Now();
+    SnapshotUnrealEditorProcessIds(Tracked.BaselineUnrealEditorPids);
+}
+
+void ResolvePendingPid()
+{
+    FTrackedGameProcess &Tracked = State().Standalone;
+    if (!HasSession() || Tracked.bPidResolved || Tracked.bPidResolutionFailed)
+    {
+        return;
+    }
+
+#if PLATFORM_WINDOWS
+    TArray<uint32> CurrentPids;
+    SnapshotUnrealEditorProcessIds(CurrentPids);
+    TArray<uint32> NewPids;
+    for (uint32 Pid : CurrentPids)
+    {
+        if (!Tracked.BaselineUnrealEditorPids.Contains(Pid))
+        {
+            NewPids.Add(Pid);
+        }
+    }
+
+    if (NewPids.Num() == 1)
+    {
+        Tracked.ProcessId = NewPids[0];
+        Tracked.Handle = FPlatformProcess::OpenProcess(Tracked.ProcessId);
+        Tracked.bPidResolved = Tracked.Handle.IsValid();
+        if (!Tracked.bPidResolved)
+        {
+            Tracked.bPidResolutionFailed = true;
+        }
+    }
+    else if (NewPids.Num() > 1)
+    {
+        Tracked.bPidResolutionFailed = true;
+    }
+    else if (FDateTime::UtcNow() - Tracked.StartedUtc > FTimespan::FromSeconds(30.0))
+    {
+        Tracked.bPidResolutionFailed = true;
+    }
+#else
+    Tracked.bPidResolutionFailed = true;
+#endif
+}
+
+bool IsRunning()
+{
+    FTrackedGameProcess &Tracked = State().Standalone;
+    if (!HasSession() || Tracked.bExited || !Tracked.Handle.IsValid())
+    {
+        return false;
+    }
+    if (!FPlatformProcess::IsProcRunning(Tracked.Handle))
+    {
+        Tracked.bExited = true;
+        if (Tracked.ExitReason.IsEmpty())
+        {
+            Tracked.ExitReason = TEXT("exited");
+        }
+#if PLATFORM_WINDOWS
+        DWORD Code = 0;
+        HANDLE RawHandle = Tracked.Handle.Get();
+        if (RawHandle && ::GetExitCodeProcess(RawHandle, &Code) && Code != STILL_ACTIVE)
+        {
+            Tracked.ExitCode = static_cast<int32>(Code);
+        }
+#endif
+        return false;
+    }
+
+    if (Tracked.bTerminateRequested &&
+        FDateTime::UtcNow() - Tracked.TerminateRequestedUtc > FTimespan::FromSeconds(10.0))
+    {
+        FPlatformProcess::TerminateProc(Tracked.Handle, true);
+        Tracked.ExitReason = TEXT("forced");
+    }
+    return true;
+}
+
+bool RequestTerminate(FString &OutStatus)
+{
+    ResolvePendingPid();
+    FTrackedGameProcess &Tracked = State().Standalone;
+    if (!HasSession() || !IsRunning())
+    {
+        OutStatus = TEXT("not_running");
+        return false;
+    }
+    FPlatformProcess::TerminateProc(Tracked.Handle, false);
+    Tracked.bTerminateRequested = true;
+    Tracked.TerminateRequestedUtc = FDateTime::UtcNow();
+    Tracked.ExitReason = TEXT("requested");
+    OutStatus = TEXT("requested");
+    return true;
+}
+
+void MarkPieStartRequested()
+{
+    FMcpPlaySessionState &S = State();
+    if (!S.bPieSessionActive)
+    {
+        S.PendingPieStartUtc = FDateTime::UtcNow();
+    }
+}
+
+void UpdatePieTracking()
+{
+    FMcpPlaySessionState &S = State();
+    const bool bPlayWorldActive = GEditor && GEditor->PlayWorld != nullptr;
+    if (bPlayWorldActive && !S.bPieSessionActive)
+    {
+        S.PieStartedUtc = S.PendingPieStartUtc != FDateTime::MinValue()
+            ? S.PendingPieStartUtc
+            : FDateTime::UtcNow();
+        S.PendingPieStartUtc = FDateTime::MinValue();
+        S.bPieSessionActive = true;
+    }
+    else if (!bPlayWorldActive && S.bPieSessionActive)
+    {
+        S.bPieSessionActive = false;
+        S.PieStartedUtc = FDateTime::MinValue();
+        S.PendingPieStartUtc = FDateTime::MinValue();
+    }
+}
+
+FDateTime GetPieStartedUtc()
+{
+    return State().PieStartedUtc;
+}
+
+FTrackedGameProcess &GetTracked()
+{
+    return State().Standalone;
+}
+} // namespace McpStandaloneSession
 #endif
 
 // Helper class for capturing export output
@@ -3160,13 +3505,9 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPlay(
     const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket) {
 #if WITH_EDITOR
-  if (GEditor->PlayWorld) {
-    TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
-    Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetBoolField(TEXT("alreadyPlaying"), true);
-    SendAutomationResponse(Socket, RequestId, true,
-                           TEXT("Play session already active"), Resp,
-                           FString());
+  if (!GEditor) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("EDITOR_NOT_AVAILABLE"),
+                              TEXT("Editor not available"), nullptr);
     return true;
   }
 
@@ -3180,11 +3521,50 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPlay(
     return true;
   }
 
+  // Standalone runs out-of-process, so it may launch while an in-process PIE
+  // session is active; only in-process destinations conflict with PlayWorld.
+  if (PieMode != TEXT("standalone") && GEditor->PlayWorld) {
+    McpStandaloneSession::UpdatePieTracking();
+    TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+    Resp->SetBoolField(TEXT("success"), true);
+    Resp->SetBoolField(TEXT("alreadyPlaying"), true);
+    Resp->SetStringField(TEXT("sessionType"), TEXT("pie"));
+    SendAutomationResponse(Socket, RequestId, true,
+                           TEXT("Play session already active"), Resp,
+                           FString());
+    return true;
+  }
+
+  const bool bStandalone = PieMode == TEXT("standalone");
+
+  FString LaunchMapName;
+  if (UWorld *EditorWorld = GEditor->GetEditorWorldContext().World()) {
+    LaunchMapName = EditorWorld->GetMapName();
+  }
+
+#if MCP_HAS_LEVEL_EDITOR_PLAY_SETTINGS
+  if (bStandalone) {
+    if (ULevelEditorPlaySettings *PlaySettings =
+            GetMutableDefault<ULevelEditorPlaySettings>()) {
+      if (!PlaySettings->AdditionalLaunchParameters.Contains(TEXT("-log"))) {
+        PlaySettings->AdditionalLaunchParameters =
+            (PlaySettings->AdditionalLaunchParameters + TEXT(" -log")).TrimStart();
+      }
+    }
+  }
+#endif
+
+  if (bStandalone) {
+    McpStandaloneSession::BeginTracking(PieMode, LaunchMapName);
+  } else {
+    McpStandaloneSession::MarkPieStartRequested();
+  }
+
   FRequestPlaySessionParams PlayParams;
   // A standalone session is a separate process by design and cannot safely
   // accept in-process PIE input/probes. Viewport and new-window remain PIE.
   PlayParams.WorldType = EPlaySessionWorldType::PlayInEditor;
-  PlayParams.SessionDestination = PieMode == TEXT("standalone")
+  PlayParams.SessionDestination = bStandalone
       ? EPlaySessionDestinationType::NewProcess
       : EPlaySessionDestinationType::InProcess;
 #if MCP_HAS_LEVEL_EDITOR_PLAY_SETTINGS
@@ -3202,12 +3582,31 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorPlay(
 #endif
 
   GEditor->RequestPlaySession(PlayParams);
+  if (!bStandalone) {
+    McpStandaloneSession::UpdatePieTracking();
+  }
   TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
   Resp->SetBoolField(TEXT("success"), true);
   Resp->SetStringField(TEXT("pieMode"), PieMode);
-  Resp->SetBoolField(TEXT("supportsRuntimeProbes"), PieMode != TEXT("standalone"));
+  Resp->SetBoolField(TEXT("supportsRuntimeProbes"), !bStandalone);
+  Resp->SetStringField(TEXT("sessionType"), bStandalone ? TEXT("standalone") : TEXT("pie"));
+  if (!LaunchMapName.IsEmpty()) {
+    Resp->SetStringField(TEXT("mapName"), LaunchMapName);
+  }
+  if (bStandalone) {
+    // PID resolution is deferred to the next status query; the child process
+    // is spawned asynchronously after RequestPlaySession returns.
+    Resp->SetNumberField(TEXT("pid"), 0);
+    Resp->SetStringField(TEXT("pidResolution"), TEXT("deferred"));
+    const FDateTime StartedUtc = McpStandaloneSession::GetTracked().StartedUtc;
+    if (StartedUtc != FDateTime::MinValue()) {
+      Resp->SetStringField(TEXT("startedUtc"), StartedUtc.ToIso8601());
+    }
+  }
   SendAutomationResponse(Socket, RequestId, true,
-                         TEXT("Play in Editor started"), Resp, FString());
+                         bStandalone ? TEXT("Standalone game launch requested")
+                                     : TEXT("Play in Editor started"),
+                         Resp, FString());
   return true;
 #else
   return false;
@@ -3218,20 +3617,61 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorStop(
     const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket) {
 #if WITH_EDITOR
-  if (!GEditor->PlayWorld) {
-    TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
-    Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetBoolField(TEXT("alreadyStopped"), true);
-    SendAutomationResponse(Socket, RequestId, true,
-                           TEXT("Play session not active"), Resp, FString());
+  if (!GEditor) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("EDITOR_NOT_AVAILABLE"),
+                              TEXT("Editor not available"), nullptr);
     return true;
   }
 
-  GEditor->RequestEndPlayMap();
+  if (GEditor->PlayWorld) {
+    GEditor->RequestEndPlayMap();
+    McpStandaloneSession::UpdatePieTracking();
+    TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+    Resp->SetBoolField(TEXT("success"), true);
+    Resp->SetStringField(TEXT("sessionType"), TEXT("pie"));
+    SendAutomationResponse(Socket, RequestId, true,
+                           TEXT("Play in Editor stopped"), Resp, FString());
+    return true;
+  }
+
+  FString TerminateStatus;
+  if (McpStandaloneSession::HasSession() &&
+      McpStandaloneSession::RequestTerminate(TerminateStatus)) {
+    const McpStandaloneSession::FTrackedGameProcess &Tracked =
+        McpStandaloneSession::GetTracked();
+    TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+    Resp->SetBoolField(TEXT("success"), true);
+    Resp->SetStringField(TEXT("sessionType"), TEXT("standalone"));
+    Resp->SetStringField(TEXT("terminated"), TerminateStatus);
+    if (Tracked.bPidResolved) {
+      Resp->SetNumberField(TEXT("standalonePid"), Tracked.ProcessId);
+    }
+    SendAutomationResponse(Socket, RequestId, true,
+                           TEXT("Standalone game termination requested"), Resp,
+                           FString());
+    return true;
+  }
+
+  McpStandaloneSession::IsRunning();
+  const bool bHasStandaloneSession = McpStandaloneSession::HasSession();
+  const McpStandaloneSession::FTrackedGameProcess &Tracked =
+      McpStandaloneSession::GetTracked();
   TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
   Resp->SetBoolField(TEXT("success"), true);
+  Resp->SetBoolField(TEXT("alreadyStopped"), true);
+  Resp->SetStringField(TEXT("sessionType"), TEXT("none"));
+  Resp->SetBoolField(TEXT("standaloneRunning"), false);
+  if (bHasStandaloneSession) {
+    if (Tracked.bPidResolved) {
+      Resp->SetNumberField(TEXT("standalonePid"), Tracked.ProcessId);
+    }
+    if (Tracked.bExited) {
+      Resp->SetStringField(TEXT("exitReason"), Tracked.ExitReason);
+      Resp->SetNumberField(TEXT("exitCode"), Tracked.ExitCode);
+    }
+  }
   SendAutomationResponse(Socket, RequestId, true,
-                         TEXT("Play in Editor stopped"), Resp, FString());
+                         TEXT("Play session not active"), Resp, FString());
   return true;
 #else
   return false;
@@ -3971,7 +4411,19 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
   }
 
   if (Mode == TEXT("standalone_window")) {
-    Mode = TEXT("full_editor_window");
+    McpStandaloneSession::ResolvePendingPid();
+    if (McpStandaloneSession::IsRunning()) {
+      SendStandardErrorResponse(
+          this, Socket, RequestId, TEXT("NOT_SUPPORTED_FOR_STANDALONE_WINDOW"),
+          TEXT("NOT_SUPPORTED_FOR_STANDALONE_WINDOW: capturing an external standalone game window is not supported; use PIE game_viewport or read the standalone window screenshot path"),
+          nullptr);
+    } else {
+      SendStandardErrorResponse(
+          this, Socket, RequestId, TEXT("STANDALONE_NOT_RUNNING"),
+          TEXT("standalone_not_running: no tracked standalone game process is running"),
+          nullptr);
+    }
+    return true;
   }
   if (Mode == TEXT("game_viewport")) {
     return HandleUiAction(RequestId, TEXT("system_control"), Payload, Socket);
@@ -3992,6 +4444,17 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
   IFileManager::Get().MakeDirectory(*ScreenshotDir, true);
   const FString FullPath = ScreenshotDir / Filename;
 
+  FString OutputPathRaw;
+  Payload->TryGetStringField(TEXT("outputPath"), OutputPathRaw);
+  FString ExtraOutputPath;
+  const bool bHasExtraOutputPath =
+      !OutputPathRaw.IsEmpty() &&
+      TryResolveScreenshotOutputPathForMcp(OutputPathRaw, ExtraOutputPath);
+  TArray<FString> ScreenshotWarnings;
+  if (!OutputPathRaw.IsEmpty() && !bHasExtraOutputPath) {
+    ScreenshotWarnings.Add(TEXT("Invalid outputPath ignored"));
+  }
+
   if (Mode == TEXT("full_editor_window")) {
     TSharedPtr<SWindow> EditorWindow = GetFullEditorSlateWindowForMcp();
     if (!EditorWindow.IsValid()) {
@@ -4002,17 +4465,49 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
       return true;
     }
 
-    TArray<uint8> PngData;
+    TArray<FColor> WindowBitmap;
     FIntVector ImageSize(0, 0, 0);
     FString CaptureError;
-    if (!CaptureSlateWindowPngForMcp(EditorWindow.ToSharedRef(), PngData,
-                                     ImageSize, CaptureError)) {
+    int32 NonBlackPixels = 0;
+    for (int32 Attempt = 0; Attempt < 3; ++Attempt) {
+      WindowBitmap.Reset();
+      if (!CaptureSlateWindowBitmapForMcp(EditorWindow.ToSharedRef(),
+                                          WindowBitmap, ImageSize,
+                                          CaptureError)) {
+        break;
+      }
+      HasVisiblePixelsForMcp(WindowBitmap, NonBlackPixels);
+      if (NonBlackPixels > 0) {
+        break;
+      }
+      if (Attempt < 2) {
+        FPlatformProcess::Sleep(0.1f);
+      }
+    }
+    if (WindowBitmap.Num() == 0) {
+      SendStandardErrorResponse(this, Socket, RequestId, TEXT("CAPTURE_FAILED"),
+                                CaptureError.IsEmpty()
+                                    ? TEXT("Failed to capture Slate window pixels")
+                                    : CaptureError,
+                                nullptr);
+      return true;
+    }
+
+    TArray<uint8> PngData;
+    if (!EncodeBitmapPngForMcp(WindowBitmap, ImageSize, PngData, CaptureError)) {
       SendStandardErrorResponse(this, Socket, RequestId, TEXT("CAPTURE_FAILED"),
                                 CaptureError, nullptr);
       return true;
     }
 
     const bool bSaved = FFileHelper::SaveArrayToFile(PngData, *FullPath);
+    bool bExtraSaved = false;
+    if (bHasExtraOutputPath) {
+      bExtraSaved = SaveScreenshotCopyForMcp(PngData, ExtraOutputPath);
+      if (!bExtraSaved) {
+        ScreenshotWarnings.Add(TEXT("Failed to save screenshot to outputPath"));
+      }
+    }
 
     bool bReturnBase64 = true;
     Payload->TryGetBoolField(TEXT("returnBase64"), bReturnBase64);
@@ -4026,6 +4521,12 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
     Resp->SetNumberField(TEXT("height"), ImageSize.Y);
     Resp->SetNumberField(TEXT("sizeBytes"), PngData.Num());
     Resp->SetStringField(TEXT("mimeType"), TEXT("image/png"));
+    Resp->SetNumberField(TEXT("nonBlackPixelCount"), NonBlackPixels);
+    Resp->SetBoolField(TEXT("blackFrameDetected"), NonBlackPixels == 0);
+    if (bHasExtraOutputPath && bExtraSaved) {
+      Resp->SetStringField(TEXT("outputPath"), ExtraOutputPath);
+    }
+    AddStringArrayFieldForMcp(Resp, TEXT("warnings"), ScreenshotWarnings);
     if (bSaved) {
       Resp->SetStringField(TEXT("path"), FullPath);
       Resp->SetStringField(TEXT("screenshotPath"), FullPath);
@@ -4083,25 +4584,67 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
     return true;
   }
 
-  Viewport->Draw();
-  FlushRenderingCommands();
+  FIntPoint RequestedResolution(0, 0);
+  bool bHasRequestedResolution = false;
+  FString ResolutionRaw;
+  double ResolutionNumber = 0.0;
+  if (Payload->TryGetStringField(TEXT("resolution"), ResolutionRaw) &&
+      !ResolutionRaw.IsEmpty()) {
+    bHasRequestedResolution = TryParseScreenshotResolutionForMcp(
+        ResolutionRaw, ViewportSize.X, ViewportSize.Y, RequestedResolution);
+  } else if (Payload->TryGetNumberField(TEXT("resolution"), ResolutionNumber) &&
+             ResolutionNumber > 0.0) {
+    bHasRequestedResolution = TryParseScreenshotResolutionForMcp(
+        FString::Printf(TEXT("%d"), FMath::RoundToInt(ResolutionNumber)),
+        ViewportSize.X, ViewportSize.Y, RequestedResolution);
+  }
 
   TArray<FColor> Bitmap;
   const FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
-  if (!Viewport->ReadPixels(Bitmap, ReadFlags) || Bitmap.Num() == 0) {
+  int32 NonBlackPixels = 0;
+  for (int32 Attempt = 0; Attempt < 3; ++Attempt) {
+    Viewport->Draw();
+    FlushRenderingCommands();
+    Bitmap.Reset();
+    if (!Viewport->ReadPixels(Bitmap, ReadFlags) || Bitmap.Num() == 0) {
+      continue;
+    }
+    for (FColor& Pixel : Bitmap) {
+      Pixel.A = 255;
+    }
+    HasVisiblePixelsForMcp(Bitmap, NonBlackPixels);
+    if (NonBlackPixels > 0) {
+      break;
+    }
+    if (Attempt < 2) {
+      FPlatformProcess::Sleep(0.1f);
+    }
+  }
+  if (Bitmap.Num() == 0) {
     SendStandardErrorResponse(this, Socket, RequestId, TEXT("CAPTURE_FAILED"),
                               TEXT("Failed to read pixels from viewport"), nullptr);
     return true;
   }
 
-  for (FColor& Pixel : Bitmap) {
-    Pixel.A = 255;
+  FIntPoint EncodedSize = ViewportSize;
+  if (bHasRequestedResolution &&
+      (RequestedResolution.X != ViewportSize.X ||
+       RequestedResolution.Y != ViewportSize.Y)) {
+    TArray<FColor> ResizedBitmap;
+    ResizeColorBitmapNearestForMcp(Bitmap, ViewportSize.X, ViewportSize.Y,
+                                   RequestedResolution.X, RequestedResolution.Y,
+                                   ResizedBitmap);
+    if (ResizedBitmap.Num() ==
+        RequestedResolution.X * RequestedResolution.Y) {
+      Bitmap = MoveTemp(ResizedBitmap);
+      EncodedSize = RequestedResolution;
+    }
   }
 
   TArray64<uint8> PngData;
   FImageUtils::PNGCompressImageArray(
-      ViewportSize.X,
-      ViewportSize.Y,
+      EncodedSize.X,
+      EncodedSize.Y,
       TArrayView64<const FColor>(Bitmap.GetData(), Bitmap.Num()),
       PngData);
   if (PngData.Num() == 0) {
@@ -4111,6 +4654,13 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
   }
 
   const bool bSaved = FFileHelper::SaveArrayToFile(PngData, *FullPath);
+  bool bExtraSaved = false;
+  if (bHasExtraOutputPath) {
+    bExtraSaved = SaveScreenshotCopyForMcp(PngData, ExtraOutputPath);
+    if (!bExtraSaved) {
+      ScreenshotWarnings.Add(TEXT("Failed to save screenshot to outputPath"));
+    }
+  }
 
   bool bReturnBase64 = false;
   Payload->TryGetBoolField(TEXT("returnBase64"), bReturnBase64);
@@ -4125,6 +4675,18 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorScreenshot(
   Resp->SetNumberField(TEXT("sizeBytes"), PngData.Num());
   Resp->SetNumberField(TEXT("fileSizeBytes"), PngData.Num());
   Resp->SetStringField(TEXT("mimeType"), TEXT("image/png"));
+  Resp->SetNumberField(TEXT("nonBlackPixelCount"), NonBlackPixels);
+  Resp->SetBoolField(TEXT("blackFrameDetected"), NonBlackPixels == 0);
+  if (bHasRequestedResolution) {
+    Resp->SetStringField(TEXT("requestedResolution"),
+        FString::Printf(TEXT("%dx%d"), RequestedResolution.X, RequestedResolution.Y));
+    Resp->SetNumberField(TEXT("resizedWidth"), EncodedSize.X);
+    Resp->SetNumberField(TEXT("resizedHeight"), EncodedSize.Y);
+  }
+  if (bHasExtraOutputPath && bExtraSaved) {
+    Resp->SetStringField(TEXT("outputPath"), ExtraOutputPath);
+  }
+  AddStringArrayFieldForMcp(Resp, TEXT("warnings"), ScreenshotWarnings);
   if (bSaved) {
     Resp->SetStringField(TEXT("path"), FullPath);
     Resp->SetStringField(TEXT("screenshotPath"), FullPath);
@@ -4936,6 +5498,8 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
   Resp->SetBoolField(TEXT("routedToPIE"), bRoutedToPIE);
   Resp->SetBoolField(TEXT("handledByPIE"), bHandledByPIE);
   Resp->SetBoolField(TEXT("handledBySlate"), bHandledBySlate);
+  Resp->SetBoolField(TEXT("consumed"),
+                     (bRoutedToPIE && bHandledByPIE) || bHandledBySlate);
   Resp->SetNumberField(TEXT("playerIndex"), PlayerIndex);
   Resp->SetBoolField(TEXT("viewportFocused"), bViewportFocused);
 
@@ -4953,6 +5517,21 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
           InputDiagnostics->SetStringField(TEXT("pawn"), Pawn->GetName());
           InputDiagnostics->SetStringField(TEXT("pendingInputVector"), Pawn->GetPendingMovementInputVector().ToString());
           InputDiagnostics->SetStringField(TEXT("lastInputVector"), Pawn->GetLastMovementInputVector().ToString());
+
+          const FVector PawnVelocity = Pawn->GetVelocity();
+          InputDiagnostics->SetObjectField(TEXT("pawnLocation"),
+              MakeVectorObjectForMcp(Pawn->GetActorLocation()));
+          InputDiagnostics->SetObjectField(TEXT("pawnVelocity"),
+              MakeVectorObjectForMcp(PawnVelocity));
+          InputDiagnostics->SetNumberField(TEXT("pawnSpeed"), PawnVelocity.Size());
+          if (ACharacter* PawnCharacter = Cast<ACharacter>(Pawn))
+          {
+            if (UCharacterMovementComponent* PawnMovement = PawnCharacter->GetCharacterMovement())
+            {
+              InputDiagnostics->SetNumberField(TEXT("movementMode"),
+                  static_cast<int32>(PawnMovement->MovementMode));
+            }
+          }
 
           if (UInputComponent* PawnInput = Pawn->InputComponent)
           {
@@ -5035,18 +5614,58 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
 
   if (Action == TEXT("get_pie_state")) {
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    McpStandaloneSession::UpdatePieTracking();
+    McpStandaloneSession::ResolvePendingPid();
+    const bool bStandaloneRunning = McpStandaloneSession::IsRunning();
+    const bool bHasStandaloneSession = McpStandaloneSession::HasSession();
+    const McpStandaloneSession::FTrackedGameProcess& Tracked =
+        McpStandaloneSession::GetTracked();
     UWorld* PlayWorld = GEditor ? GEditor->PlayWorld.Get() : nullptr;
     UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     Result->SetBoolField(TEXT("success"), true);
     Result->SetBoolField(TEXT("isInPIE"), PlayWorld != nullptr);
     Result->SetBoolField(TEXT("isPaused"), PlayWorld && PlayWorld->bDebugPauseExecution);
+    const TCHAR* SessionType = PlayWorld ? TEXT("pie")
+        : (bHasStandaloneSession && bStandaloneRunning ? TEXT("standalone") : TEXT("none"));
+    Result->SetStringField(TEXT("sessionType"), SessionType);
     if (PlayWorld) Result->SetStringField(TEXT("pieWorld"), PlayWorld->GetName());
     if (EditorWorld) Result->SetStringField(TEXT("editorWorld"), EditorWorld->GetName());
     if (PlayWorld) {
+      Result->SetStringField(TEXT("mapName"), PlayWorld->GetMapName());
+      const FDateTime PieStartedUtc = McpStandaloneSession::GetPieStartedUtc();
+      if (PieStartedUtc != FDateTime::MinValue()) {
+        Result->SetStringField(TEXT("startedUtc"), PieStartedUtc.ToIso8601());
+        Result->SetNumberField(TEXT("elapsedSeconds"),
+            (FDateTime::UtcNow() - PieStartedUtc).GetTotalSeconds());
+      }
       if (APlayerController* Controller = PlayWorld->GetFirstPlayerController()) {
         if (APawn* Pawn = Controller->GetPawn()) Result->SetStringField(TEXT("possessedPawn"), Pawn->GetName());
         AddRotator(Result, TEXT("controllerRotation"), Controller->GetControlRotation());
       }
+    }
+    if (bHasStandaloneSession) {
+      if (Tracked.bPidResolved) {
+        Result->SetNumberField(TEXT("standalonePid"), Tracked.ProcessId);
+      } else if (Tracked.bPidResolutionFailed) {
+        Result->SetStringField(TEXT("standalonePidResolution"), TEXT("failed"));
+      } else {
+        Result->SetStringField(TEXT("standalonePidResolution"), TEXT("pending"));
+      }
+      Result->SetBoolField(TEXT("standaloneRunning"), bStandaloneRunning);
+      if (Tracked.StartedUtc != FDateTime::MinValue()) {
+        Result->SetStringField(TEXT("startedUtc"), Tracked.StartedUtc.ToIso8601());
+        Result->SetNumberField(TEXT("elapsedSeconds"),
+            (FDateTime::UtcNow() - Tracked.StartedUtc).GetTotalSeconds());
+      }
+      if (!Tracked.MapName.IsEmpty()) {
+        Result->SetStringField(TEXT("mapName"), Tracked.MapName);
+      }
+      if (Tracked.bExited) {
+        Result->SetStringField(TEXT("exitReason"), Tracked.ExitReason);
+        Result->SetNumberField(TEXT("exitCode"), Tracked.ExitCode);
+      }
+    } else {
+      Result->SetBoolField(TEXT("standaloneRunning"), false);
     }
     SendAutomationResponse(Socket, RequestId, true, TEXT("PIE state queried"), Result, FString());
     return true;
@@ -5152,34 +5771,92 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorRuntimeProbe(
   }
 
   if (Action == TEXT("read_pie_logs")) {
+    auto BuildLogEntriesForMcp = [](const FString& LogText, int32& OutWarnings,
+                                    int32& OutErrors, int32& OutCrashes,
+                                    int32& OutBlueprintErrors) {
+      TArray<TSharedPtr<FJsonValue>> Entries;
+      const int32 Start = FMath::Max(0, LogText.Len() - 65536);
+      TArray<FString> Lines;
+      LogText.Mid(Start).ParseIntoArrayLines(Lines, true);
+      for (const FString& Line : Lines) {
+        const FString LowerLine = Line.ToLower();
+        if (LowerLine.Contains(TEXT("warning"))) ++OutWarnings;
+        if (LowerLine.Contains(TEXT("error"))) ++OutErrors;
+        if (LowerLine.Contains(TEXT("fatal error")) || LowerLine.Contains(TEXT("crash"))) ++OutCrashes;
+        if (LowerLine.Contains(TEXT("blueprint")) && (LowerLine.Contains(TEXT("error")) || LowerLine.Contains(TEXT("warning")))) ++OutBlueprintErrors;
+        if (LowerLine.Contains(TEXT("token")) || LowerLine.Contains(TEXT("password")) || LowerLine.Contains(TEXT("secret")) || LowerLine.Contains(TEXT("apikey"))) {
+          Entries.Add(MakeShared<FJsonValueString>(TEXT("[REDACTED SENSITIVE LOG LINE]")));
+        } else if (Entries.Num() < 200) {
+          Entries.Add(MakeShared<FJsonValueString>(Line));
+        }
+      }
+      return Entries;
+    };
+
     const FString LogPath = FPaths::ProjectLogDir() / (FString(FApp::GetProjectName()) + TEXT(".log"));
     FString LogText;
     FFileHelper::LoadFileToString(LogText, *LogPath);
-    const int32 Start = FMath::Max(0, LogText.Len() - 65536);
-    TArray<FString> Lines;
-    LogText.Mid(Start).ParseIntoArrayLines(Lines, true);
-    TArray<TSharedPtr<FJsonValue>> Entries;
-    int32 Warnings = 0, Errors = 0, Crashes = 0, BlueprintErrors = 0;
-    for (const FString& Line : Lines) {
-      const FString LowerLine = Line.ToLower();
-      if (LowerLine.Contains(TEXT("warning"))) ++Warnings;
-      if (LowerLine.Contains(TEXT("error"))) ++Errors;
-      if (LowerLine.Contains(TEXT("fatal error")) || LowerLine.Contains(TEXT("crash"))) ++Crashes;
-      if (LowerLine.Contains(TEXT("blueprint")) && (LowerLine.Contains(TEXT("error")) || LowerLine.Contains(TEXT("warning")))) ++BlueprintErrors;
-      if (LowerLine.Contains(TEXT("token")) || LowerLine.Contains(TEXT("password")) || LowerLine.Contains(TEXT("secret")) || LowerLine.Contains(TEXT("apikey"))) {
-        Entries.Add(MakeShared<FJsonValueString>(TEXT("[REDACTED SENSITIVE LOG LINE]")));
-      } else if (Entries.Num() < 200) {
-        Entries.Add(MakeShared<FJsonValueString>(Line));
-      }
-    }
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetBoolField(TEXT("success"), true);
+
+    int32 Warnings = 0, Errors = 0, Crashes = 0, BlueprintErrors = 0;
+    Result->SetArrayField(TEXT("entries"), BuildLogEntriesForMcp(LogText, Warnings, Errors, Crashes, BlueprintErrors));
     Result->SetNumberField(TEXT("warningCount"), Warnings);
     Result->SetNumberField(TEXT("errorCount"), Errors);
     Result->SetNumberField(TEXT("crashCount"), Crashes);
     Result->SetNumberField(TEXT("blueprintErrorCount"), BlueprintErrors);
-    Result->SetArrayField(TEXT("entries"), Entries);
     Result->SetBoolField(TEXT("sensitiveValuesRedacted"), true);
+
+    bool bStandaloneRequested = false;
+    Payload->TryGetBoolField(TEXT("standalone"), bStandaloneRequested);
+    if (bStandaloneRequested) {
+      McpStandaloneSession::ResolvePendingPid();
+      const bool bStandaloneRunning = McpStandaloneSession::IsRunning();
+      const McpStandaloneSession::FTrackedGameProcess& Tracked =
+          McpStandaloneSession::GetTracked();
+      Result->SetBoolField(TEXT("standaloneRunning"), bStandaloneRunning);
+      if (McpStandaloneSession::HasSession() &&
+          Tracked.StartedLocal != FDateTime::MinValue()) {
+        const FString EditorLogName = FString(FApp::GetProjectName()) + TEXT(".log");
+        const FString LogDir = FPaths::ProjectLogDir();
+        TArray<FString> LogFiles;
+        IFileManager::Get().FindFiles(LogFiles, *(LogDir / TEXT("*.log")), true, false);
+        FString NewestLogPath;
+        FDateTime NewestModification = Tracked.StartedLocal;
+        for (const FString& LogFile : LogFiles) {
+          if (LogFile.Equals(EditorLogName, ESearchCase::IgnoreCase)) {
+            continue;
+          }
+          const FString CandidatePath = LogDir / LogFile;
+          const FFileStatData StatData = IFileManager::Get().GetStatData(*CandidatePath);
+          if (StatData.bIsValid && StatData.ModificationTime > NewestModification) {
+            NewestModification = StatData.ModificationTime;
+            NewestLogPath = CandidatePath;
+          }
+        }
+        if (!NewestLogPath.IsEmpty()) {
+          FString StandaloneLogText;
+          if (FFileHelper::LoadFileToString(StandaloneLogText, *NewestLogPath)) {
+            int32 SWarnings = 0, SErrors = 0, SCrashes = 0, SBlueprintErrors = 0;
+            Result->SetArrayField(TEXT("standaloneEntries"),
+                BuildLogEntriesForMcp(StandaloneLogText, SWarnings, SErrors, SCrashes, SBlueprintErrors));
+            Result->SetNumberField(TEXT("standaloneWarningCount"), SWarnings);
+            Result->SetNumberField(TEXT("standaloneErrorCount"), SErrors);
+            Result->SetNumberField(TEXT("standaloneCrashCount"), SCrashes);
+            Result->SetNumberField(TEXT("standaloneBlueprintErrorCount"), SBlueprintErrors);
+            Result->SetBoolField(TEXT("standaloneLogFound"), true);
+            Result->SetStringField(TEXT("standaloneLogPath"), NewestLogPath);
+          } else {
+            Result->SetBoolField(TEXT("standaloneLogFound"), false);
+          }
+        } else {
+          Result->SetBoolField(TEXT("standaloneLogFound"), false);
+        }
+      } else {
+        Result->SetBoolField(TEXT("standaloneLogFound"), false);
+      }
+    }
+
     SendAutomationResponse(Socket, RequestId, true, TEXT("Runtime log tail read"), Result, FString());
     return true;
   }

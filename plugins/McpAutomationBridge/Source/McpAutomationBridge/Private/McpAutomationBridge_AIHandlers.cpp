@@ -82,6 +82,7 @@
 
 // AI Controller
 #include "AIController.h"
+#include "Navigation/PathFollowingComponent.h"
 #include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
 
@@ -796,6 +797,18 @@ static bool HandleInspectRuntimeAI(
     }
     const FString RequestedName = GetStringFieldAI(Payload, TEXT("controllerName"), GetStringFieldAI(Payload, TEXT("actorName")));
     const float StuckSpeed = GetNumberFieldAI(Payload, TEXT("stuckSpeedThreshold"), 2.0f);
+    // Optional reference location for displacement math (world cm).
+    bool bHasPreviousLocation = false;
+    FVector PreviousLocation = FVector::ZeroVector;
+    if (const TSharedPtr<FJsonObject>* PreviousLocationObject = nullptr;
+        Payload->TryGetObjectField(TEXT("previousLocation"), PreviousLocationObject) &&
+        PreviousLocationObject && (*PreviousLocationObject)->IsValid())
+    {
+        PreviousLocation.X = GetNumberFieldAI(*PreviousLocationObject, TEXT("x"), 0.0);
+        PreviousLocation.Y = GetNumberFieldAI(*PreviousLocationObject, TEXT("y"), 0.0);
+        PreviousLocation.Z = GetNumberFieldAI(*PreviousLocationObject, TEXT("z"), 0.0);
+        bHasPreviousLocation = true;
+    }
     UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
     TArray<TSharedPtr<FJsonValue>> Controllers;
 
@@ -819,6 +832,22 @@ static bool HandleInspectRuntimeAI(
         {
             Info->SetStringField(TEXT("pawnClass"), Pawn->GetClass()->GetPathName());
             Info->SetStringField(TEXT("location"), Pawn->GetActorLocation().ToString());
+            const FVector PawnLocation = Pawn->GetActorLocation();
+            TSharedPtr<FJsonObject> PawnLocationObject = McpHandlerUtils::CreateResultObject();
+            PawnLocationObject->SetNumberField(TEXT("x"), PawnLocation.X);
+            PawnLocationObject->SetNumberField(TEXT("y"), PawnLocation.Y);
+            PawnLocationObject->SetNumberField(TEXT("z"), PawnLocation.Z);
+            Info->SetObjectField(TEXT("pawnLocation"), PawnLocationObject);
+            if (bHasPreviousLocation)
+            {
+                Info->SetNumberField(TEXT("displacementCm"), FVector::Dist(PreviousLocation, PawnLocation));
+                const FVector Displacement = PawnLocation - PreviousLocation;
+                TSharedPtr<FJsonObject> DisplacementObject = McpHandlerUtils::CreateResultObject();
+                DisplacementObject->SetNumberField(TEXT("x"), Displacement.X);
+                DisplacementObject->SetNumberField(TEXT("y"), Displacement.Y);
+                DisplacementObject->SetNumberField(TEXT("z"), Displacement.Z);
+                Info->SetObjectField(TEXT("displacementVector"), DisplacementObject);
+            }
             Info->SetNumberField(TEXT("speed"), Pawn->GetVelocity().Size());
             FNavLocation Projected;
             const bool bOnNavMesh = NavSys && NavSys->ProjectPointToNavigation(Pawn->GetActorLocation(), Projected);
@@ -826,6 +855,35 @@ static bool HandleInspectRuntimeAI(
             Info->SetBoolField(TEXT("stuckCandidate"), Pawn->GetVelocity().Size() <= StuckSpeed);
             Info->SetStringField(TEXT("stuckReason"), Pawn->GetVelocity().Size() <= StuckSpeed ? TEXT("velocity below threshold") : FString());
         }
+
+        // Path-follow results. UE 5.8 has no UPathFollowingComponent::GetLastMoveResult();
+        // the terminal result code is not exposed, so it is synthesized from
+        // DidMoveReachGoal() (bLastMoveReachedGoal) and GetStatus().
+        if (UPathFollowingComponent* PathFollowing = Controller->GetPathFollowingComponent())
+        {
+            const EPathFollowingStatus::Type PathFollowingStatus = PathFollowing->GetStatus();
+            Info->SetNumberField(TEXT("pathFollowingStatus"), static_cast<int32>(PathFollowingStatus));
+            Info->SetStringField(TEXT("pathFollowingStatusName"), PathFollowing->GetStatusDesc());
+            Info->SetBoolField(TEXT("lastMoveReachedGoal"), PathFollowing->DidMoveReachGoal());
+            int32 LastMoveResultCode = -1;
+            FString LastMoveResult;
+            if (PathFollowing->DidMoveReachGoal())
+            {
+                LastMoveResultCode = static_cast<int32>(EPathFollowingResult::Success);
+                LastMoveResult = PathFollowing->GetResultDesc(EPathFollowingResult::Success);
+            }
+            else if (PathFollowingStatus == EPathFollowingStatus::Moving)
+            {
+                LastMoveResult = TEXT("InProgress");
+            }
+            else
+            {
+                LastMoveResult = TEXT("Unknown");
+            }
+            Info->SetNumberField(TEXT("lastMoveResultCode"), LastMoveResultCode);
+            Info->SetStringField(TEXT("lastMoveResult"), LastMoveResult);
+        }
+
 
         UBehaviorTreeComponent* BTComponent = Controller->FindComponentByClass<UBehaviorTreeComponent>();
         const UBTNode* ActiveNode = BTComponent ? BTComponent->GetActiveNode() : nullptr;
