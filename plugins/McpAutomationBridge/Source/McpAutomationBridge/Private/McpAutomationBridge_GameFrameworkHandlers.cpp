@@ -54,6 +54,7 @@
 
 #if WITH_EDITOR
 #include "Editor.h"
+#include "ScopedTransaction.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Factories/BlueprintFactory.h"
@@ -806,6 +807,61 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
     // 21.2 GAME MODE CONFIGURATION (5 actions)
     // ========================================================================
 
+    else if (SubAction == TEXT("set_level_game_mode"))
+    {
+        if (GameModeBlueprint.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'gameModeBlueprint'."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+        if (!World || !World->GetWorldSettings())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Editor world or WorldSettings is unavailable."), TEXT("NO_WORLD"));
+            return true;
+        }
+
+        FString RequestedLevel = GetStringField(Payload, TEXT("levelPath"));
+        if (RequestedLevel.IsEmpty())
+        {
+            RequestedLevel = GetStringField(Payload, TEXT("mapPath"));
+        }
+        if (!RequestedLevel.IsEmpty() && !RequestedLevel.Equals(World->GetOutermost()->GetName(), ESearchCase::IgnoreCase))
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("The requested level is not the current editor world: %s"), *RequestedLevel),
+                TEXT("LEVEL_NOT_CURRENT"));
+            return true;
+        }
+
+        UClass* GameModeClass = LoadClassFromPath(GameModeBlueprint);
+        if (!GameModeClass || !GameModeClass->IsChildOf(AGameModeBase::StaticClass()))
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Failed to load a GameMode class from: %s"), *GameModeBlueprint),
+                TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        const FScopedTransaction Transaction(NSLOCTEXT("McpAutomation", "SetLevelGameMode", "Set Level GameMode Override"));
+        World->GetWorldSettings()->Modify();
+        World->GetWorldSettings()->DefaultGameMode = GameModeClass;
+        World->GetWorldSettings()->MarkPackageDirty();
+        if (!McpSafeLevelSave(World->PersistentLevel, World->GetOutermost()->GetName()))
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to save the level GameMode override."), TEXT("SAVE_FAILED"));
+            return true;
+        }
+
+        TSharedPtr<FJsonObject> Response = McpHandlerUtils::CreateResultObject();
+        Response->SetBoolField(TEXT("success"), true);
+        Response->SetStringField(TEXT("levelPath"), World->GetOutermost()->GetName());
+        Response->SetStringField(TEXT("gameModeClass"), GameModeClass->GetPathName());
+        Response->SetBoolField(TEXT("existsAfter"), World->GetWorldSettings()->DefaultGameMode.Get() == GameModeClass);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Level GameMode override set"), Response);
+        return true;
+    }
     else if (SubAction == TEXT("set_default_pawn_class"))
     {
         if (GameModeBlueprint.IsEmpty())

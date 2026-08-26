@@ -83,6 +83,10 @@
 #include "Engine/Blueprint.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
+#include "Engine/Brush.h"
+#include "Model.h"
+#include "Engine/Polys.h"
+#include "Builders/CubeBuilder.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "ScopedTransaction.h"
 
@@ -682,14 +686,67 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
     }
     Volume->Modify();
     Volume->SetActorLabel(VolumeName);
-    // The default volume brush is 200 UU wide. Scaling is safe for a newly
-    // created brush and makes the requested extent durable across reload.
-    Volume->SetActorScale3D(Extent / 100.0);
+
+    // Build real editor brush geometry.  Scaling a freshly spawned volume is
+    // insufficient because direct SpawnActor paths can have no UModel/UPolys
+    // and therefore still report a zero bounds box.
+    if (!Volume->Brush)
+    {
+        Volume->Brush = NewObject<UModel>(Volume, TEXT("Brush"), RF_Transactional);
+    }
+    if (!Volume->Brush)
+    {
+        World->DestroyActor(Volume);
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Failed to allocate the NavMeshBoundsVolume brush model"), nullptr, TEXT("BRUSH_CREATE_FAILED"));
+        return true;
+    }
+    Volume->Brush->Initialize(Volume, true);
+    if (!Volume->Brush->Polys)
+    {
+        World->DestroyActor(Volume);
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Failed to allocate the NavMeshBoundsVolume brush polygons"), nullptr, TEXT("BRUSH_CREATE_FAILED"));
+        return true;
+    }
+    Volume->Brush->Polys->SetFlags(RF_Transactional);
+
+    UCubeBuilder* CubeBuilder = NewObject<UCubeBuilder>(GetTransientPackage());
+    CubeBuilder->X = Extent.X * 2.0f;
+    CubeBuilder->Y = Extent.Y * 2.0f;
+    CubeBuilder->Z = Extent.Z * 2.0f;
+    if (!CubeBuilder->Build(World, Volume))
+    {
+        World->DestroyActor(Volume);
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("CubeBuilder failed to create the NavMeshBoundsVolume brush"), nullptr, TEXT("BRUSH_BUILD_FAILED"));
+        return true;
+    }
+    Volume->Brush->BuildBound();
+    Volume->GetBrushComponent()->UpdateBounds();
+    Volume->GetBrushComponent()->MarkRenderStateDirty();
+    const FBox BrushBounds = Volume->GetComponentsBoundingBox(true);
+    if (!BrushBounds.IsValid || BrushBounds.GetExtent().GetMin() <= KINDA_SMALL_NUMBER)
+    {
+        World->DestroyActor(Volume);
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("NavMeshBoundsVolume brush was created but has zero bounds"), nullptr, TEXT("ZERO_BOUNDS"));
+        return true;
+    }
+
     World->MarkPackageDirty();
+    Volume->MarkPackageDirty();
+    if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
+    {
+        NavSys->AddDirtyArea(BrushBounds, ENavigationDirtyFlag::All);
+    }
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("boundsActorName"), Volume->GetActorLabel());
     Result->SetStringField(TEXT("actorPath"), Volume->GetPathName());
     Result->SetBoolField(TEXT("created"), true);
+    Result->SetNumberField(TEXT("boundsExtentX"), BrushBounds.GetExtent().X);
+    Result->SetNumberField(TEXT("boundsExtentY"), BrushBounds.GetExtent().Y);
+    Result->SetNumberField(TEXT("boundsExtentZ"), BrushBounds.GetExtent().Z);
     McpHandlerUtils::AddVerification(Result, Volume);
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("NavMeshBoundsVolume created"), Result);
     return true;

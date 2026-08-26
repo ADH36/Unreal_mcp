@@ -37,7 +37,9 @@ export async function handleGameFrameworkTools(
     pathFields: [
       'path',
       'blueprintPath',
-      'gameModeBlueprint'
+      'gameModeBlueprint',
+      'levelPath',
+      'mapPath'
     ]
   });
 
@@ -97,6 +99,13 @@ export async function handleGameFrameworkTools(
     // =========================================================================
     // 21.2 Game Mode Configuration (5 actions)
     // =========================================================================
+
+    case 'set_level_game_mode': {
+      const gmPath = getGameModePath(argsRecord);
+      requireNonEmptyString(gmPath, 'gameModeBlueprint', 'Missing required parameter: gameModeBlueprint or blueprintPath');
+      // Applies the GameMode class to the current editor level's World Settings.
+      return sendRequest('set_level_game_mode');
+    }
 
     case 'set_default_pawn_class': {
       const gmPath = getGameModePath(argsRecord);

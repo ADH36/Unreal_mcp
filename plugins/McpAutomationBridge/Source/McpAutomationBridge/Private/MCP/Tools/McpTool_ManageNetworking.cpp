@@ -159,6 +159,8 @@ public:
 			.String(TEXT("name"), TEXT("Name identifier."))
 			.String(TEXT("path"), TEXT("Path to a directory."))
 			.String(TEXT("gameModeBlueprint"), TEXT("Path to GameMode blueprint to configure."))
+			.String(TEXT("levelPath"), TEXT("Current level package to receive the GameMode override."))
+			.String(TEXT("mapPath"), TEXT("Alias for levelPath."))
 			.String(TEXT("parentClass"), TEXT("Parent class path."))
 			.String(TEXT("pawnClass"), TEXT("Pawn class to use."))
 			.String(TEXT("defaultPawnClass"), TEXT("Default pawn class for GameMode."))

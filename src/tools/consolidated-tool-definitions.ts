@@ -138,7 +138,7 @@ export const SESSION_ACTIONS = [
 export const GAME_FRAMEWORK_ACTIONS = [
   'create_game_mode', 'create_game_state', 'create_player_controller',
   'create_player_state', 'create_game_instance', 'create_hud_class',
-  'set_default_pawn_class', 'set_player_controller_class',
+  'set_default_pawn_class', 'set_player_controller_class', 'set_level_game_mode',
   'set_game_state_class', 'set_player_state_class', 'configure_game_rules',
   'setup_match_states', 'configure_round_system', 'configure_team_system',
   'configure_scoring_system', 'configure_spawn_system',
@@ -3470,6 +3470,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         name: commonSchemas.name,
         path: commonSchemas.directoryPathForCreation,
         gameModeBlueprint: { type: 'string', description: 'Path to GameMode blueprint to configure.' },
+        levelPath: { type: 'string', description: 'Current level package to receive the GameMode override.' },
+        mapPath: { type: 'string', description: 'Alias for levelPath.' },
         parentClass: commonSchemas.parentClass,
         pawnClass: { type: 'string', description: 'Pawn class to use.' },
         defaultPawnClass: { type: 'string', description: 'Default pawn class for GameMode.' },

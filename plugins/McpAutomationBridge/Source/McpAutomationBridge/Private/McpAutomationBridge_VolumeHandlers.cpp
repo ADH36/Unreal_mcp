@@ -107,6 +107,7 @@
 
 // Brush Building
 #include "Engine/Brush.h"
+#include "Model.h"
 #include "Engine/Polys.h"
 #include "Builders/CubeBuilder.h"
 
@@ -162,9 +163,28 @@ namespace VolumeHelpers
     // Note: UCubeBuilder is allocated with GetTransientPackage() as outer to prevent GC accumulation
     bool CreateBoxBrushForVolume(ABrush* Volume, const FVector& Extent)
     {
-        if (!Volume)
+        if (!Volume || Extent.X <= 0.0f || Extent.Y <= 0.0f || Extent.Z <= 0.0f)
         {
             return false;
+        }
+
+        // Actors spawned directly by automation do not always have the UModel/
+        // UPolys pair that the editor's CubeBuilder expects.  In that case the
+        // builder returns success without generating any polygons, leaving the
+        // volume with a zero bounding box.
+        if (!Volume->Brush)
+        {
+            Volume->Brush = NewObject<UModel>(Volume, TEXT("Brush"), RF_Transactional);
+            if (!Volume->Brush)
+            {
+                return false;
+            }
+            Volume->Brush->Initialize(Volume, true);
+            if (!Volume->Brush->Polys)
+            {
+                return false;
+            }
+            Volume->Brush->Polys->SetFlags(RF_Transactional);
         }
 
         // Use UCubeBuilder to create the brush shape
@@ -175,9 +195,17 @@ namespace VolumeHelpers
         CubeBuilder->Z = Extent.Z * 2.0f;
 
         // Build the brush
-        CubeBuilder->Build(Volume->GetWorld(), Volume);
+        if (!CubeBuilder->Build(Volume->GetWorld(), Volume))
+        {
+            return false;
+        }
 
-        return true;
+        Volume->Brush->BuildBound();
+        Volume->GetBrushComponent()->UpdateBounds();
+        Volume->GetBrushComponent()->MarkRenderStateDirty();
+
+        return Volume->Brush->Polys && Volume->Brush->Polys->Element.Num() > 0 &&
+            Volume->GetComponentsBoundingBox(true).GetExtent().GetMin() > KINDA_SMALL_NUMBER;
     }
 
     // Create a sphere brush for a volume (for TriggerSphere)
@@ -1561,10 +1589,23 @@ static bool HandleCreateNavMeshBoundsVolume(
             TEXT("Failed to spawn NavMeshBoundsVolume"), nullptr);
         return true;
     }
+    const FBox BrushBounds = Volume->GetComponentsBoundingBox(true);
+    if (!BrushBounds.IsValid || BrushBounds.GetExtent().GetMin() <= KINDA_SMALL_NUMBER)
+    {
+        World->DestroyActor(Volume);
+        Subsystem->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("NavMeshBoundsVolume brush was created but has zero bounds"), nullptr, TEXT("ZERO_BOUNDS"));
+        return true;
+    }
+    World->MarkPackageDirty();
+    Volume->MarkPackageDirty();
 
     TSharedPtr<FJsonObject> ResponseJson = McpHandlerUtils::CreateResultObject();
     ResponseJson->SetStringField(TEXT("volumeName"), Volume->GetActorLabel());
     ResponseJson->SetStringField(TEXT("volumeClass"), TEXT("ANavMeshBoundsVolume"));
+    ResponseJson->SetNumberField(TEXT("boundsExtentX"), BrushBounds.GetExtent().X);
+    ResponseJson->SetNumberField(TEXT("boundsExtentY"), BrushBounds.GetExtent().Y);
+    ResponseJson->SetNumberField(TEXT("boundsExtentZ"), BrushBounds.GetExtent().Z);
 
     // Add verification data
     McpHandlerUtils::AddVerification(ResponseJson, Volume);
