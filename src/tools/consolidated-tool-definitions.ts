@@ -62,7 +62,12 @@ export const LIGHTING_ACTIONS = [
   'spawn_light', 'create_light', 'spawn_sky_light', 'create_sky_light', 'ensure_single_sky_light',
   'create_lightmass_volume', 'create_lighting_enabled_level', 'create_dynamic_light',
   'setup_global_illumination', 'configure_shadows', 'set_exposure', 'set_ambient_occlusion',
-  'setup_volumetric_fog', 'build_lighting', 'list_light_types'
+  'setup_volumetric_fog', 'build_lighting', 'list_light_types',
+  // Phase 29.1: Advanced ray-tracing configuration.
+  'configure_ray_traced_shadows', 'configure_ray_traced_gi',
+  'configure_ray_traced_reflections', 'configure_ray_traced_ao',
+  'configure_path_tracing', 'configure_ray_traced_translucency',
+  'configure_ray_tracing_quality'
 ] as const;
 
 export const SPLINE_ACTIONS = [
@@ -1174,6 +1179,34 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         initialPoints: commonSchemas.arrayOfObjects,
         leaveTangent: commonSchemas.location,
         lightType: commonSchemas.stringProp,
+        // Phase 29.1 ray-tracing configuration.
+        rayTracedShadows: commonSchemas.booleanProp,
+        rayTracedGI: commonSchemas.booleanProp,
+        rayTracedReflections: commonSchemas.booleanProp,
+        rayTracedAO: commonSchemas.booleanProp,
+        rayTracedTranslucency: commonSchemas.booleanProp,
+        samplesPerPixel: commonSchemas.numberProp,
+        maxBounces: commonSchemas.numberProp,
+        denoiser: commonSchemas.booleanProp,
+        aoRadius: commonSchemas.numberProp,
+        aoIntensity: commonSchemas.numberProp,
+        refraction: commonSchemas.booleanProp,
+        refractionRays: commonSchemas.numberProp,
+        maxRoughness: commonSchemas.numberProp,
+        includeTranslucentObjects: commonSchemas.booleanProp,
+        spatialDenoiserType: commonSchemas.numberProp,
+        cullingMode: commonSchemas.numberProp,
+        cullingRadius: commonSchemas.numberProp,
+        cullingAngle: commonSchemas.numberProp,
+        geometry: commonSchemas.objectProp,
+        maxUpdatePrimitivesPerFrame: commonSchemas.numberProp,
+        priorityBasedUpdate: commonSchemas.booleanProp,
+        useTracingFeedback: commonSchemas.booleanProp,
+        useReferenceBasedResidency: commonSchemas.booleanProp,
+        residentGeometryMemoryPoolSizeInMB: commonSchemas.numberProp,
+        compactInstances: commonSchemas.booleanProp,
+        reflectionCaptures: commonSchemas.booleanProp,
+        pathTracing: commonSchemas.booleanProp,
         materialIndex: commonSchemas.numberProp,
         maxBrightness: commonSchemas.numberProp,
         method: commonSchemas.stringProp,

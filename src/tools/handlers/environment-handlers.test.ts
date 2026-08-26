@@ -20,6 +20,7 @@ vi.mock('../../utils/environment-snapshot.js', () => ({
 }));
 
 import { handleEnvironmentTools } from './environment-handlers.js';
+import { handleLightingTools } from './lighting-handlers.js';
 import { consolidatedToolDefinitions } from '../consolidated-tool-definitions.js';
 
 const PHASE_28_ENVIRONMENT_ACTIONS = [
@@ -46,6 +47,13 @@ const UE_581_LANDSCAPE_FOLIAGE_ACTIONS = [
   'create_landscape_material', 'configure_landscape_layer_blend',
   'scatter_landscape_foliage', 'inspect_generated_foliage',
   'regenerate_generated_foliage', 'clear_generated_foliage'
+] as const;
+
+const PHASE_29_1_RAY_TRACING_ACTIONS = [
+  'configure_ray_traced_shadows', 'configure_ray_traced_gi',
+  'configure_ray_traced_reflections', 'configure_ray_traced_ao',
+  'configure_path_tracing', 'configure_ray_traced_translucency',
+  'configure_ray_tracing_quality'
 ] as const;
 
 function getBuildEnvironmentActionEnum(): readonly string[] {
@@ -134,6 +142,43 @@ describe('handleEnvironmentTools path normalization', () => {
 
   it('exposes every Phase 28 roadmap action on the build_environment schema', () => {
     expect(getBuildEnvironmentActionEnum()).toEqual(expect.arrayContaining([...PHASE_28_ENVIRONMENT_ACTIONS]));
+  });
+
+  it('exposes every Phase 29.1 ray-tracing action on the build_environment schema', () => {
+    expect(getBuildEnvironmentActionEnum()).toEqual(expect.arrayContaining([...PHASE_29_1_RAY_TRACING_ACTIONS]));
+    expect(getBuildEnvironmentProperties()).toEqual(expect.objectContaining({
+      samplesPerPixel: expect.any(Object),
+      maxBounces: expect.any(Object),
+      denoiser: expect.any(Object),
+      aoRadius: expect.any(Object),
+      aoIntensity: expect.any(Object)
+    }));
+  });
+
+  it.each([...PHASE_29_1_RAY_TRACING_ACTIONS])('forwards %s with normalized ray-tracing settings', async action => {
+    await handleLightingTools(action, {
+      action,
+      enabled: true,
+      samplesPerPixel: 4,
+      maxBounces: 6,
+      denoiser: true,
+      aoRadius: 150,
+      aoIntensity: 1.25
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenCalledWith(
+      {},
+      action,
+      expect.objectContaining({
+        enabled: true,
+        samplesPerPixel: 4,
+        maxBounces: 6,
+        denoiser: true,
+        radius: 150,
+        intensity: 1.25
+      }),
+      `Automation bridge not available for ${action}`
+    );
   });
 
   it('routes the Phase 28 create_foliage_type alias to foliage type creation', async () => {

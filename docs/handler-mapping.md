@@ -142,6 +142,13 @@ This document maps the TypeScript tool definitions to their corresponding C++ ha
 | `set_exposure` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | |
 | `set_ambient_occlusion` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | |
 | `list_light_types` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Discovery: Returns all `ALight` subclasses |
+| `configure_ray_traced_shadows` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported ray-traced shadow CVars |
+| `configure_ray_traced_gi` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported RTGI CVars |
+| `configure_ray_traced_reflections` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported ray-traced reflection CVars |
+| `configure_ray_traced_ao` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported ray-traced AO CVars |
+| `configure_path_tracing` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported path-tracing CVars |
+| `configure_ray_traced_translucency` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; configures translucency/refraction and Post Process Volume overrides |
+| `configure_ray_tracing_quality` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; configures scene culling, geometry inclusion, residency, and update budgets |
 
 ## Performance Manager (`system_control`)
 

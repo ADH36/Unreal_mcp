@@ -1226,11 +1226,13 @@ The following phases represent the comprehensive expansion to enable **full proj
 **Tool**: `build_environment` (Expanded) + `manage_post_process`
 
 ### 29.1 Ray Tracing
-- [ ] `configure_ray_traced_shadows`
-- [ ] `configure_ray_traced_gi`
-- [ ] `configure_ray_traced_reflections`
-- [ ] `configure_ray_traced_ao`
-- [ ] `configure_path_tracing`
+- [x] `configure_ray_traced_shadows`
+- [x] `configure_ray_traced_gi`
+- [x] `configure_ray_traced_reflections`
+- [x] `configure_ray_traced_ao`
+- [x] `configure_path_tracing`
+- [x] `configure_ray_traced_translucency` (translucency, refraction, roughness, and per-volume overrides)
+- [x] `configure_ray_tracing_quality` (scene culling, geometry participation, TLAS/BLAS performance controls)
 
 ### 29.2 Light Channels
 - [ ] `set_light_channel`

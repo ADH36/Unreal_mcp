@@ -611,6 +611,98 @@ async function setAmbientOcclusion(
 }
 
 /**
+ * Configure one of the engine's hardware ray-tracing pipelines.
+ *
+ * The native bridge owns the CVar application so the same action works from
+ * both the consolidated build_environment tool and direct bridge requests.
+ */
+async function configureRayTracing(
+  tools: ITools,
+  action: string,
+  args: LightingArgs
+): Promise<Record<string, unknown>> {
+  const enabled = toBoolean(
+    action === 'configure_ray_traced_shadows' ? args.rayTracedShadows :
+        action === 'configure_ray_traced_gi' ? args.rayTracedGI :
+          action === 'configure_ray_traced_reflections' ? args.rayTracedReflections :
+            action === 'configure_ray_traced_ao' ? args.rayTracedAO :
+              action === 'configure_ray_traced_translucency' ? args.rayTracedTranslucency : args.pathTracing
+  );
+  const samplesPerPixel = toNumber(args.samplesPerPixel);
+  const maxBounces = toNumber(args.maxBounces);
+  const denoiser = toBoolean(args.denoiser);
+  const radius = toNumber(args.aoRadius ?? args.radius);
+  const intensity = toNumber(args.aoIntensity);
+  const refraction = toBoolean(args.refraction);
+  const refractionRays = toNumber(args.refractionRays);
+  const maxRoughness = toNumber(args.maxRoughness);
+  const spatialDenoiserType = toNumber(args.spatialDenoiserType);
+  const cullingMode = toNumber(args.cullingMode);
+  const cullingRadius = toNumber(args.cullingRadius);
+  const cullingAngle = toNumber(args.cullingAngle);
+  const maxUpdatePrimitivesPerFrame = toNumber(args.maxUpdatePrimitivesPerFrame);
+  const residentGeometryMemoryPoolSizeInMB = toNumber(args.residentGeometryMemoryPoolSizeInMB);
+
+  for (const [field, value] of Object.entries({ samplesPerPixel, maxBounces, radius, intensity, refractionRays, spatialDenoiserType, maxUpdatePrimitivesPerFrame, residentGeometryMemoryPoolSizeInMB })) {
+    if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+      return {
+        success: false,
+        isError: true,
+        error: 'INVALID_ARGUMENT',
+        message: `${field} must be a finite, non-negative number`
+      };
+    }
+  }
+  if (maxRoughness !== undefined && (maxRoughness < 0 || maxRoughness > 1)) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'maxRoughness must be between 0 and 1' };
+  }
+  if (cullingMode !== undefined && (!Number.isInteger(cullingMode) || cullingMode < 0 || cullingMode > 3)) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'cullingMode must be an integer from 0 to 3' };
+  }
+  if (cullingRadius !== undefined && cullingRadius < -1) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'cullingRadius must be -1 or non-negative' };
+  }
+  if (cullingAngle !== undefined && cullingAngle < 0) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'cullingAngle must be non-negative' };
+  }
+  if (spatialDenoiserType !== undefined && (!Number.isInteger(spatialDenoiserType) || spatialDenoiserType < 0 || spatialDenoiserType > 1)) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'spatialDenoiserType must be 0 (spatial) or 1 (temporal)' };
+  }
+
+  const payload: Record<string, unknown> = {
+    enabled: enabled ?? true,
+    samplesPerPixel,
+    maxBounces,
+    denoiser,
+    radius,
+    intensity,
+    refraction,
+    refractionRays,
+    maxRoughness,
+    includeTranslucentObjects: toBoolean(args.includeTranslucentObjects),
+    spatialDenoiserType,
+    cullingMode,
+    cullingRadius,
+    cullingAngle,
+    geometry: args.geometry,
+    maxUpdatePrimitivesPerFrame,
+    priorityBasedUpdate: toBoolean(args.priorityBasedUpdate),
+    useTracingFeedback: toBoolean(args.useTracingFeedback),
+    useReferenceBasedResidency: toBoolean(args.useReferenceBasedResidency),
+    residentGeometryMemoryPoolSizeInMB,
+    compactInstances: toBoolean(args.compactInstances),
+    reflectionCaptures: toBoolean(args.reflectionCaptures)
+  };
+
+  return cleanObject(await executeAutomationRequest(
+    tools,
+    action,
+    payload,
+    `Automation bridge not available for ${action}`
+  )) as Record<string, unknown>;
+}
+
+/**
  * Setup volumetric fog
  */
 async function setupVolumetricFog(
@@ -706,6 +798,15 @@ export async function handleLightingTools(action: string, args: LightingArgs, to
 
     case 'set_ambient_occlusion':
       return cleanObject(await setAmbientOcclusion(tools, args));
+
+    case 'configure_ray_traced_shadows':
+    case 'configure_ray_traced_gi':
+    case 'configure_ray_traced_reflections':
+    case 'configure_ray_traced_ao':
+    case 'configure_path_tracing':
+    case 'configure_ray_traced_translucency':
+    case 'configure_ray_tracing_quality':
+      return configureRayTracing(tools, action, args);
 
     case 'build_lighting':
       return cleanObject(await buildLighting(tools, args));

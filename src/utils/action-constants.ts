@@ -105,6 +105,13 @@ export const TOOL_ACTIONS = {
   SET_AMBIENT_OCCLUSION: 'set_ambient_occlusion',
   SETUP_VOLUMETRIC_FOG: 'setup_volumetric_fog',
   LIST_LIGHT_TYPES: 'list_light_types',
+  CONFIGURE_RAY_TRACED_SHADOWS: 'configure_ray_traced_shadows',
+  CONFIGURE_RAY_TRACED_GI: 'configure_ray_traced_gi',
+  CONFIGURE_RAY_TRACED_REFLECTIONS: 'configure_ray_traced_reflections',
+  CONFIGURE_RAY_TRACED_AO: 'configure_ray_traced_ao',
+  CONFIGURE_PATH_TRACING: 'configure_path_tracing',
+  CONFIGURE_RAY_TRACED_TRANSLUCENCY: 'configure_ray_traced_translucency',
+  CONFIGURE_RAY_TRACING_QUALITY: 'configure_ray_tracing_quality',
 
   // ==================== PERFORMANCE ACTIONS ====================
   START_PROFILING: 'start_profiling',

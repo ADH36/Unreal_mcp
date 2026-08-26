@@ -267,7 +267,12 @@ inline const TArray<FString>& Lighting()
 		TEXT("setup_global_illumination"), TEXT("configure_shadows"),
 		TEXT("set_exposure"), TEXT("set_ambient_occlusion"),
 		TEXT("setup_volumetric_fog"), TEXT("build_lighting"),
-		TEXT("list_light_types")
+		TEXT("list_light_types"),
+		// Phase 29.1: Advanced ray-tracing configuration.
+		TEXT("configure_ray_traced_shadows"), TEXT("configure_ray_traced_gi"),
+		TEXT("configure_ray_traced_reflections"), TEXT("configure_ray_traced_ao"),
+		TEXT("configure_path_tracing"), TEXT("configure_ray_traced_translucency"),
+		TEXT("configure_ray_tracing_quality")
 	};
 	return Actions;
 }
