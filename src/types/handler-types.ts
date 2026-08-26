@@ -525,6 +525,8 @@ export interface EnvironmentArgs extends HandlerArgs {
 
 export interface LightingArgs extends HandlerArgs {
     lightType?: string;
+    lightName?: string;
+    lightPath?: string;
     name?: string;
     location?: Vector3;
     rotation?: Rotator;
@@ -585,6 +587,10 @@ export interface LightingArgs extends HandlerArgs {
     compactInstances?: boolean;
     reflectionCaptures?: boolean;
     pathTracing?: boolean;
+    channel?: number;
+    channels?: Record<string, unknown>;
+    componentName?: string;
+    applyToAllComponents?: boolean;
     compensationValue?: number;
     minBrightness?: number;
     maxBrightness?: number;

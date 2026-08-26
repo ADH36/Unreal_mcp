@@ -272,7 +272,10 @@ inline const TArray<FString>& Lighting()
 		TEXT("configure_ray_traced_shadows"), TEXT("configure_ray_traced_gi"),
 		TEXT("configure_ray_traced_reflections"), TEXT("configure_ray_traced_ao"),
 		TEXT("configure_path_tracing"), TEXT("configure_ray_traced_translucency"),
-		TEXT("configure_ray_tracing_quality")
+		TEXT("configure_ray_tracing_quality"),
+		// Phase 29.2: Light channel assignment and readback.
+		TEXT("set_light_channel"), TEXT("set_actor_light_channel"),
+		TEXT("get_light_channels")
 	};
 	return Actions;
 }

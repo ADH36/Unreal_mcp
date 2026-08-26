@@ -20,6 +20,7 @@
 // - configure_path_tracing
 // - configure_ray_traced_translucency
 // - configure_ray_tracing_quality
+// - set_light_channel / set_actor_light_channel / get_light_channels
 //
 // UE VERSION COMPATIBILITY:
 // - UE 5.0-5.7: Full support for all lighting types
@@ -61,8 +62,10 @@
 // Engine Includes - Editor
 // =============================================================================
 #include "Components/DirectionalLightComponent.h"
+#include "Components/LightComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/RectLightComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/SpotLightComponent.h"
 #include "Engine/DirectionalLight.h"
@@ -89,6 +92,92 @@
 // =============================================================================
 // Handler Implementation
 // =============================================================================
+
+namespace
+{
+struct FMcpLightingChannelState
+{
+    bool bChannel0 = false;
+    bool bChannel1 = false;
+    bool bChannel2 = false;
+};
+
+static TSharedPtr<FJsonObject> MakeLightingChannelsJson(const FMcpLightingChannelState& State)
+{
+    TSharedPtr<FJsonObject> Channels = McpHandlerUtils::CreateResultObject();
+    Channels->SetBoolField(TEXT("channel0"), State.bChannel0);
+    Channels->SetBoolField(TEXT("channel1"), State.bChannel1);
+    Channels->SetBoolField(TEXT("channel2"), State.bChannel2);
+    return Channels;
+}
+
+static bool ParseLightingChannelPayload(
+    const TSharedPtr<FJsonObject>& Payload,
+    FMcpLightingChannelState& State,
+    FString& OutError)
+{
+    bool bSpecified = false;
+    const TSharedPtr<FJsonObject>* ChannelsObject = nullptr;
+    if (Payload->TryGetObjectField(TEXT("channels"), ChannelsObject) && ChannelsObject && ChannelsObject->IsValid())
+    {
+        bool Value = false;
+        if ((*ChannelsObject)->TryGetBoolField(TEXT("channel0"), Value) || (*ChannelsObject)->TryGetBoolField(TEXT("0"), Value))
+        {
+            State.bChannel0 = Value;
+            bSpecified = true;
+        }
+        if ((*ChannelsObject)->TryGetBoolField(TEXT("channel1"), Value) || (*ChannelsObject)->TryGetBoolField(TEXT("1"), Value))
+        {
+            State.bChannel1 = Value;
+            bSpecified = true;
+        }
+        if ((*ChannelsObject)->TryGetBoolField(TEXT("channel2"), Value) || (*ChannelsObject)->TryGetBoolField(TEXT("2"), Value))
+        {
+            State.bChannel2 = Value;
+            bSpecified = true;
+        }
+    }
+
+    double ChannelNumber = 0.0;
+    if (Payload->TryGetNumberField(TEXT("channel"), ChannelNumber))
+    {
+        const int32 Channel = FMath::RoundToInt(ChannelNumber);
+        if (!FMath::IsFinite(ChannelNumber) || ChannelNumber != static_cast<double>(Channel) || Channel < 0 || Channel > 2)
+        {
+            OutError = TEXT("channel must be an integer from 0 to 2");
+            return false;
+        }
+
+        bool bEnabled = true;
+        Payload->TryGetBoolField(TEXT("enabled"), bEnabled);
+        if (Channel == 0) State.bChannel0 = bEnabled;
+        if (Channel == 1) State.bChannel1 = bEnabled;
+        if (Channel == 2) State.bChannel2 = bEnabled;
+        bSpecified = true;
+    }
+
+    if (!bSpecified)
+    {
+        OutError = TEXT("Provide channel plus enabled, or a channels object with channel0/channel1/channel2");
+        return false;
+    }
+    return true;
+}
+
+static FString GetLightingTarget(const TSharedPtr<FJsonObject>& Payload)
+{
+    FString Target;
+    const TCHAR* Fields[] = { TEXT("lightPath"), TEXT("lightName"), TEXT("actorPath"), TEXT("actorName"), TEXT("name") };
+    for (const TCHAR* Field : Fields)
+    {
+        if (Payload->TryGetStringField(Field, Target) && !Target.IsEmpty())
+        {
+            return Target;
+        }
+    }
+    return FString();
+}
+}
 
 /**
  * Dispatch and execute native lighting actions for the automation bridge.
@@ -139,7 +228,10 @@ bool UMcpAutomationBridgeSubsystem::HandleLightingAction(
         Lower.StartsWith(TEXT("configure_ray_traced_ao")) ||
         Lower.StartsWith(TEXT("configure_path_tracing")) ||
         Lower.StartsWith(TEXT("configure_ray_traced_translucency")) ||
-        Lower.StartsWith(TEXT("configure_ray_tracing_quality"));
+        Lower.StartsWith(TEXT("configure_ray_tracing_quality")) ||
+        Lower.StartsWith(TEXT("set_light_channel")) ||
+        Lower.StartsWith(TEXT("set_actor_light_channel")) ||
+        Lower.StartsWith(TEXT("get_light_channels"));
     if (!bKnownLightingAction)
     {
         if (Action.Equals(TEXT("manage_lighting"), ESearchCase::IgnoreCase))
@@ -178,6 +270,152 @@ bool UMcpAutomationBridgeSubsystem::HandleLightingAction(
         SendAutomationError(RequestingSocket, RequestId,
             TEXT("EditorActorSubsystem not available"),
             TEXT("EDITOR_ACTOR_SUBSYSTEM_MISSING"));
+        return true;
+    }
+
+    // =========================================================================
+    // Phase 29.2: Light channels
+    // =========================================================================
+    if (Lower == TEXT("set_light_channel") ||
+        Lower == TEXT("set_actor_light_channel") ||
+        Lower == TEXT("get_light_channels"))
+    {
+        const FString Target = GetLightingTarget(Payload);
+        if (Target.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                TEXT("A lightName/lightPath or actorName/actorPath/name is required"),
+                TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        AActor* TargetActor = FindActorByName(Target, true);
+        if (!TargetActor)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Actor or light not found: %s"), *Target),
+                TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        if (Lower == TEXT("set_light_channel") ||
+            Lower == TEXT("set_actor_light_channel") ||
+            Lower == TEXT("get_light_channels"))
+        {
+            if (ULightComponent* LightComponent = TargetActor->FindComponentByClass<ULightComponent>())
+            {
+                FMcpLightingChannelState State;
+                State.bChannel0 = LightComponent->LightingChannels.bChannel0;
+                State.bChannel1 = LightComponent->LightingChannels.bChannel1;
+                State.bChannel2 = LightComponent->LightingChannels.bChannel2;
+
+                if (Lower == TEXT("set_light_channel"))
+                {
+                    FString ParseError;
+                    if (!ParseLightingChannelPayload(Payload, State, ParseError))
+                    {
+                        SendAutomationError(RequestingSocket, RequestId, *ParseError, TEXT("INVALID_ARGUMENT"));
+                        return true;
+                    }
+                    TargetActor->Modify();
+                    LightComponent->SetLightingChannels(State.bChannel0, State.bChannel1, State.bChannel2);
+                    TargetActor->MarkComponentsRenderStateDirty();
+                }
+
+                TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+                Resp->SetStringField(TEXT("actorName"), TargetActor->GetActorLabel());
+                Resp->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
+                Resp->SetStringField(TEXT("componentName"), LightComponent->GetName());
+                Resp->SetObjectField(TEXT("channels"), MakeLightingChannelsJson(State));
+                SendAutomationResponse(RequestingSocket, RequestId, true,
+                    Lower == TEXT("get_light_channels") ? TEXT("Light channels read") : TEXT("Light channel updated"), Resp);
+                return true;
+            }
+            if (Lower == TEXT("set_light_channel"))
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Actor is not a light: %s"), *Target), TEXT("INVALID_TARGET"));
+                return true;
+            }
+        }
+
+        TArray<UPrimitiveComponent*> PrimitiveComponents;
+        FString ComponentName;
+        if (Payload->TryGetStringField(TEXT("componentName"), ComponentName) && !ComponentName.IsEmpty())
+        {
+            if (UPrimitiveComponent* Component = Cast<UPrimitiveComponent>(FindComponentByName(TargetActor, ComponentName)))
+            {
+                PrimitiveComponents.Add(Component);
+            }
+            else
+            {
+                SendAutomationError(RequestingSocket, RequestId,
+                    FString::Printf(TEXT("Primitive component not found: %s"), *ComponentName), TEXT("NOT_FOUND"));
+                return true;
+            }
+        }
+        else
+        {
+            TargetActor->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+
+            bool bApplyToAllComponents = true;
+            Payload->TryGetBoolField(TEXT("applyToAllComponents"), bApplyToAllComponents);
+            if (!bApplyToAllComponents && PrimitiveComponents.Num() > 1)
+            {
+                if (UPrimitiveComponent* RootPrimitive = Cast<UPrimitiveComponent>(TargetActor->GetRootComponent()))
+                {
+                    PrimitiveComponents.Reset();
+                    PrimitiveComponents.Add(RootPrimitive);
+                }
+                else
+                {
+                    PrimitiveComponents.SetNum(1);
+                }
+            }
+        }
+
+        if (PrimitiveComponents.Num() == 0)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Actor has no primitive components: %s"), *Target), TEXT("INVALID_TARGET"));
+            return true;
+        }
+
+        TArray<TSharedPtr<FJsonValue>> ComponentResults;
+        for (UPrimitiveComponent* Component : PrimitiveComponents)
+        {
+            if (!Component) continue;
+            FMcpLightingChannelState State;
+            State.bChannel0 = Component->LightingChannels.bChannel0;
+            State.bChannel1 = Component->LightingChannels.bChannel1;
+            State.bChannel2 = Component->LightingChannels.bChannel2;
+
+            if (Lower == TEXT("set_actor_light_channel"))
+            {
+                FString ParseError;
+                if (!ParseLightingChannelPayload(Payload, State, ParseError))
+                {
+                    SendAutomationError(RequestingSocket, RequestId, *ParseError, TEXT("INVALID_ARGUMENT"));
+                    return true;
+                }
+                TargetActor->Modify();
+                Component->SetLightingChannels(State.bChannel0, State.bChannel1, State.bChannel2);
+                Component->MarkRenderStateDirty();
+            }
+
+            TSharedPtr<FJsonObject> ComponentResult = McpHandlerUtils::CreateResultObject();
+            ComponentResult->SetStringField(TEXT("componentName"), Component->GetName());
+            ComponentResult->SetObjectField(TEXT("channels"), MakeLightingChannelsJson(State));
+            ComponentResults.Add(MakeShared<FJsonValueObject>(ComponentResult));
+        }
+
+        TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
+        Resp->SetStringField(TEXT("actorName"), TargetActor->GetActorLabel());
+        Resp->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
+        Resp->SetNumberField(TEXT("componentCount"), ComponentResults.Num());
+        Resp->SetArrayField(TEXT("components"), ComponentResults);
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+            Lower == TEXT("get_light_channels") ? TEXT("Actor light channels read") : TEXT("Actor light channels updated"), Resp);
         return true;
     }
 

@@ -56,6 +56,10 @@ const PHASE_29_1_RAY_TRACING_ACTIONS = [
   'configure_ray_tracing_quality'
 ] as const;
 
+const PHASE_29_2_LIGHT_CHANNEL_ACTIONS = [
+  'set_light_channel', 'set_actor_light_channel', 'get_light_channels'
+] as const;
+
 function getBuildEnvironmentActionEnum(): readonly string[] {
   const tool = consolidatedToolDefinitions.find(def => def.name === 'build_environment');
   const inputSchema = tool?.inputSchema as { properties?: { action?: { enum?: string[] } } } | undefined;
@@ -155,6 +159,18 @@ describe('handleEnvironmentTools path normalization', () => {
     }));
   });
 
+  it('exposes every Phase 29.2 light-channel action and property on the schema', () => {
+    expect(getBuildEnvironmentActionEnum()).toEqual(expect.arrayContaining([...PHASE_29_2_LIGHT_CHANNEL_ACTIONS]));
+    expect(getBuildEnvironmentProperties()).toEqual(expect.objectContaining({
+      lightName: expect.any(Object),
+      lightPath: expect.any(Object),
+      channel: expect.any(Object),
+      channels: expect.any(Object),
+      componentName: expect.any(Object),
+      applyToAllComponents: expect.any(Object)
+    }));
+  });
+
   it.each([...PHASE_29_1_RAY_TRACING_ACTIONS])('forwards %s with normalized ray-tracing settings', async action => {
     await handleLightingTools(action, {
       action,
@@ -176,6 +192,28 @@ describe('handleEnvironmentTools path normalization', () => {
         denoiser: true,
         radius: 150,
         intensity: 1.25
+      }),
+      `Automation bridge not available for ${action}`
+    );
+  });
+
+  it.each([...PHASE_29_2_LIGHT_CHANNEL_ACTIONS])('forwards %s with target and channel settings', async action => {
+    await handleLightingTools(action, {
+      action,
+      lightName: 'Phase29Light',
+      actorName: 'Phase29Actor',
+      channel: 1,
+      enabled: true
+    }, {} as never);
+
+    expect(executeAutomationRequestMock).toHaveBeenCalledWith(
+      {},
+      action,
+      expect.objectContaining({
+        lightName: 'Phase29Light',
+        actorName: 'Phase29Actor',
+        channel: 1,
+        enabled: true
       }),
       `Automation bridge not available for ${action}`
     );

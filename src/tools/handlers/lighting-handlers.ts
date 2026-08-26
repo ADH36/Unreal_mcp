@@ -702,6 +702,40 @@ async function configureRayTracing(
   )) as Record<string, unknown>;
 }
 
+/** Configure or inspect the three Unreal lighting channels on lights/actors. */
+async function configureLightChannels(
+  tools: ITools,
+  action: string,
+  args: LightingArgs
+): Promise<Record<string, unknown>> {
+  const channel = toNumber(args.channel);
+  if (action !== 'get_light_channels' && channel === undefined && !args.channels) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'Provide channel plus enabled, or a channels object with channel0/channel1/channel2.' };
+  }
+  if (channel !== undefined && (!Number.isInteger(channel) || channel < 0 || channel > 2)) {
+    return { success: false, isError: true, error: 'INVALID_ARGUMENT', message: 'channel must be an integer from 0 to 2' };
+  }
+
+  const payload: Record<string, unknown> = {
+    lightName: args.lightName,
+    lightPath: args.lightPath,
+    actorName: args.actorName,
+    actorPath: args.actorPath,
+    name: args.name,
+    channel,
+    enabled: toBoolean(args.enabled),
+    channels: args.channels,
+    componentName: args.componentName,
+    applyToAllComponents: toBoolean(args.applyToAllComponents)
+  };
+  return cleanObject(await executeAutomationRequest(
+    tools,
+    action,
+    payload,
+    `Automation bridge not available for ${action}`
+  )) as Record<string, unknown>;
+}
+
 /**
  * Setup volumetric fog
  */
@@ -807,6 +841,11 @@ export async function handleLightingTools(action: string, args: LightingArgs, to
     case 'configure_ray_traced_translucency':
     case 'configure_ray_tracing_quality':
       return configureRayTracing(tools, action, args);
+
+    case 'set_light_channel':
+    case 'set_actor_light_channel':
+    case 'get_light_channels':
+      return configureLightChannels(tools, action, args);
 
     case 'build_lighting':
       return cleanObject(await buildLighting(tools, args));

@@ -112,6 +112,9 @@ export const TOOL_ACTIONS = {
   CONFIGURE_PATH_TRACING: 'configure_path_tracing',
   CONFIGURE_RAY_TRACED_TRANSLUCENCY: 'configure_ray_traced_translucency',
   CONFIGURE_RAY_TRACING_QUALITY: 'configure_ray_tracing_quality',
+  SET_LIGHT_CHANNEL: 'set_light_channel',
+  SET_ACTOR_LIGHT_CHANNEL: 'set_actor_light_channel',
+  GET_LIGHT_CHANNELS: 'get_light_channels',
 
   // ==================== PERFORMANCE ACTIONS ====================
   START_PROFILING: 'start_profiling',

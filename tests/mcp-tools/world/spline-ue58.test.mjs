@@ -167,11 +167,11 @@ runner.addStep('create and inspect a closed-loop route', async (tools) => {
 });
 
 runner.addStep('save, reload, and verify route persistence', async (tools) => {
-  ensureSuccess(await tools.executeTool('manage_level_structure', {
-    action: 'save_level_as', savePath: levelPath
+  ensureSuccess(await tools.executeTool('manage_level', {
+    action: 'save_level_as', path: levelPath
   }), 'save level');
-  ensureSuccess(await tools.executeTool('manage_level_structure', {
-    action: 'load_level', levelPath
+  ensureSuccess(await tools.executeTool('manage_level', {
+    action: 'load_level', path: levelPath
   }), 'reload level');
   const response = await tools.executeTool('build_environment', {
     action: 'inspect_spline_points', actorName, coordinateSpace: 'World'

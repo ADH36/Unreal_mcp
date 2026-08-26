@@ -67,7 +67,8 @@ export const LIGHTING_ACTIONS = [
   'configure_ray_traced_shadows', 'configure_ray_traced_gi',
   'configure_ray_traced_reflections', 'configure_ray_traced_ao',
   'configure_path_tracing', 'configure_ray_traced_translucency',
-  'configure_ray_tracing_quality'
+  'configure_ray_tracing_quality', 'set_light_channel',
+  'set_actor_light_channel', 'get_light_channels'
 ] as const;
 
 export const SPLINE_ACTIONS = [
@@ -1206,6 +1207,11 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         residentGeometryMemoryPoolSizeInMB: commonSchemas.numberProp,
         compactInstances: commonSchemas.booleanProp,
         reflectionCaptures: commonSchemas.booleanProp,
+        lightName: commonSchemas.actorName,
+        lightPath: commonSchemas.actorPath,
+        channel: { type: 'number', description: 'Lighting channel index (0-2).' },
+        channels: commonSchemas.objectProp,
+        applyToAllComponents: commonSchemas.booleanProp,
         pathTracing: commonSchemas.booleanProp,
         materialIndex: commonSchemas.numberProp,
         maxBrightness: commonSchemas.numberProp,

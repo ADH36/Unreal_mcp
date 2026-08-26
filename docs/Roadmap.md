@@ -1235,8 +1235,9 @@ The following phases represent the comprehensive expansion to enable **full proj
 - [x] `configure_ray_tracing_quality` (scene culling, geometry participation, TLAS/BLAS performance controls)
 
 ### 29.2 Light Channels
-- [ ] `set_light_channel`
-- [ ] `set_actor_light_channel`
+- [x] `set_light_channel`
+- [x] `set_actor_light_channel`
+- [x] `get_light_channels` (extra readback/verification action)
 
 ### 29.3 Lightmass
 - [ ] `configure_lightmass_settings`

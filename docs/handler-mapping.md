@@ -149,6 +149,9 @@ This document maps the TypeScript tool definitions to their corresponding C++ ha
 | `configure_path_tracing` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; applies supported path-tracing CVars |
 | `configure_ray_traced_translucency` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; configures translucency/refraction and Post Process Volume overrides |
 | `configure_ray_tracing_quality` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.1; configures scene culling, geometry inclusion, residency, and update budgets |
+| `set_light_channel` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.2; configures a light's three lighting channels |
+| `set_actor_light_channel` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.2; applies channels to primitive components, with optional component targeting |
+| `get_light_channels` | `McpAutomationBridge_LightingHandlers.cpp` | `HandleLightingAction` | Phase 29.2; reads back light or actor component channel state for verification |
 
 ## Performance Manager (`system_control`)
 
