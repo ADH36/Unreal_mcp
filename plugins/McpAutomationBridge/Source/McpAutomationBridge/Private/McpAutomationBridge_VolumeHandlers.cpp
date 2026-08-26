@@ -180,6 +180,14 @@ namespace VolumeHelpers
                 return false;
             }
             Volume->Brush->Initialize(Volume, true);
+            if (UBrushComponent* BrushComponent = Volume->GetBrushComponent())
+            {
+                BrushComponent->Brush = Volume->Brush;
+            }
+            else
+            {
+                return false;
+            }
             if (!Volume->Brush->Polys)
             {
                 return false;

@@ -84,6 +84,7 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/Brush.h"
+#include "Components/BrushComponent.h"
 #include "Model.h"
 #include "Engine/Polys.h"
 #include "Builders/CubeBuilder.h"
@@ -638,6 +639,7 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
     UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: begin"));
     const FString VolumeName = GetJsonStringFieldNav(Payload, TEXT("boundsActorName"),
         GetJsonStringFieldNav(Payload, TEXT("volumeName"), TEXT("NavMeshBoundsVolume")));
     if (!IsValidActorName(VolumeName) || !Payload->HasField(TEXT("location")) || !Payload->HasField(TEXT("extent")))
@@ -679,6 +681,7 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
     SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
     ANavMeshBoundsVolume* Volume = World->SpawnActor<ANavMeshBoundsVolume>(Location, FRotator::ZeroRotator, SpawnParams);
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: spawned=%s"), Volume ? TEXT("true") : TEXT("false"));
     if (!Volume)
     {
         Self->SendAutomationResponse(Socket, RequestId, false, TEXT("Failed to create NavMeshBoundsVolume"), nullptr, TEXT("SPAWN_FAILED"));
@@ -702,6 +705,18 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
         return true;
     }
     Volume->Brush->Initialize(Volume, true);
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: model initialized"));
+    if (UBrushComponent* BrushComponent = Volume->GetBrushComponent())
+    {
+        BrushComponent->Brush = Volume->Brush;
+    }
+    else
+    {
+        World->DestroyActor(Volume);
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("NavMeshBoundsVolume has no brush component"), nullptr, TEXT("BRUSH_CREATE_FAILED"));
+        return true;
+    }
     if (!Volume->Brush->Polys)
     {
         World->DestroyActor(Volume);
@@ -711,19 +726,47 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
     }
     Volume->Brush->Polys->SetFlags(RF_Transactional);
 
-    UCubeBuilder* CubeBuilder = NewObject<UCubeBuilder>(GetTransientPackage());
-    CubeBuilder->X = Extent.X * 2.0f;
-    CubeBuilder->Y = Extent.Y * 2.0f;
-    CubeBuilder->Z = Extent.Z * 2.0f;
-    if (!CubeBuilder->Build(World, Volume))
+    // Build the six box polygons directly.  UCubeBuilder performs editor
+    // viewport/pivot work and can monopolize the editor for a large volume;
+    // the navigation volume only needs a valid UModel/UPolys bounds source.
+    Volume->Brush->Polys->Element.Empty();
+    const FVector Vertices[8] = {
+        FVector(-Extent.X, -Extent.Y, -Extent.Z), FVector( Extent.X, -Extent.Y, -Extent.Z),
+        FVector( Extent.X,  Extent.Y, -Extent.Z), FVector(-Extent.X,  Extent.Y, -Extent.Z),
+        FVector(-Extent.X, -Extent.Y,  Extent.Z), FVector( Extent.X, -Extent.Y,  Extent.Z),
+        FVector( Extent.X,  Extent.Y,  Extent.Z), FVector(-Extent.X,  Extent.Y,  Extent.Z)
+    };
+    const int32 Faces[6][4] = {
+        {0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4},
+        {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}
+    };
+    for (const int32 (&Face)[4] : Faces)
+    {
+        FPoly Poly;
+        Poly.Init();
+        Poly.Base = (FVector3f)Vertices[Face[0]];
+        Poly.PolyFlags = PF_DefaultFlags;
+        for (int32 VertexIndex : Face)
+        {
+            Poly.Vertices.Emplace(Vertices[VertexIndex]);
+        }
+        if (Poly.Finalize(Volume, 1) == 0)
+        {
+            Volume->Brush->Polys->Element.Add(MoveTemp(Poly));
+        }
+    }
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: polygons=%d"), Volume->Brush->Polys->Element.Num());
+    if (Volume->Brush->Polys->Element.Num() != 6)
     {
         World->DestroyActor(Volume);
         Self->SendAutomationResponse(Socket, RequestId, false,
-            TEXT("CubeBuilder failed to create the NavMeshBoundsVolume brush"), nullptr, TEXT("BRUSH_BUILD_FAILED"));
+            TEXT("Failed to create the NavMeshBoundsVolume brush polygons"), nullptr, TEXT("BRUSH_BUILD_FAILED"));
         return true;
     }
     Volume->Brush->BuildBound();
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: bound built"));
     Volume->GetBrushComponent()->UpdateBounds();
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: component bounds updated"));
     Volume->GetBrushComponent()->MarkRenderStateDirty();
     const FBox BrushBounds = Volume->GetComponentsBoundingBox(true);
     if (!BrushBounds.IsValid || BrushBounds.GetExtent().GetMin() <= KINDA_SMALL_NUMBER)
@@ -736,10 +779,9 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
 
     World->MarkPackageDirty();
     Volume->MarkPackageDirty();
-    if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
-    {
-        NavSys->AddDirtyArea(BrushBounds, ENavigationDirtyFlag::All);
-    }
+    // Defer dirty-area submission to build_navigation.  Submitting a very
+    // large volume here can synchronously monopolize the editor while the
+    // MCP request is still waiting to send its response.
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
     Result->SetStringField(TEXT("boundsActorName"), Volume->GetActorLabel());
     Result->SetStringField(TEXT("actorPath"), Volume->GetPathName());
@@ -747,6 +789,7 @@ static bool HandleCreateNavMeshBoundsVolumeForAI(
     Result->SetNumberField(TEXT("boundsExtentX"), BrushBounds.GetExtent().X);
     Result->SetNumberField(TEXT("boundsExtentY"), BrushBounds.GetExtent().Y);
     Result->SetNumberField(TEXT("boundsExtentZ"), BrushBounds.GetExtent().Z);
+    UE_LOG(LogMcpNavigationHandlers, Warning, TEXT("MCP NavBounds create: sending response"));
     McpHandlerUtils::AddVerification(Result, Volume);
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("NavMeshBoundsVolume created"), Result);
     return true;

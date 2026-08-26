@@ -2829,7 +2829,10 @@ bool UMcpAutomationBridgeSubsystem::HandleControlActorRemoveComponent(
   // CRITICAL FIX: Use FindComponentByName helper which supports fuzzy matching
   UActorComponent* Component = FindComponentByName(Actor, ComponentName);
   if (Component) {
+    Actor->Modify();
+    Actor->RemoveInstanceComponent(Component);
     Component->DestroyComponent();
+    Actor->MarkPackageDirty();
     TSharedPtr<FJsonObject> Data = McpHandlerUtils::CreateResultObject();
     Data->SetStringField(TEXT("actorName"), ActorName);
     Data->SetStringField(TEXT("componentName"), ComponentName);
