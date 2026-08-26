@@ -472,6 +472,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         inputTriggerEvent: { type: 'string', enum: ['Started', 'Triggered', 'Ongoing', 'Completed', 'Canceled'], description: 'Enhanced Input event pin to use.' },
         // Compilation options
         saveAfterCompile: commonSchemas.booleanProp,
+        compile: commonSchemas.booleanProp,
         // Timing/async options
         timeoutMs: commonSchemas.numberProp,
         // Parent class for blueprint creation
@@ -873,6 +874,9 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         warmupFrames: { type: 'integer', minimum: 0, maximum: 120, description: 'Frames to render before screenshot capture.' },
         screenshotDelayMs: { type: 'number', minimum: 0, maximum: 5000, description: 'Delay after warm-up before screenshot capture.' },
         captureMode: { type: 'string', enum: ['game_viewport', 'editor_viewport', 'standalone_window'] },
+        outputPath: { type: 'string', description: 'Optional sanitized project-relative subpath under Saved/ for an additional screenshot copy.' },
+        interfaceName: { type: 'string', description: 'Interface class name checked against the hit actor during interact camera trace.' },
+        standalone: { type: 'boolean', description: 'When true, read_pie_logs also tails the tracked standalone game process log.' },
         timeoutMs: { type: 'number', minimum: 1, maximum: 300000, description: 'Client-side deadline for this operation; sent nowhere else.' },
         axisX: commonSchemas.numberProp,
         axisY: commonSchemas.numberProp,

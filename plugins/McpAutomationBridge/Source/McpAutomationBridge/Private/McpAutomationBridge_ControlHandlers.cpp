@@ -5491,6 +5491,71 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
     Message = FString::Printf(TEXT("Unknown input type: %s. Supported: key_down, key_up, mouse_click, mouse_move, axis"), *InputType);
   }
 
+  // Additive interact probe: after a dispatched key press while PIE has a
+  // player controller with pawn, report what a camera-center visibility trace
+  // would reach. Never fails the key press itself.
+  TSharedPtr<FJsonObject> TraceObject;
+  if (bSuccess && !Key.IsEmpty() && GEditor && GEditor->PlayWorld &&
+      (InputType == TEXT("key_down") || InputType == TEXT("keydown"))) {
+    UWorld *PlayWorld = GEditor->PlayWorld.Get();
+    FString ResolveError;
+    APlayerController *PlayerController =
+        ResolvePiePlayerControllerForMcp(PlayWorld, PlayerIndex, ResolveError);
+    APawn *Pawn = PlayerController ? PlayerController->GetPawn() : nullptr;
+    if (PlayWorld && PlayerController && Pawn) {
+      TraceObject = McpHandlerUtils::CreateResultObject();
+      TraceObject->SetBoolField(TEXT("performed"), false);
+      FVector ViewLocation = FVector::ZeroVector;
+      FRotator ViewRotation = FRotator::ZeroRotator;
+      if (APlayerCameraManager *CameraManager =
+              PlayerController->PlayerCameraManager) {
+        ViewLocation = CameraManager->GetCameraLocation();
+        ViewRotation = CameraManager->GetCameraRotation();
+      } else {
+        PlayerController->GetPlayerViewPoint(ViewLocation, ViewRotation);
+      }
+      const FVector TraceEnd =
+          ViewLocation + ViewRotation.Vector() * (500.0f * 100.0f);
+      FHitResult HitResult;
+      FCollisionQueryParams QueryParams(
+          SCENE_QUERY_STAT(McpInteractTrace), /*bTraceComplex*/ false);
+      QueryParams.AddIgnoredActor(Pawn);
+      const bool bHit = PlayWorld->LineTraceSingleByChannel(
+          OUT HitResult, ViewLocation, TraceEnd, ECC_Visibility, QueryParams);
+      AActor *HitActor = bHit ? HitResult.GetActor() : nullptr;
+      TraceObject->SetBoolField(TEXT("performed"), true);
+      TraceObject->SetObjectField(TEXT("start"),
+                                  MakeVectorObjectForMcp(ViewLocation));
+      TraceObject->SetObjectField(TEXT("end"), MakeVectorObjectForMcp(TraceEnd));
+      TraceObject->SetBoolField(TEXT("hit"), bHit);
+      if (HitActor) {
+        TraceObject->SetStringField(TEXT("hitActorPath"), HitActor->GetPathName());
+        TraceObject->SetStringField(TEXT("hitActorName"), HitActor->GetName());
+        TraceObject->SetStringField(TEXT("hitActorClass"),
+                                    HitActor->GetClass()->GetName());
+      }
+      TraceObject->SetNumberField(TEXT("distanceCm"), HitResult.Distance);
+      TraceObject->SetObjectField(TEXT("impactPoint"),
+                                  MakeVectorObjectForMcp(HitResult.ImpactPoint));
+      bool bInterfaceChecked = false;
+      bool bInterfaceImplemented = false;
+      FString InterfaceName;
+      if (Payload->TryGetStringField(TEXT("interfaceName"), InterfaceName) &&
+          !InterfaceName.IsEmpty()) {
+        bInterfaceChecked = true;
+        if (UClass *ResolvedInterfaceClass = ResolveClassByName(InterfaceName)) {
+          if (HitActor) {
+            bInterfaceImplemented =
+                HitActor->GetClass()->ImplementsInterface(ResolvedInterfaceClass);
+          }
+        }
+      }
+      TraceObject->SetBoolField(TEXT("interfaceImplemented"),
+                                bInterfaceImplemented);
+      TraceObject->SetBoolField(TEXT("interfaceChecked"), bInterfaceChecked);
+    }
+  }
+
   TSharedPtr<FJsonObject> Resp = McpHandlerUtils::CreateResultObject();
   Resp->SetBoolField(TEXT("success"), bSuccess);
   Resp->SetStringField(TEXT("type"), InputType);
@@ -5502,6 +5567,9 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorSimulateInput(
                      (bRoutedToPIE && bHandledByPIE) || bHandledBySlate);
   Resp->SetNumberField(TEXT("playerIndex"), PlayerIndex);
   Resp->SetBoolField(TEXT("viewportFocused"), bViewportFocused);
+  if (TraceObject.IsValid()) {
+    Resp->SetObjectField(TEXT("trace"), TraceObject);
+  }
 
   if (!Key.IsEmpty() && GEditor && GEditor->PlayWorld)
   {

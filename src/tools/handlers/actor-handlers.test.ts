@@ -167,7 +167,7 @@ describe('handleActorTools apply_force', () => {
       force: { x: 0, y: 0, z: 2500 }
     }, tools);
 
-    expect(result).toEqual({ success: true, impulseApplied: true });
+    expect(result).toEqual({ success: true, status: 'success', impulseApplied: true });
     expect(sendAutomationRequest).toHaveBeenNthCalledWith(1, 'control_actor', {
       action: 'apply_force',
       actorName: 'MCP_PhysicsActor',

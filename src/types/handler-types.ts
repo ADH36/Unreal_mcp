@@ -281,6 +281,9 @@ export interface EditorArgs extends HandlerArgs {
     warmupFrames?: number;
     screenshotDelayMs?: number;
     captureMode?: string;
+    outputPath?: string;
+    interfaceName?: string;
+    standalone?: boolean;
     minMovementCm?: number;
     expectedMovement?: boolean;
     previousLocation?: Vector3;

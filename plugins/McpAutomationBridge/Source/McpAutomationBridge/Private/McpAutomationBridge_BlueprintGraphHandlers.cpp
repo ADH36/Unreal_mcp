@@ -2076,6 +2076,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
       Evidence->SetNumberField(TEXT("linkedToCount"), LinkedToCount);
       Result->SetObjectField(TEXT("evidence"), Evidence);
       Result->SetNumberField(TEXT("graphLinkCount"), McpGraphCountLinks(TargetGraph));
+      Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
       McpGraphRecordSave(Result, bSaved);
       McpHandlerUtils::AddVerification(Result, Blueprint);
       const bool bCompileOk =
@@ -2194,6 +2195,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     const bool bSaved = SaveLoadedAssetThrottled(Blueprint);
 
     TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+    Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
     McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
     const bool bCompileOk =
@@ -2675,6 +2677,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBlueprintGraphAction(
     Result->SetStringField(TEXT("nodeName"), TargetNode->GetName());
     Result->SetStringField(TEXT("pinName"), PinName);
     Result->SetStringField(TEXT("value"), Value);
+    Result->SetNumberField(TEXT("nodeCount"), TargetGraph->Nodes.Num());
     McpGraphRecordSave(Result, bSaved);
     McpHandlerUtils::AddVerification(Result, Blueprint);
     const bool bCompileOk =

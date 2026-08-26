@@ -3306,12 +3306,72 @@ bool UMcpAutomationBridgeSubsystem::HandleLevelAction(
       Payload->TryGetBoolField(TEXT("overwrite"), bOverwrite);
     }
 
+    // Save a loaded dirty source level before the on-disk copy; fail otherwise
+    bool bSourceSavedBeforeDuplicate = false;
+    if (UPackage* SourcePackage = FindPackage(nullptr, *SourcePath)) {
+      if (SourcePackage->IsDirty()) {
+        int32 InitialWorldPackages = 0;
+        int32 InitialContentPackages = 0;
+        int32 RemainingWorldPackages = 0;
+        int32 RemainingContentPackages = 0;
+        int32 FailedDirtyPackages = 0;
+        if (!SaveBlockingDirtyPackagesForLevelLoad(InitialWorldPackages,
+                                                   InitialContentPackages,
+                                                   RemainingWorldPackages,
+                                                   RemainingContentPackages,
+                                                   FailedDirtyPackages)) {
+          TSharedPtr<FJsonObject> DirtyResult = McpHandlerUtils::CreateResultObject();
+          DirtyResult->SetBoolField(TEXT("sourceSavedBeforeDuplicate"), false);
+          SendAutomationResponse(RequestingSocket, RequestId, false,
+                                 FString::Printf(TEXT("Source level '%s' has unsaved changes and saving dirty packages failed (%d remaining); resolve and retry."), *SourcePath, RemainingWorldPackages + RemainingContentPackages),
+                                 DirtyResult, TEXT("SOURCE_DIRTY"));
+          return true;
+        }
+        bSourceSavedBeforeDuplicate = true;
+      }
+    }
+
+    // Detect external actor GUID overlap between source and destination
+    TSet<FString> SourceExternalActorGuids;
+    TSet<FString> DestinationExternalActorGuids;
+    int32 SourceExternalActorFileCount = 0;
+    int32 DestinationExternalActorFileCount = 0;
+    FString SourceExternalActorsDir;
+    FString DestinationExternalActorsDir;
+    if (GetExternalPackageDirectory(SourcePath, TEXT("__ExternalActors__"), SourceExternalActorsDir)) {
+      CollectExternalActorGuidsRecursive(SourceExternalActorsDir, SourceExternalActorGuids, SourceExternalActorFileCount);
+    }
+    if (GetExternalPackageDirectory(DestinationPath, TEXT("__ExternalActors__"), DestinationExternalActorsDir)) {
+      CollectExternalActorGuidsRecursive(DestinationExternalActorsDir, DestinationExternalActorGuids, DestinationExternalActorFileCount);
+    }
+    const TSet<FString> OverlappingExternalActorGuids =
+        SourceExternalActorGuids.Intersect(DestinationExternalActorGuids);
+    if (!bOverwrite && OverlappingExternalActorGuids.Num() > 0) {
+      TArray<FString> DuplicateGuids = OverlappingExternalActorGuids.Array();
+      DuplicateGuids.Sort();
+      TSharedPtr<FJsonObject> DuplicateResult = McpHandlerUtils::CreateResultObject();
+      TArray<TSharedPtr<FJsonValue>> DuplicateGuidValues;
+      for (int32 GuidIndex = 0; GuidIndex < DuplicateGuids.Num() && GuidIndex < 50; ++GuidIndex) {
+        DuplicateGuidValues.Add(MakeShared<FJsonValueString>(DuplicateGuids[GuidIndex]));
+      }
+      DuplicateResult->SetArrayField(TEXT("duplicateExternalActorGuids"), DuplicateGuidValues);
+      DuplicateResult->SetNumberField(TEXT("duplicateExternalActorCount"), DuplicateGuids.Num());
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             FString::Printf(TEXT("Destination '%s' shares %d external actor GUIDs with source '%s'; rerun with overwrite=true or pick another destination."), *DestinationPath, DuplicateGuids.Num(), *SourcePath),
+                             DuplicateResult, TEXT("DUPLICATE_EXTERNAL_ACTORS"));
+      return true;
+    }
+
     TSharedPtr<FJsonObject> Result;
     FString ErrorMessage;
     FString ErrorCode;
     const bool bDuplicated = CopyLevelMapPackageFile(SourcePath, DestinationPath, bOverwrite, Result, ErrorMessage, ErrorCode);
     if (bDuplicated) {
       Result->SetBoolField(TEXT("duplicated"), true);
+      Result->SetBoolField(TEXT("sourceSavedBeforeDuplicate"), bSourceSavedBeforeDuplicate);
+      if (bOverwrite && OverlappingExternalActorGuids.Num() > 0) {
+        Result->SetNumberField(TEXT("overwrittenExternalActorCount"), OverlappingExternalActorGuids.Num());
+      }
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              FString::Printf(TEXT("Level duplicated to: %s"), *DestinationPath), Result);
     } else {

@@ -2819,6 +2819,13 @@ static inline void AddActorVerification(TSharedPtr<FJsonObject> Response, AActor
   Response->SetStringField(TEXT("actorGuid"), Actor->GetActorGuid().ToString());
   Response->SetBoolField(TEXT("existsAfter"), true);
   Response->SetStringField(TEXT("actorClass"), Actor->GetClass()->GetName());
+
+  TSharedPtr<FJsonObject> Evidence = MakeShared<FJsonObject>();
+  Evidence->SetStringField(TEXT("kind"), TEXT("actor"));
+  Evidence->SetStringField(TEXT("path"), ActorPath);
+  Evidence->SetBoolField(TEXT("existsAfter"), true);
+  Response->SetObjectField(TEXT("evidence"), Evidence);
+  Response->SetBoolField(TEXT("verified"), true);
 }
 
 /**
@@ -2847,6 +2854,13 @@ static inline void AddAssetVerification(TSharedPtr<FJsonObject> Response, UObjec
   Response->SetStringField(TEXT("assetName"), Asset->GetName());
   Response->SetBoolField(TEXT("existsAfter"), true);
   Response->SetStringField(TEXT("assetClass"), Asset->GetClass()->GetName());
+
+  TSharedPtr<FJsonObject> Evidence = MakeShared<FJsonObject>();
+  Evidence->SetStringField(TEXT("kind"), TEXT("asset"));
+  Evidence->SetStringField(TEXT("path"), AssetPath);
+  Evidence->SetBoolField(TEXT("existsAfter"), true);
+  Response->SetObjectField(TEXT("evidence"), Evidence);
+  Response->SetBoolField(TEXT("verified"), true);
 }
 
 /**
@@ -2865,6 +2879,14 @@ static inline void AddAssetVerificationNested(TSharedPtr<FJsonObject> Response, 
   VerificationObj->SetStringField(TEXT("assetName"), Asset->GetName());
   VerificationObj->SetBoolField(TEXT("existsAfter"), true);
   VerificationObj->SetStringField(TEXT("assetClass"), Asset->GetClass()->GetName());
+
+  TSharedPtr<FJsonObject> Evidence = MakeShared<FJsonObject>();
+  Evidence->SetStringField(TEXT("kind"), TEXT("asset"));
+  Evidence->SetStringField(TEXT("path"), AssetPath);
+  Evidence->SetBoolField(TEXT("existsAfter"), true);
+  VerificationObj->SetObjectField(TEXT("evidence"), Evidence);
+  VerificationObj->SetBoolField(TEXT("verified"), true);
+
   Response->SetObjectField(FieldName, VerificationObj);
 }
 
@@ -2876,6 +2898,13 @@ static inline bool VerifyAssetExists(TSharedPtr<FJsonObject> Response, const FSt
   if (Response) {
     Response->SetStringField(TEXT("verifiedPath"), AssetPath);
     Response->SetBoolField(TEXT("existsAfter"), bExists);
+    Response->SetBoolField(TEXT("verified"), bExists);
+
+    TSharedPtr<FJsonObject> Evidence = MakeShared<FJsonObject>();
+    Evidence->SetStringField(TEXT("kind"), TEXT("path"));
+    Evidence->SetStringField(TEXT("path"), AssetPath);
+    Evidence->SetBoolField(TEXT("existsAfter"), bExists);
+    Response->SetObjectField(TEXT("evidence"), Evidence);
   }
   return bExists;
 }

@@ -93,7 +93,7 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'set_camera_fov': ['fov'],
   'set_game_speed': ['speed'],
   'set_fixed_delta_time': ['deltaTime'],
-  'screenshot': ['filename', 'path', 'resolution', 'mode', 'returnBase64', 'includeMetadata', 'metadata', 'warmupFrames', 'screenshotDelayMs', 'captureMode'],
+  'screenshot': ['filename', 'path', 'outputPath', 'resolution', 'mode', 'returnBase64', 'includeMetadata', 'metadata', 'warmupFrames', 'screenshotDelayMs', 'captureMode'],
   'set_preferences': ['category', 'preferences'],
   'execute_command': ['command'],
   'console_command': ['command'],
@@ -122,9 +122,9 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'look': ['x', 'y', 'durationMs', 'playerIndex'],
   'jump': ['key', 'durationMs', 'playerIndex'],
   'sprint': ['key', 'durationMs', 'playerIndex'],
-  'interact': ['key', 'durationMs', 'playerIndex'],
+  'interact': ['key', 'durationMs', 'playerIndex', 'interfaceName'],
   'capture_pie_screenshot': ['filename', 'resolution', 'returnBase64', 'includeMetadata', 'metadata', 'warmupFrames', 'screenshotDelayMs', 'captureMode'],
-  'read_pie_logs': [],
+  'read_pie_logs': ['standalone'],
   'run_playtest_sequence': ['sequence', 'autoStop', 'timeoutMs', 'pieMode', 'playerIndex', 'warmupFrames', 'screenshotDelayMs'],
 };
 
@@ -267,12 +267,13 @@ async function stopPieAndVerify(tools: ITools, timeoutMs: number): Promise<Recor
   return { ...stopResult, success: false, pieStopped: false, error: 'PIE_STOP_TIMEOUT', message: 'PIE did not stop before the cleanup deadline.' };
 }
 
-async function sendHeldPieKey(tools: ITools, key: string, durationMs: number, timeoutMs: number, playerIndex = 0): Promise<Record<string, unknown>> {
+async function sendHeldPieKey(tools: ITools, key: string, durationMs: number, timeoutMs: number, playerIndex = 0, interfaceName?: string): Promise<Record<string, unknown>> {
   const options = { timeoutMs };
   let pressed = false;
   try {
     const down = await executeAutomationRequest(tools, 'control_editor', {
-      action: 'simulate_input', type: 'key_down', key, playerIndex
+      action: 'simulate_input', type: 'key_down', key, playerIndex,
+      ...(interfaceName && interfaceName.trim().length > 0 ? { interfaceName: interfaceName.trim() } : {})
     }, undefined, options) as Record<string, unknown>;
     pressed = isSuccessful(down);
     if (!pressed) return cleanObject(down);
@@ -441,6 +442,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
 
       const mode = modeResult.mode;
       const payload: Record<string, unknown> = { action: 'screenshot', filename, resolution: args.resolution };
+      if (typeof args.outputPath === 'string' && args.outputPath.trim().length > 0) {
+        payload.outputPath = args.outputPath.trim();
+      }
       if (mode !== undefined) {
         payload.mode = mode;
       }
@@ -707,8 +711,10 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       return sendHeldPieKey(tools, editorArgs.key ?? 'SpaceBar', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
     case 'sprint':
       return sendHeldPieKey(tools, editorArgs.key ?? 'LeftShift', getBoundedDurationMs(editorArgs.durationMs, 250), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
-    case 'interact':
-      return sendHeldPieKey(tools, editorArgs.key ?? 'E', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0);
+    case 'interact': {
+      const interfaceName = typeof editorArgs.interfaceName === 'string' ? editorArgs.interfaceName : undefined;
+      return await sendHeldPieKey(tools, editorArgs.key ?? 'E', getBoundedDurationMs(editorArgs.durationMs), getBoundedTimeoutMs(args.timeoutMs), editorArgs.playerIndex ?? 0, interfaceName);
+    }
     case 'run_playtest_sequence':
       return runPlaytestSequence(editorArgs, tools);
     case 'focus':

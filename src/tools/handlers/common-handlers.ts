@@ -250,7 +250,41 @@ export async function executeAutomationRequest(
   const cleanedArgs = { ...argsRecord };
   delete cleanedArgs.timeoutMs;
 
-  return await automationBridge.sendAutomationRequest(toolName, cleanedArgs, timeoutMs ? { timeoutMs } : {});
+  const response = await automationBridge.sendAutomationRequest(toolName, cleanedArgs, timeoutMs ? { timeoutMs } : {});
+  return standardizeResultContract(response);
+}
+
+/**
+ * Derive the truthful result contract fields (status / errors) from a raw
+ * automation envelope. Purely additive: existing handler-owned fields such as
+ * success, verified, warnings, and evidence are preserved untouched so
+ * handlers can always override the derivation with their own values.
+ */
+export function standardizeResultContract(response: unknown): unknown {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    return response;
+  }
+  const record = response as Record<string, unknown>;
+  if (typeof record.status === 'string' && record.status.length > 0) {
+    return record;
+  }
+
+  const failed = record.success === false || record.isError === true;
+  let status: 'success' | 'failed' | 'partial' = failed ? 'failed' : 'success';
+  if (!failed && Array.isArray(record.warnings) && record.warnings.length > 0 && record.verified === false) {
+    status = 'partial';
+  }
+
+  const errors: string[] = [];
+  if (typeof record.error === 'string' && record.error.length > 0) errors.push(record.error);
+  if (record.errorCode && typeof record.errorCode === 'string' && !errors.includes(record.errorCode)) errors.push(record.errorCode);
+  if (failed && typeof record.message === 'string' && record.message.length > 0 && !errors.includes(record.message)) errors.push(record.message);
+
+  return {
+    ...record,
+    status,
+    ...(errors.length > 0 ? { errors } : {})
+  };
 }
 
 export interface SubActionDispatcher {
